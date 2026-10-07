@@ -126,6 +126,20 @@ Do not solve future problems before the current implementation gate requires the
 Inspect no more than 3 images unless an image is genuinely essential to the
 assigned task.
 
+## Platform-specific tests
+
+Tests must pass on Windows, macOS and Linux, and no CI runs them, so check by
+hand. A test that only holds on one platform must say so with a gate, not fail
+elsewhere.
+
+- Unix-only APIs (`PermissionsExt`, symlinks, file modes): gate the `use` and the
+  test with `#[cfg(unix)]`.
+- Platform-dependent output (GPUI `Keystroke::unparse` renders the platform
+  modifier as `cmd-`, `win-` or `super-`): normalize in the test, or gate with
+  `#[cfg(target_os = "...")]`.
+- Run `cargo test` on the platform you are on and name the platforms you did not
+  run in the PR description.
+
 ## Git rules
 
 Preserve unrelated user work. Before editing:

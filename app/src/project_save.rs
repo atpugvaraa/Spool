@@ -1839,6 +1839,7 @@ mod tests {
     use crate::source_document::NodeId;
     // `from_mode` is how a directory is made read-only, which is how the
     // partial-write test refuses a write without touching any editor code.
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     /// Copy a fixture so a save never touches the committed files.
@@ -2948,6 +2949,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_failure_part_way_through_reports_the_files_that_did_land() {
         // A multi-file save is not atomic, and this is the case that proves the
         // code says so rather than implying it.

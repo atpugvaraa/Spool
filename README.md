@@ -33,8 +33,7 @@ flex layout and `gap`, inline layout, text wrapping, CSS custom properties as
 first-class values, descendant selectors, media queries, `@layer`, and
 `!important` are not fully modelled. Unsupported edits may be refused on save
 with a diagnostic. Some current interaction and Inspector inconsistencies are
-also documented in the [Human Interaction Audit](docs/research/README.md) and
-the implementation roadmap.
+also documented in the [implementation roadmap](docs/04-implementation-roadmap.md).
 
 ## Current limitations
 
@@ -75,8 +74,21 @@ cargo build --release --locked
 To open the included source-backed example:
 
 ```sh
+# macOS / Linux
 cd app
 SPOOL_PROJECT=./fixtures/landing cargo run
+```
+
+```powershell
+# Windows PowerShell
+cd app
+$env:SPOOL_PROJECT = ".\fixtures\landing"; cargo run
+```
+
+```bat
+:: Windows cmd
+cd app
+set "SPOOL_PROJECT=.\fixtures\landing" && cargo run
 ```
 
 `SPOOL_PROJECT` is a development override. A real project is a directory named
