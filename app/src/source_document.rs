@@ -71,6 +71,43 @@ impl std::fmt::Display for ModelError {
 impl std::error::Error for ModelError {}
 
 impl LamineStructure {
+    /// `root` and every node beneath it, deepest first.
+    ///
+    /// Post-order because that is the only order in which a cascade can be
+    /// applied without ever orphaning anyone: a child is always removed before
+    /// its parent, so no node is ever left naming a parent that has gone.
+    ///
+    /// Uses the recorded `children` rather than scanning `parent`, because that
+    /// is the edge the structure owns; a `parent` left dangling by a removal
+    /// would otherwise widen the subtree without bound.
+    pub fn subtree_post_order(&self, root: &NodeId) -> Vec<StructuralNode> {
+        let mut found = Vec::new();
+        let mut seen = HashSet::new();
+        self.walk_post_order(root, &mut seen, &mut found);
+        found
+    }
+
+    fn walk_post_order(
+        &self,
+        id: &NodeId,
+        seen: &mut HashSet<NodeId>,
+        found: &mut Vec<StructuralNode>,
+    ) {
+        // A cycle in a malformed structure would otherwise recurse forever.
+        if !seen.insert(id.clone()) {
+            return;
+        }
+        let Some(node) = self.nodes.iter().find(|node| node.id == *id) else {
+            return;
+        };
+        // Children first, and the node itself only once they are all recorded:
+        // that is what makes the result safe to remove in order.
+        for child in &node.children {
+            self.walk_post_order(child, seen, found);
+        }
+        found.push(node.clone());
+    }
+
     pub fn validate(&self) -> Result<(), ModelError> {
         let mut ids = HashSet::new();
         let mut names = HashSet::new();
@@ -356,6 +393,100 @@ mod tests {
                 },
             ],
         }
+    }
+
+    /// A root with a child, and that child with a child of its own.
+    fn deep_fixture() -> LamineStructure {
+        let root = NodeId::new("spool-root-001").unwrap();
+        let middle = NodeId::new("spool-middle-002").unwrap();
+        let leaf = NodeId::new("spool-leaf-003").unwrap();
+        let bind = |id: &NodeId| SourceBinding {
+            file: "index.html".into(),
+            selector: format!("[data-spool-id=\"{}\"]", id.as_str()),
+        };
+        LamineStructure {
+            nodes: vec![
+                StructuralNode {
+                    id: root.clone(),
+                    name: "Root".into(),
+                    kind: "frame".into(),
+                    parent: None,
+                    children: vec![middle.clone()],
+                    source: bind(&root),
+                },
+                StructuralNode {
+                    id: middle.clone(),
+                    name: "Middle".into(),
+                    kind: "frame".into(),
+                    parent: Some(root),
+                    children: vec![leaf.clone()],
+                    source: bind(&middle),
+                },
+                StructuralNode {
+                    id: leaf.clone(),
+                    name: "Leaf".into(),
+                    kind: "text".into(),
+                    parent: Some(middle),
+                    children: vec![],
+                    source: bind(&leaf),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn a_subtree_lists_children_before_their_parent() {
+        // The order is the whole point: a cascade is applied in this order so that
+        // no node is ever removed while another still names it as parent. A
+        // pre-order walk looks right and leaves exactly the dangling reference this
+        // is meant to prevent.
+        let structure = deep_fixture();
+        let root = NodeId::new("spool-root-001").unwrap();
+        let order: Vec<String> = structure
+            .subtree_post_order(&root)
+            .into_iter()
+            .map(|node| node.id.as_str().to_owned())
+            .collect();
+        assert_eq!(
+            order,
+            vec!["spool-leaf-003", "spool-middle-002", "spool-root-001"],
+            "deepest first, and the root last"
+        );
+    }
+
+    #[test]
+    fn a_subtree_starts_from_any_node_not_only_a_root() {
+        let structure = deep_fixture();
+        let middle = NodeId::new("spool-middle-002").unwrap();
+        let order: Vec<String> = structure
+            .subtree_post_order(&middle)
+            .into_iter()
+            .map(|node| node.id.as_str().to_owned())
+            .collect();
+        assert_eq!(order, vec!["spool-leaf-003", "spool-middle-002"]);
+    }
+
+    #[test]
+    fn a_subtree_of_a_cyclic_structure_terminates() {
+        // A cycle cannot survive validation, but this walk is reachable before
+        // that and must not hang the editor on a malformed structure.
+        let mut structure = deep_fixture();
+        let leaf = NodeId::new("spool-leaf-003").unwrap();
+        let root = NodeId::new("spool-root-001").unwrap();
+        structure
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == leaf)
+            .expect("the leaf is there")
+            .children
+            .push(root.clone());
+
+        let order = structure.subtree_post_order(&root);
+        assert_eq!(
+            order.len(),
+            3,
+            "each node is visited once despite the cycle back to the root"
+        );
     }
 
     #[test]

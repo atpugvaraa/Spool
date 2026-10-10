@@ -21,6 +21,12 @@ cd "$(dirname "$0")" || exit 2
 
 CANVAS="src/canvas.rs"
 SHELL="src/shell.rs"
+STRUCTURE="src/source_document.rs"
+OPS="src/operations.rs"
+SAVE="src/project_save.rs"
+STRUCTURE="src/source_document.rs"
+OPS="src/operations.rs"
+SAVE="src/project_save.rs"
 # Empty on purpose. The three behaviours this harness exists for — keyboard
 # focus, the Text handover, and the toolbar highlight — can only be seen
 # through a live window, so they live in `interaction_window_tests`. A filter
@@ -31,15 +37,35 @@ FILTER=""
 # this harness mutates predate the marker convention, and adding one to the
 # canvas would be an unrelated edit. The guard exists to catch a file that was
 # meant to carry it and has lost it, and neither of these ever did.
-if grep -q "MUTATION HARNESS" "$CANVAS" || grep -q "MUTATION HARNESS" "$SHELL"; then
+if grep -q "MUTATION HARNESS" "$CANVAS" || grep -q "MUTATION HARNESS" "$SHELL" \
+  || grep -q "MUTATION HARNESS" "$STRUCTURE" \
+  || grep -q "MUTATION HARNESS" "$OPS" \
+  || grep -q "MUTATION HARNESS" "$SAVE"; then
   echo "note: a marker appeared in a file this harness assumed had none;"
   echo "      re-check whether the guard below should now apply" >&2
 fi
 
+# Every file this harness mutates is backed up and restored. Adding a file to the
+# mutation list without adding it here would mutate it for real and never undo it,
+# and the next mutation would then fail to compile against a file nobody meant to
+# change.
 BACKUP_CANVAS="$(mktemp -t canvas.rs.XXXXXX)"
 BACKUP_SHELL="$(mktemp -t shell.rs.XXXXXX)"
-cp "$CANVAS" "$BACKUP_CANVAS"; cp "$SHELL" "$BACKUP_SHELL"
-restore() { cp "$BACKUP_CANVAS" "$CANVAS"; cp "$BACKUP_SHELL" "$SHELL"; }
+BACKUP_STRUCTURE="$(mktemp -t source_document.rs.XXXXXX)"
+BACKUP_OPS="$(mktemp -t operations.rs.XXXXXX)"
+BACKUP_SAVE="$(mktemp -t project_save.rs.XXXXXX)"
+cp "$CANVAS" "$BACKUP_CANVAS"
+cp "$SHELL" "$BACKUP_SHELL"
+cp "$STRUCTURE" "$BACKUP_STRUCTURE"
+cp "$OPS" "$BACKUP_OPS"
+cp "$SAVE" "$BACKUP_SAVE"
+restore() {
+  cp "$BACKUP_CANVAS" "$CANVAS"
+  cp "$BACKUP_SHELL" "$SHELL"
+  cp "$BACKUP_STRUCTURE" "$STRUCTURE"
+  cp "$BACKUP_OPS" "$OPS"
+  cp "$BACKUP_SAVE" "$SAVE"
+}
 trap restore EXIT
 
 passed=0
@@ -233,6 +259,55 @@ run "$SHELL" "" "the toolbar highlight ignores the tool in effect" \
   '        self.canvas.read(cx).tool() == tool' \
   '        matches!(tool, canvas::Tool::Select)'
 
+
+echo
+echo "== what a cascade depends on =="
+# Deleting a container deletes what is inside it. Four things have to hold for
+# that, and each was arrived at by getting one of them wrong first.
+
+run "$STRUCTURE" "" "the subtree is walked parent-first" \
+  '        for child in &node.children {
+            self.walk_post_order(child, seen, found);
+        }
+        found.push(node.clone());' \
+  '        found.push(node.clone());
+        for child in &node.children {
+            self.walk_post_order(child, seen, found);
+        }'
+
+run "$OPS" "" "a removal is allowed to orphan its children" \
+  '.any(|other| other.parent.as_ref() == Some(&node.id))' \
+  '.any(|other| false)' \
+  '                    .structure' \
+  '                    .nodes' \
+  '                    .iter()' \
+  '                    .any(|other| other.parent.as_ref() == Some(&node.id))' \
+  '                {' \
+  '                    return Err(OperationError::NodeHasChildren(node.id.clone()));' \
+  '                }' \
+  '                    .structure' \
+  '                    .nodes' \
+  '                    .iter()' \
+  '                    .any(|other| false)' \
+  '                {' \
+  '                    return Err(OperationError::NodeHasChildren(node.id.clone()));' \
+  '                }'
+
+run "$OPS" "" "every member of a compound is judged against the pre-state" \
+  '                validate(member, &working, runtime)?;' \
+  '                validate(member, document, runtime)?;'
+
+run "$CANVAS" "" "deleting a container leaves its contents behind" \
+  '        let doomed = self.subtree_of_selection(&ids);' \
+  '        let doomed: Vec<StructuralNode> = ids
+            .iter()
+            .filter_map(|id| self.runtime_node_for(*id))
+            .filter_map(|id| self.session.document.structure.nodes.iter().find(|n| n.id == id).cloned())
+            .collect();'
+
+run "$SAVE" "" "a removal inside another removal is applied too" \
+  '    for removal in outermost_only(removes.into_iter().flatten()) {' \
+  '    for removal in removes.into_iter().flatten() {'
 
 echo
 echo "== summary =="

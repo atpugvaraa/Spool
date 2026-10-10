@@ -882,24 +882,19 @@ fn object_centre(
 }
 
 #[gpui::test]
-#[ignore = "known defect: deleting a container that still has children cannot be saved"]
-fn deleting_a_container_leaves_a_save_that_refuses_to_load(cx: &mut TestAppContext) {
-    // Recorded rather than fixed here, and ignored rather than deleted, because it
-    // is a real defect and it would be easy to mistake the save failure for a
-    // quirk of this test.
+fn deleting_a_container_takes_its_contents_with_it_and_still_saves(cx: &mut TestAppContext) {
+    // Deleting a container deletes what is inside it.
     //
-    // What happens: `spool-frame-root` in the landing fixture is the parent of the
-    // other two objects. Deleting it leaves those two referring to a node that no
-    // longer exists, `lamine.yaml` fails validation, and `save_project` returns an
-    // error. Nothing is written, so the object the user deleted is still there on
-    // the next open. The status line says the save failed; the user's deletion is
-    // simply lost.
+    // The rule is settled by the authored source rather than by taste: the
+    // fixture nests two elements inside the container's `<main>`, so removing
+    // that element removes them whether or not anyone says so. Leaving their
+    // records behind would mean a `lamine.yaml` entry for an element no longer in
+    // the source — a dangling binding, and the same class of corruption as the
+    // dangling `parent` that used to make this save fail outright.
     //
-    // This is a document-metadata problem, not an interaction one: the keyboard
-    // did exactly what it was asked, and `commands::resolve` mapped Delete to the
-    // one deletion path. Fixing it means deciding what deleting a container should
-    // do to the objects inside it — take them with it, reparent them, or refuse —
-    // which is a document-model decision and out of scope for a verification pass.
+    // Before the cascade this test was ignored and asserted the failure: nothing
+    // was written, and because a failed save left the structure corrupt, every
+    // later save failed the same way too.
     let root = scratch_project("container-delete");
 
     let (shell, window) = cx.add_window_view({
@@ -908,10 +903,18 @@ fn deleting_a_container_leaves_a_save_that_refuses_to_load(cx: &mut TestAppConte
     });
     redraw(&shell, window);
 
-    let container = identities(&shell, window)
+    let all = identities(&shell, window);
+    let container = all
         .first()
         .cloned()
         .expect("the fixture should have objects");
+    // The landing fixture nests two objects inside the root frame, which is what
+    // makes this the interesting case: they are children in lamine.yaml *and*
+    // elements nested inside the container's element in the HTML.
+    let (child_one, child_two) = (
+        all.get(1).cloned().expect("a nested child"),
+        all.get(2).cloned().expect("another nested child"),
+    );
     let target = object_centre(&shell, window, &container);
     window.simulate_click(target, Modifiers::none());
     window.run_until_parked();
@@ -922,15 +925,56 @@ fn deleting_a_container_leaves_a_save_that_refuses_to_load(cx: &mut TestAppConte
         "precondition: the container is gone from the open document"
     );
 
+    // The save is the point of the test. Before the cascade, this failed
+    // validation with a dangling `parent`, wrote nothing, and every later save
+    // failed the same way, so the user's deletion was silently lost.
     let outcome = window.update(|_, cx| {
         shell.update(cx, |shell, cx| {
             shell.canvas().update(cx, |canvas, _| canvas.save_project())
         })
     });
     assert!(
-        outcome.is_err(),
-        "today this save fails; when it is fixed, un-ignore this and invert it"
+        outcome.is_ok(),
+        "deleting a container must leave a project that can still be saved: {:?}",
+        outcome.err()
     );
+
+    // And the cascade has to be real, not just saveable: the objects inside the
+    // container went with it rather than being stranded.
+    let after_delete = identities(&shell, window);
+    assert!(
+        !after_delete.contains(&container),
+        "the container itself is gone"
+    );
+    for child in [&child_one, &child_two] {
+        assert!(
+            !after_delete.contains(child),
+            "{child} was inside the deleted container and goes with it"
+        );
+    }
+
+    // Reopening proves it reached the source rather than only the document.
+    window.simulate_keystrokes("cmd-s");
+    window.run_until_parked();
+    let (reopened, second) = cx.add_window_view({
+        let root = root.clone();
+        move |_, cx| AppShell::new_with_project(Some(root), cx)
+    });
+    redraw(&reopened, second);
+    // The assertion is that the deleted subtree does not come back, rather than
+    // that the reopened project is empty. A project with no nodes cannot be
+    // opened — there is nothing with a canvas representation — so the shell falls
+    // back to the starter scene. That fallback is its own behaviour; what this
+    // test is about is that none of the three deleted identities is in the source
+    // any more.
+    let after_reopen = identities(&reopened, second);
+    for gone in [&container, &child_one, &child_two] {
+        assert!(
+            !after_reopen.contains(gone),
+            "{gone} was deleted and must not reappear from the source; reopened \
+             {after_reopen:?}"
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&root);
 }

@@ -155,11 +155,9 @@ run "a compound is a no-op if ANY member is" \
 
 run "compound validation stops at the first member" \
   '            for member in operations {
-                validate(member, document, runtime)?;
-            }
-            Ok(())' \
-  '            let _ = operations;
-            Ok(())'
+                validate(member, &working, runtime)?;' \
+  '            for member in operations.iter().take(1) {
+                validate(member, &working, runtime)?;'
 
 echo
 echo "== gesture lifecycle =="

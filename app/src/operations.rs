@@ -379,11 +379,24 @@ impl StructureChange {
                 Ok(())
             }
             Self::Remove { .. } => {
-                if present {
-                    Ok(())
-                } else {
-                    Err(OperationError::MissingNode(node.id.clone()))
+                if !present {
+                    return Err(OperationError::MissingNode(node.id.clone()));
                 }
+                // A child left naming this node as its parent would be unreachable
+                // by any walk and would fail validation on save. So a removal that
+                // still has children is refused rather than performed — the same
+                // reasoning, and the same shape, as the insert-side refusal above.
+                // Removing a container means removing its contents first; that is
+                // what `LamineStructure::subtree_post_order` is for.
+                if document
+                    .structure
+                    .nodes
+                    .iter()
+                    .any(|other| other.parent.as_ref() == Some(&node.id))
+                {
+                    return Err(OperationError::NodeHasChildren(node.id.clone()));
+                }
+                Ok(())
             }
         }
     }
@@ -486,6 +499,16 @@ pub enum OperationError {
     /// indistinguishable from a broken identity and let it reach the
     /// apply-time panic in [`EditSession::execute`].
     DuplicateName(String),
+    /// The operation would remove a node that other nodes still name as parent.
+    ///
+    /// The mirror of the insert-side refusal just below. Removing a node while
+    /// its children survive would leave each of them naming a parent that is
+    /// gone: `lamine.yaml` fails validation on the dangling link, the save
+    /// refuses to write anything, and because that refusal is silent about its
+    /// cause the project cannot be saved again at all. A caller that means to
+    /// take a container's contents with it has to say so by removing them, and
+    /// this is what makes saying so the only option.
+    NodeHasChildren(NodeId),
     /// The operation's recorded `before` value no longer matches the state,
     /// so replaying it would silently overwrite a change made since.
     ///
@@ -504,6 +527,11 @@ impl std::fmt::Display for OperationError {
             Self::MissingObject(id) => write!(f, "no runtime object {id:?}"),
             Self::WrongTarget(what) => write!(f, "{what} cannot be applied to this target"),
             Self::DuplicateName(name) => write!(f, "another node is already named {name:?}"),
+            Self::NodeHasChildren(id) => write!(
+                f,
+                "cannot remove {} while it still contains objects",
+                id.as_str()
+            ),
             Self::StaleEdit(id) => {
                 write!(
                     f,
@@ -925,13 +953,29 @@ fn validate(
             Ok(())
         }
         SemanticOperation::Runtime(command) => command.validate(runtime),
-        // Every member, before any member is applied. A compound is therefore
-        // all-or-nothing by construction instead of by compensation, which is
-        // what a multi-member entry needs once undo can no longer reverse a
-        // half-applied state.
+        // Every member, before any member is applied to the real document. A
+        // compound is therefore all-or-nothing by construction instead of by
+        // compensation, which is what a multi-member entry needs once undo can no
+        // longer reverse a half-applied state.
+        //
+        // Each member is judged against the state its predecessors leave, not
+        // against the state before the compound. That is what lets a cascade
+        // exist: deleting a container removes the objects inside it first, and
+        // the container's own removal is only legal once they are gone — removing
+        // it while a child still names it as parent is the dangling reference
+        // that makes a whole project unsaveable. Judged all at once against the
+        // pre-state, every cascade would be refused.
+        //
+        // The simulation is a copy, so a refusal still changes nothing.
         SemanticOperation::Compound(operations) => {
+            let mut working = document.clone();
             for member in operations {
-                validate(member, document, runtime)?;
+                validate(member, &working, runtime)?;
+                if let SemanticOperation::Structure(change) = member {
+                    // A failure here is not this function's to report: the real
+                    // apply runs next, against the real document.
+                    let _ = change.apply(&mut working);
+                }
             }
             Ok(())
         }
@@ -1270,6 +1314,79 @@ mod tests {
             .iter()
             .map(|n| n.id.as_str().to_owned())
             .collect()
+    }
+
+    fn remove(node: StructuralNode, at: usize) -> SemanticOperation {
+        SemanticOperation::Structure(StructureChange::Remove {
+            node,
+            node_index: at,
+            child_index: None,
+        })
+    }
+
+    #[test]
+    fn a_removal_that_would_orphan_a_child_is_refused() {
+        // The counterpart to the insert-side refusal. Removing a container while
+        // its children survive leaves each of them naming a parent that is gone,
+        // and `lamine.yaml` refuses to encode that — so the project stops saving
+        // entirely rather than losing a single object.
+        let parent = structural("spool-parent", "Parent", None);
+        let child = structural("spool-child", "Child", Some("spool-parent"));
+        let mut session = structure_session(vec![parent.clone(), child]);
+
+        let error = session
+            .execute(remove(parent, 0))
+            .expect_err("removing a node that still has children must be refused");
+        assert_eq!(
+            error,
+            OperationError::NodeHasChildren(NodeId::new("spool-parent").unwrap()),
+            "and the refusal has to say why, not merely fail"
+        );
+        assert_eq!(
+            session.document.structure.nodes.len(),
+            2,
+            "a refusal leaves the document as it was"
+        );
+    }
+
+    #[test]
+    fn a_removal_is_allowed_once_the_children_are_gone() {
+        // The guard is about orphans, not about containers: the same removal is
+        // fine once nothing is left pointing at it, which is what makes a
+        // post-order cascade possible at all.
+        let parent = structural("spool-parent", "Parent", None);
+        let child = structural("spool-child", "Child", Some("spool-parent"));
+        let mut session = structure_session(vec![parent.clone(), child.clone()]);
+
+        assert!(session
+            .execute(remove(child, 1))
+            .expect("a leaf removal is fine"));
+        assert!(session
+            .execute(remove(parent, 0))
+            .expect("and then the container has nothing left to orphan"));
+        assert_eq!(session.document.structure.nodes.len(), 0);
+    }
+
+    #[test]
+    fn a_cascade_is_refused_when_judged_against_the_state_before_it() {
+        // The reason compound members are validated in order rather than all at
+        // once. A cascade removes a child before its parent, so judging every
+        // member against the pre-state would refuse the parent — and silently
+        // refuse the whole gesture with it, since a compound is all-or-nothing.
+        let parent = structural("spool-parent", "Parent", None);
+        let child = structural("spool-child", "Child", Some("spool-parent"));
+        let mut session = structure_session(vec![parent.clone(), child.clone()]);
+
+        assert!(
+            session
+                .execute(SemanticOperation::compound(vec![
+                    remove(child, 1),
+                    remove(parent, 0),
+                ]))
+                .expect("a post-order cascade is one legal operation"),
+            "child first, then the container that no longer has one"
+        );
+        assert_eq!(session.document.structure.nodes.len(), 0);
     }
 
     #[test]

@@ -7,7 +7,7 @@ use gpui::{
 };
 use std::{
     cell::Cell,
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     ops::Range,
     rc::Rc,
 };
@@ -5022,27 +5022,51 @@ impl CanvasView {
         self.commit_text_edit();
         self.abandon_interaction();
         let ids = self.selection.ids().to_vec();
-        let deleted = self.session.runtime.remove_objects(&ids);
+
+        // A container takes its contents with it.
+        //
+        // The authored source is what decides this rather than taste: a child is
+        // nested inside its container's element, so removing the container's
+        // element already removes the child's element with it. Keeping the child
+        // would leave a record in `lamine.yaml` for an element that is no longer
+        // in the source — a dangling binding, which is the same class of
+        // corruption as the dangling parent this avoids. So the subtree goes, and
+        // it goes in post-order so that no node is ever removed while another
+        // still names it as parent.
+        let doomed = self.subtree_of_selection(&ids);
+        let doomed_object_ids: Vec<ObjectId> = doomed
+            .iter()
+            .filter_map(|node| self.runtime_object_for(node.id.as_str()))
+            .collect();
+        // Whatever the runtime holds for the selected objects too: a node can be
+        // in the structure without a drawn object of its own.
+        let mut removed_ids = doomed_object_ids;
+        for id in &ids {
+            if let Some(node_id) = self.runtime_node_for(*id) {
+                if !doomed.iter().any(|node| node.id == node_id) {
+                    removed_ids.push(*id);
+                }
+            }
+        }
+        let deleted = self.session.runtime.remove_objects(&removed_ids);
         if deleted.is_empty() {
             self.retain_existing_selection();
             return false;
         }
+
         // The runtime half and the document half, as one entry. The node has to
         // leave `lamine.yaml` and lose its authored element too, or a reopen
         // would bring back an object the user deleted.
         let mut operations = Vec::with_capacity(deleted.len() * 2);
-        for placement in &deleted {
+        for node in doomed {
             let Some(index) = self
                 .session
                 .document
                 .structure
                 .nodes
                 .iter()
-                .position(|node| node.id == placement.object.spool_id)
+                .position(|candidate| candidate.id == node.id)
             else {
-                continue;
-            };
-            let Some(node) = self.session.document.structure.nodes.get(index).cloned() else {
                 continue;
             };
             operations.push(SemanticOperation::Structure(StructureChange::Remove {
@@ -5055,6 +5079,46 @@ impl CanvasView {
         self.commit_operation(SemanticOperation::compound(operations));
         self.retain_existing_selection();
         true
+    }
+
+    /// The structure nodes a deletion of `ids` has to take with it, post-order.
+    ///
+    /// Every selected node's subtree, deduplicated: selecting a container and
+    /// something inside it names the same node twice, and a removal is refused
+    /// for a node that is already gone.
+    fn subtree_of_selection(&self, ids: &[ObjectId]) -> Vec<StructuralNode> {
+        let structure = &self.session.document.structure;
+        let mut seen: HashSet<NodeId> = HashSet::new();
+        let mut doomed: Vec<StructuralNode> = Vec::new();
+        for node in ids.iter().filter_map(|id| self.runtime_node_for(*id)) {
+            for candidate in structure.subtree_post_order(&node) {
+                if seen.insert(candidate.id.clone()) {
+                    doomed.push(candidate);
+                }
+            }
+        }
+        doomed
+    }
+
+    /// The structure identity behind a runtime object, if it has one.
+    fn runtime_node_for(&self, id: ObjectId) -> Option<NodeId> {
+        self.session
+            .runtime
+            .object(id)
+            .map(|object| object.spool_id.clone())
+    }
+
+    /// The runtime object drawn for a structure node, if it has one.
+    ///
+    /// A node can exist in `lamine.yaml` with nothing drawn for it, and those
+    /// still have to come out of the document.
+    fn runtime_object_for(&self, spool_id: &str) -> Option<ObjectId> {
+        self.session
+            .runtime
+            .objects()
+            .iter()
+            .find(|object| object.spool_id.as_str() == spool_id)
+            .map(|object| object.id)
     }
 
     pub fn duplicate_selection(&mut self, cx: &mut Context<Self>) -> bool {
@@ -13582,6 +13646,159 @@ mod tests {
             "the undone object was taken back out of the source: {html}"
         );
         assert_eq!(reopen(&root).runtime.objects().len(), 3);
+    }
+
+    #[test]
+    fn deleting_a_container_takes_its_contents_with_it_in_one_entry() {
+        // The cascade, at the level where it is decided: one gesture, one history
+        // entry, and the whole subtree gone from the runtime *and* the structure.
+        let root = project_scratch("landing.spool");
+        let mut view = project_view(&root);
+        let before_runtime = view.document_objects().len();
+        let before_nodes = view.persistent_document().structure.nodes.len();
+        assert!(
+            before_runtime >= 3 && before_nodes >= 3,
+            "the fixture nests objects"
+        );
+
+        let container = object_with_node(&view, "spool-frame-root");
+        let children: Vec<String> = view
+            .persistent_document()
+            .structure
+            .nodes
+            .iter()
+            .filter(|node| node.parent.as_ref() == Some(&container.spool_id))
+            .map(|node| node.id.as_str().to_owned())
+            .collect();
+        assert_eq!(children.len(), 2, "the landing fixture nests two objects");
+        let entries = view.session.history.undo_len();
+
+        view.selection.replace(vec![container.id]);
+        assert!(view.delete_selected_objects());
+
+        // Everything went: the container, and what was inside it.
+        assert!(!view
+            .document_objects()
+            .iter()
+            .any(|object| children.contains(&object.spool_id.as_str().to_owned())));
+        assert!(view.persistent_document().structure.nodes.is_empty());
+        assert_eq!(
+            view.session.history.undo_len(),
+            entries + 1,
+            "a cascade is still one gesture and therefore one entry"
+        );
+
+        // And no node was left naming a parent that is gone, which is what used
+        // to make the project unsaveable.
+        let ids: Vec<&str> = view
+            .persistent_document()
+            .structure
+            .nodes
+            .iter()
+            .map(|node| node.id.as_str())
+            .collect();
+        for node in &view.persistent_document().structure.nodes {
+            if let Some(parent) = &node.parent {
+                assert!(
+                    ids.contains(&parent.as_str()),
+                    "{} is named by a node but is not there",
+                    parent.as_str()
+                );
+            }
+            for child in &node.children {
+                assert!(
+                    ids.contains(&child.as_str()),
+                    "{} is listed by a node but is not there",
+                    child.as_str()
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn undoing_a_container_deletion_brings_the_whole_subtree_back() {
+        // The half of the history contract that a cascade could plausibly break:
+        // undo replays a compound in reverse, so the container has to be restored
+        // before the children that link into it, or they come back stranded.
+        let root = project_scratch("landing.spool");
+        let mut view = project_view(&root);
+        let before_runtime: Vec<String> = view
+            .document_objects()
+            .iter()
+            .map(|object| object.spool_id.as_str().to_owned())
+            .collect();
+        let before_nodes = view.persistent_document().structure.nodes.clone();
+
+        let container = object_with_node(&view, "spool-frame-root");
+        view.selection.replace(vec![container.id]);
+        assert!(view.delete_selected_objects());
+
+        view.session.undo().expect("undo");
+
+        let after_runtime: Vec<String> = view
+            .document_objects()
+            .iter()
+            .map(|object| object.spool_id.as_str().to_owned())
+            .collect();
+        assert_eq!(after_runtime, before_runtime, "every object comes back");
+        assert_eq!(
+            view.persistent_document().structure.nodes.len(),
+            before_nodes.len(),
+            "and every structural node"
+        );
+        for node in &before_nodes {
+            let restored = view
+                .persistent_document()
+                .structure
+                .nodes
+                .iter()
+                .find(|candidate| candidate.id == node.id)
+                .unwrap_or_else(|| panic!("{} was not restored", node.id.as_str()));
+            assert_eq!(
+                restored.parent,
+                node.parent,
+                "{} came back with a different parent",
+                node.id.as_str()
+            );
+        }
+
+        // Redo takes it all away again.
+        view.session.redo().expect("redo");
+        assert!(view.persistent_document().structure.nodes.is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_deleted_container_does_not_come_back_from_the_source() {
+        let root = project_scratch("landing.spool");
+        let mut view = project_view(&root);
+        let container = object_with_node(&view, "spool-frame-root");
+        view.selection.replace(vec![container.id]);
+        assert!(view.delete_selected_objects());
+        view.save_project()
+            .expect("a container deletion leaves a saveable project");
+
+        let html = std::fs::read_to_string(root.join("pages/index.html")).expect("html");
+        for gone in [
+            "spool-frame-root",
+            "spool-text-headline",
+            "spool-cta-primary",
+        ] {
+            assert!(
+                !html.contains(gone),
+                "{gone} is still in the source: {html}"
+            );
+        }
+        let metadata = std::fs::read_to_string(root.join("lamine.yaml")).expect("metadata");
+        assert!(
+            !metadata.contains("spool-frame-root"),
+            "the deleted container is still in lamine.yaml: {metadata}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

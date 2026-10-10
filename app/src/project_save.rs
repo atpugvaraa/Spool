@@ -1565,13 +1565,47 @@ fn render_html(
         ));
     }
 
-    for removal in removes.into_iter().flatten() {
+    for removal in outermost_only(removes.into_iter().flatten()) {
         // Taking an element out also takes the line it was on. Leaving the
         // indentation behind would leave a line of spaces where the element was.
         let start = line_start_with_indent(original, removal.range.start);
         replacements.push((start..removal.range.end, String::new()));
     }
     apply_replacements(original, replacements)
+}
+
+/// Drop removals whose range already sits inside another removal's.
+///
+/// A cascade removes a container and everything inside it, so both arrive here
+/// with byte ranges, and the inner ones are already covered by the outer one.
+/// They cannot simply all be applied: `apply_replacements` takes the latest
+/// start first, so the innermost element would be lifted out and the container's
+/// own tags would survive, empty. Removing the container takes its contents with
+/// it in one edit instead.
+///
+/// Only ranges from the same file can contain one another, and the caller has
+/// already grouped them by file, so this runs per file.
+fn outermost_only<'a, I: IntoIterator<Item = &'a PlannedRemoval>>(
+    removals: I,
+) -> Vec<&'a PlannedRemoval> {
+    let removals: Vec<&PlannedRemoval> = removals.into_iter().collect();
+    let mut kept: Vec<&'a PlannedRemoval> = Vec::with_capacity(removals.len());
+    for candidate in removals {
+        // Contained by something already kept: that removal covers it.
+        if kept.iter().any(|existing| {
+            existing.range.start <= candidate.range.start
+                && existing.range.end >= candidate.range.end
+        }) {
+            continue;
+        }
+        // Contains something already kept: this one covers them all instead.
+        kept.retain(|existing| {
+            !(candidate.range.start <= existing.range.start
+                && candidate.range.end >= existing.range.end)
+        });
+        kept.push(candidate);
+    }
+    kept
 }
 
 /// Start the line `offset` is on, including its indentation.
