@@ -3130,9 +3130,11 @@ impl CanvasView {
     /// key that is about to do something must not announce that it is about to
     /// fail.
     fn text_backspace(&mut self, _: &Backspace, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.delete_a_character(false) {
-            diagnostics::count("canvas_notify", 1);
-            cx.notify();
+    if self.delete_a_character(false) {
+        diagnostics::count("canvas_notify", 1);
+        cx.notify();
+    } else {
+        cx.propagate();
         }
     }
 
@@ -3142,9 +3144,10 @@ impl CanvasView {
         if self.delete_a_character(true) {
             diagnostics::count("canvas_notify", 1);
             cx.notify();
+        } else {
+            cx.propagate();
         }
     }
-
     /// Delete one character, or the selected range, from the open buffer.
     ///
     /// `forward` is `⌦` rather than `⌫`. Returns whether there was a buffer to
