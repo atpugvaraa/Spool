@@ -1130,10 +1130,14 @@ mod tests {
     #[test]
     fn a_save_with_no_edits_writes_nothing() {
         let root = scratch("save-noop");
-        let before: Vec<(String, String)> = tree(&root)
+        // Compared as bytes, not as text. The question is whether the save
+        // changed the file, and bytes answer that for every file in the project
+        // — including any that are not text, such as the `.DS_Store` macOS drops
+        // into a directory whenever it has been opened in Finder.
+        let before: Vec<(String, Vec<u8>)> = tree(&root)
             .into_iter()
             .map(|rel| {
-                let bytes = read(&root.join(&rel));
+                let bytes = std::fs::read(root.join(&rel)).expect("read file");
                 (rel, bytes)
             })
             .collect();
@@ -1149,7 +1153,7 @@ mod tests {
         );
         for (rel, bytes) in before {
             assert_eq!(
-                read(&root.join(&rel)),
+                std::fs::read(root.join(&rel)).expect("read file"),
                 bytes,
                 "{rel} changed on a no-op save"
             );
