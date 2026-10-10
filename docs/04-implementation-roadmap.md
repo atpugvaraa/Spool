@@ -1,44 +1,110 @@
 # Implementation roadmap
 
-Work in order. Each milestone must meet its acceptance checks before the next subsystem begins.
+**Status updated: 2026-10-10.** This file is Spool's single live summary of
+project maturity, the next milestone, and contributor-sized work. The README
+introduces Spool; it is not the status log. Use GitHub issues or assigned tasks
+for owners, discussion, and detailed progress, then link the active tasks here.
 
-## 1. Source-backed foundation (now)
+## Current state
 
-Deliver stable opaque Spool node IDs; `lamine.yaml` load/save and validation; HTML source bindings; distinct persistent document and transient editor-state types; one semantic operation with undo/redo; a small fixture project. Integrate the model with the existing editor rather than creating a second app.
+Spool has a native GPUI editor, `.spool` project creation and opening, a
+source-backed document model, and a bounded set of visual edits that write back
+to authored HTML/CSS and `lamine.yaml`. Supported object creation and
+duplication persist through save/reopen. Deleting a container deletes its
+descendants in one semantic history operation; undo restores the subtree.
 
-**Accept when:** round-trip preserves IDs, names, hierarchy, and bindings; duplicate/dangling metadata is rejected; operation/undo/redo restore exact values and preserve redo on no-op; external source bytes remain unchanged; focused model tests and the existing suite pass.
+The governing boundaries remain in [Product and Boundaries](01-product-and-boundaries.md),
+[Document and Source Model](02-document-and-source-model.md), and
+[Editor Runtime and History](03-editor-runtime-history.md). In brief: HTML,
+CSS, and SVG remain authored truth; `lamine.yaml` holds Spool identity and
+structure; editor runtime state is disposable; persistent changes use semantic
+operations and history.
 
-## 2. Source-preserving edits
+## Completed slices
 
-Add incremental HTML/CSS parsing and patching for a bounded supported syntax, source provenance, external-edit reconciliation, and multi-file atomic writes.
+- **Project lifecycle and source-backed editing:** open and create `.spool`
+  projects; preserve authored source outside supported edit spans; save and
+  reopen supported text, geometry, style, rename, and created-object changes.
+- **Core interaction and persistence:** click/drag creation, tool handoff,
+  canvas keyboard focus, verified GPUI window interactions, and persistent
+  deletion/undo behavior, including container cascades.
+- **Verification foundations:** focused tests and mutation harnesses cover key
+  interaction, operation, project, and created-object invariants.
 
-**Accept when:** edits alter only intended source spans; parse/patch errors make no partial changes; unchanged regions remain byte-identical across fixtures; ambiguous cascade ownership is diagnosed.
+The latest implementation report is commit `f6453c1` (following `2587aed`). It
+reports 730 passing tests, clean formatting and Clippy, successful mutation
+runs, and a release bundle launch. Interactive GUI verification was not done.
+These are agent-reported results and were not rerun while updating this roadmap.
 
-## 3. Semantic editing and runtime projection
+## Next milestone — reliable first editing workflow
 
-Move existing canvas operations onto the document operation boundary; derive runtime nodes, layout, and hit testing from source; preserve current tools and gestures.
+**Status: proposed working focus; team owners and target date are not assigned.**
+This follows the team's stated goal of completing the first usable application
+surface and the latest agent report's remaining risks. Confirm the scope and
+assign owners at the next team planning point.
 
-**Accept when:** current editor workflows behave as before, all persistent edits are undoable through semantic operations, and rebuilding runtime from saved source produces equivalent editable nodes.
+The milestone is complete when a contributor can demonstrate a supported
+project workflow from open through edit, save, close, and reopen, and can see
+what happened when an operation is refused.
 
-## 4. Renderer and scale, by evidence
+### Acceptance checks
 
-Separate scene/paint data from GPUI where needed; add spatial indexing, culling, and incremental invalidation only against measured workloads.
+1. A supported `.spool` project opens into its authored document. A project
+   deliberately emptied of all managed nodes does not silently become the
+   starter scene on reopen.
+2. Create, duplicate, edit, and delete (including container cascade) each
+   update the runtime, persistent structure, and authored source consistently.
+3. Each committed action is one undo step; undo and redo restore the expected
+   objects and source. Cancelled actions add no history entry.
+4. A refused semantic operation is visible to the user and does not leave
+   runtime, document, source, or history in conflicting states.
+5. Unsupported or ambiguous source edits are reported without rewriting
+   unrelated authored bytes.
+6. Focused model and GPUI window tests cover the workflow. Relevant mutation
+   harnesses must detect removed behavior and restore files even when a mutant
+   fails.
 
-**Accept when:** deterministic renderer/model tests pass and benchmarks demonstrate the targeted improvement without changing source semantics.
+### Candidate tasks (unassigned)
 
-## 5. Advanced document concepts
+- **Operation refusal behavior:** trace `commit_operation` and its callers;
+  define the smallest user-visible failure message and ensure a refusal cannot
+  leave eager runtime changes behind.
+- **Empty-project reopen:** reproduce the zero-node case and specify whether an
+  empty document is a valid saved project; make open/reopen behavior match that
+  decision.
+- **Surface consistency pass:** choose one reported Canvas/Layers/Inspector
+  behavior at a time, establish expected behavior, and add a reproducible
+  acceptance test before implementing a fix.
+- **Mutation harness maintenance:** resolve the four stale anchors reported in
+  `mutate_ops.sh` as separate test-tooling work.
 
-Add frames/groups/masks/components, CSS ownership/cascade inspection, assets, and collaboration only when a concrete vertical slice requires them. Each concept must define source representation, metadata boundary, operation/history behavior, and migration path before implementation.
+No contributor owns these tasks yet. Assign one task per person with an
+acceptance check and review date; avoid parallel edits to high-coupling canvas
+or shell behavior without coordination.
 
-## Do not build prematurely
+## Later, when a concrete workflow needs it
+
+- Expand the supported CSS/layout subset based on real project examples and
+  explicit source-ownership rules.
+- Improve design-editor interaction consistency in focused slices.
+- Measure renderer or document-scale bottlenecks before adding optimization
+  infrastructure.
+- Explore local AI operating on the same structured, source-backed project.
+
+These are directions, not committed milestone dates or feature promises.
+
+## Keep out of the current milestone
 
 - A general browser-compatible CSS engine or complete cascade inspector.
-- A proprietary duplicate of HTML/CSS visual properties in `lamine.yaml`.
-- A browser DOM as the runtime scene graph.
-- Binary persistence, cache infrastructure, million-node optimizations, spatial indexes, or a plugin/agent registry without a measured or user-facing need.
-- Components, variants, constraints, collaboration, or a generalized transaction framework before a real operation requires them.
+- A duplicate store of HTML/CSS visual properties in `lamine.yaml`.
+- A browser DOM as the editor's runtime scene graph.
+- Collaboration, plugin/MCP infrastructure, or an AI agent runtime.
+- Large-scale optimization without a measured bottleneck.
 - A parallel demonstration app or wholesale rewrite of existing GPUI tools.
 
-## Verification
+## Contributor verification
 
-Every milestone adds focused model/operation/source tests, then runs the app crate's existing test suite. Report any platform or dependency limitation with its exact failing command and output; do not label an unrun check as passing.
+Read [CONTRIBUTING.md](../CONTRIBUTING.md) for setup and checks. Run focused
+tests for changed behavior and the app crate's test suite. Report exact commands
+and outcomes; label agent-reported or unrun checks accurately. If platform or
+dependency limits prevent a check, include the command and failure details.

@@ -1,78 +1,107 @@
 # Spool
 
-**A local-first design tool that makes graphics design, UI/UX and branding easier and quicker to prototype on your devices—even without an internet connection.**
+**A local-first design editor for graphics, UI/UX, and branding.** Shape and
+refine an interface on a native canvas, keep its authored source, and build
+toward AI that understands the project you are editing.
 
+Spool is a student-built project from [Google Developer Groups](https://www.instagram.com/gdg.tiet/) at Thapar
+Institute of Engineering and Technology.
+It is for people who want the directness of a visual editor without losing the
+transparency and portability of the code behind a design.
 
-Spool is a student-built, open-source design tool from [Google Developer Groups](https://www.instagram.com/gdg.tiet/)
-at Thapar Institute of Engineering and Technology. Open an existing interface,
-inspect its structure, select elements on a native canvas, make supported
-visual edits, and save those changes back into the project's authored source.
+Your project stays yours: Spool writes supported edits back into the source
+files you opened. It is not a browser engine, a hosted design service, or a
+Figma reimplementation. Familiar editor interactions help make it approachable; source-backed editing is the product's center.
 
-Your project stays yours. HTML, CSS and SVG are the authored design. Spool uses
-`lamine.yaml` for Spool-specific identity, hierarchy and source bindings; it
-does not duplicate the project's visual properties. The editor is early and
-actively being built. Private, local AI is a long-term vision, not a feature
-available in the app today.
+[Get started](#get-started) · [What works](#what-works-today) · [Roadmap](docs/04-implementation-roadmap.md) · [Contributing](CONTRIBUTING.md)
+
+## Why Spool
+
+### Work on the design you already have
+
+Open a `.spool` project and inspect its structure in the Canvas, Layers, and
+Inspector. Make supported changes directly, then save them back into the
+project's authored files.
+
+### Keep the source human-readable
+
+HTML, CSS, and SVG remain the authored design. Spool uses `lamine.yaml` for stable Spool identity, hierarchy, and source bindings. It does not turn that metadata into a second store for visual properties.
+
+### Keep editing local
+
+The native editor works with project files on your device. The project can be opened and edited as ordinary source; Spool's runtime is a working representation that can be rebuilt from the project.
+
+### Build toward design-aware assistance
+
+The long-term direction includes private, local AI that can work with the same
+structured project as the editor. AI assistance is **not available in the app
+today**.
 
 ## What works today
 
-- Open an existing `.spool` project — an `HTML`/`CSS` project with its
-  `lamine.yaml` metadata — and edit it through the native Canvas, Layers and
-  Inspector.
-- Select and multi-select objects, move and resize them, duplicate or delete
-  them in the current session, rename layers, edit text and change supported
-  visual properties.
-- Use alignment snapping, canvas navigation, and undo/redo for supported edits.
-- Save supported changes back to their owning source files. The audit verified
-  minimal authored diffs, correct CSS ownership, no-op saves that write
-  nothing, and repeated save/reopen/edit cycles that preserve the project.
+- Open and create `.spool` projects.
+- Select and multi-select supported objects; create, duplicate, move, resize,
+  rename, and delete them.
+- Use the native Canvas, Layers, and Inspector, with text editing, alignment
+  snapping, canvas navigation, and undo/redo for supported actions.
+- Save supported changes to the authored project. Created and duplicated
+  objects persist through save and reopen; deleting a container deletes its
+  descendants as one undoable action.
+- Preserve unrelated authored source when saving supported edits.
 
-Spool's CSS and layout model is intentionally bounded. It supports a subset of
-authored styles and layout behavior; it is not a browser engine. For example,
-flex layout and `gap`, inline layout, text wrapping, CSS custom properties as
-first-class values, descendant selectors, media queries, `@layer`, and
-`!important` are not fully modelled. Unsupported edits may be refused on save
-with a diagnostic. Some current interaction and Inspector inconsistencies are
-also documented in the [Human Interaction Audit](docs/research/README.md) and
-the implementation roadmap.
+These capabilities are still developing. The project tracks the current
+milestone, known gaps, and deferred work in the [implementation roadmap](docs/04-implementation-roadmap.md).
 
-## Current limitations
+## Honest status
 
-- **Created-object persistence is not implemented.** Duplicated or otherwise
-  created objects can exist during an editing session, but saving them to the
-  authored project is not yet supported.
-- **CSS and layout coverage is limited.** Spool does not yet reproduce all
-  browser layout or cascade behavior. See the support boundary above and the
-  [roadmap](docs/04-implementation-roadmap.md).
-- **Some values and interactions need clearer feedback.** The audit found
-  cases where opening an invalid project can fail without an on-screen error,
-  the Inspector can show a display placeholder as though it were authored, and
-  selection behavior differs between Canvas and Layers. These are known gaps,
-  not claims of completed behavior.
-- **AI is a future direction.** The current editor does not include AI agents
-  or local AI features.
+Spool is an early-stage editor. Its CSS and layout support is deliberately
+bounded: it does not reproduce browser behavior for all flex layouts and `gap`, inline layout, text wrapping, CSS custom properties, descendant selectors,
+media queries, `@layer`, or `!important`. Ambiguous or unsupported edits may be refused.
 
-## Try it
+Two current reliability gaps are tracked for the next milestone: some refused
+semantic operations need clearer user feedback, and reopening a project with no managed nodes can fall back to the starter scene. See the [roadmap](docs/04-implementation-roadmap.md) for acceptance checks and task status. The roadmap is the changing project-status page; this README focuses on what Spool is and how to try it.
 
-### Native app
+## Under the hood
 
-Install a current stable Rust toolchain and use a platform supported by GPUI.
-From the repository root:
+- **Source-backed:** HTML, CSS, and SVG are the authored implementation.
+- **Structural metadata:** `lamine.yaml` supplies Spool IDs, hierarchy, and
+  source bindings.
+- **Native editor:** Rust and GPUI provide the Canvas, Layers, Inspector, and
+  interaction runtime.
+- **Semantic history:** persistent user actions use the shared operation and
+  undo/redo path.
+- **Bounded by design:** unsupported source ownership is surfaced rather than guessed at or silently rewritten.
+
+```text
+HTML / CSS / SVG + lamine.yaml
+              ↓
+     source-backed document
+              ↓
+       native editor runtime
+              ↓
+ Canvas · Layers · Inspector
+              ↓
+ supported edits saved to source
+```
+
+Read the [product boundaries](docs/01-product-and-boundaries.md),
+[document and source model](docs/02-document-and-source-model.md), and
+[editor runtime and history](docs/03-editor-runtime-history.md) for the
+architecture contracts.
+
+## Get started
+
+### Run the native app
+
+Install a current stable Rust toolchain on a platform supported by GPUI. From
+the repository root:
 
 ```sh
-# for debug mode
 cd app
 cargo run
 ```
 
-```sh
-# for release build
-cd app
-cargo build --release --locked
-./target/release/Spool
-```
-
-To open the included source-backed example:
+To open the included source-backed example during development:
 
 ```sh
 cd app
@@ -80,22 +109,15 @@ SPOOL_PROJECT=./fixtures/landing cargo run
 ```
 
 `SPOOL_PROJECT` is a development override. A real project is a directory named
-`*.spool`, and the application opens one from its command line:
+`*.spool`; open it by passing its path to the app:
 
 ```sh
 dist/Spool.app/Contents/MacOS/Spool ~/projects/MyProject.spool
 ```
 
-A `.spool` project is a directory containing a `lamine.yaml` manifest beside the
-authored HTML, CSS and SVG — plain files that stay readable and editable in
-place. See [app setup guide](docs/development/getting-started.md) for the exact
-contract.
+The first build fetches and compiles GPUI from the pinned Zed source, so it can take a while and needs network access. The [development guide](docs/development/getting-started.md) explains the project format, app setup, packaging, and verification commands.
 
-The first build downloads and compiles GPUI from the pinned Zed source, so it
-can take a while and needs network access. See the
-[app setup guide](docs/development/getting-started.md) for details.
-
-### Website
+### Run the website
 
 The website is a separate Next.js project. It requires Bun 1.4.2, pinned in
 `website/package.json`:
@@ -106,61 +128,11 @@ bun install
 bun run dev
 ```
 
-## Architecture and how it works
+## Contribute
 
-Spool starts from the project you open. HTML, CSS and SVG remain the authored
-source; `lamine.yaml` supplies the stable identity, hierarchy and source
-bindings Spool needs to connect those files to editor objects. The runtime is
-an editing and rendering representation that can be reconstructed from the
-project. When you make a supported change, Spool routes it back to the
-appropriate source file while preserving unrelated authored content.
-
-```text
-Existing HTML / CSS / SVG + lamine.yaml
-                  ↓
-       Spool's native editor runtime
-                  ↓
-       Canvas, Layers and Inspector
-                  ↓
-     supported edits written to source
-                  ↓
-       save, close and reopen project
-```
-
-Read more about the boundaries and implementation in
-[Product and Boundaries](docs/01-product-and-boundaries.md),
-[Document and Source Model](docs/02-document-and-source-model.md), and
-[Editor Runtime and History](docs/03-editor-runtime-history.md).
-
-## Where we're going
-
-The next major milestone is **created-object persistence**: making objects
-created or duplicated in the editor persist correctly in the HTML/CSS/SVG
-project and its metadata. This extends Spool's central promise: visual edits
-operate on the project itself and survive saving and reopening.
-
-Beyond that, the project will continue to expand its supported CSS and layout
-model and improve feedback around unsupported or synthesized values. Private,
-local AI remains a longer-term direction for working with structured projects,
-not part of today's feature set. See the
-[implementation roadmap](docs/04-implementation-roadmap.md) for current
-priorities.
-
-## Contributing
-
-Spool is built by students, and contributions to both the native app and
-website are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md), then use
-the [development setup guide](docs/development/getting-started.md) to run the
-part you want to work on.
-
-## Further docs
-
-- [Implementation roadmap](docs/04-implementation-roadmap.md)
-- [Product and Boundaries](docs/01-product-and-boundaries.md)
-- [Document and Source Model](docs/02-document-and-source-model.md)
-- [Editor Runtime and History](docs/03-editor-runtime-history.md)
-- [Research notes](docs/research/README.md)
-- [App development setup](docs/development/getting-started.md)
+Start with [CONTRIBUTING.md](CONTRIBUTING.md) to find the current milestone, choose a bounded task, set up the app or website, and check your change. The
+[implementation roadmap](docs/04-implementation-roadmap.md) is the single live
+status summary; assigned issues or tasks carry owners and detailed progress.
 
 ## License
 

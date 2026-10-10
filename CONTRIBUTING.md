@@ -21,17 +21,28 @@ if a task needs to cross the boundary, explain why in the pull request.
 
 ## Find a first task
 
-Start with an issue or a concrete problem you’ve noticed. Good first changes
-are small enough to understand and review: fix a clear bug, improve an existing
-interaction, add a focused test, or clarify a page of documentation. If you
-have an idea but aren’t sure where it belongs, open an issue to discuss the
-scope before building a larger change.
+Start with an assigned issue or a concrete problem you’ve noticed. Check the
+[implementation roadmap](docs/04-implementation-roadmap.md) for the current
+milestone and its acceptance checks; use issues or assigned tasks for owners,
+discussion, and detailed progress. Roadmap bullets are priorities, not blanket
+authorization to expand scope. Good first changes are small enough to
+understand and review: fix a clear bug, improve one existing interaction, add a
+focused test, or clarify a page of documentation. If you have an idea but
+aren’t sure where it belongs, open an issue to discuss the scope before
+building a larger change.
 
-The [roadmap](docs/04-implementation-roadmap.md) shows the order in which the
-editor’s foundations are being developed. The deeper rationale is in
-[docs/01](docs/01-product-and-boundaries.md) through
-[docs/04](docs/04-implementation-roadmap.md), with prior investigation in
-[`docs/research/`](docs/research/README.md).
+The README introduces Spool and its stable entry points. Routine feature status
+belongs in the roadmap, so ordinary implementation work should not need a
+README update. Update the roadmap when milestone status or priorities change;
+update architecture docs only when an underlying decision changes.
+
+The [roadmap](docs/04-implementation-roadmap.md) shows current project status,
+the proposed next milestone, and candidate tasks. The architecture contracts
+are in [Product and Boundaries](docs/01-product-and-boundaries.md),
+[Document and Source Model](docs/02-document-and-source-model.md), and
+[Editor Runtime and History](docs/03-editor-runtime-history.md). Prior
+investigation is in [`docs/research/`](docs/research/README.md); treat it as
+background evidence, not as the live task list.
 
 ## Set up your project
 
@@ -117,7 +128,9 @@ prompts, and don’t let a tool make broad changes outside the task.
 Keep each pull request focused. In its description, explain the problem, the
 change, how you checked it, and any known limitation. Include screenshots or a
 short recording when they help reviewers understand a visual or interaction
-change.
+change. Link the issue or milestone task when there is one, and state which
+acceptance check the change satisfies. Report commands and results you actually
+ran; distinguish those from checks reported by another contributor or agent.
 
 Review is a conversation about correctness, clarity and fit with the project’s
 direction. Please respond to questions and update the pull request when a
