@@ -341,12 +341,15 @@ source = source.replace(old, new, 1)' \
 # 23. A rename writes the runtime name without touching the document.
 run_mutation "a rename only changes the runtime copy" \
   src/canvas.rs \
-  'old = """        let Ok(operation) =
-            crate::operations::rename_node_in(&self.session.document, node.clone(), name)
-        else {
-            return false;
-        };
-        let changed = self.session.execute(operation).unwrap_or(false);"""
+  'old = """        let changed = crate::operations::rename_node_in(&self.session.document, node.clone(), name)
+            .and_then(|operation| self.session.execute(operation));
+        let changed = match changed {
+            Ok(changed) => changed,
+            Err(error) => {
+                self.refuse("rename", &error);
+                return false;
+            }
+        };"""
 new = """        let changed = self.session.runtime.set_object_name(id, name);"""
 assert old in source, "rename operation pattern not found"
 source = source.replace(old, new, 1)' \

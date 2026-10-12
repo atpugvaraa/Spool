@@ -123,8 +123,10 @@
 //! # Who is on the live path
 //!
 //! `canvas::CanvasView` owns an [`EditSession`] and funnels every mutation
-//! through [`EditSession::execute`] via its private `commit`. So the live set
-//! is [`SemanticOperation`], [`SemanticHistory`], [`Origin`], [`EditSession`],
+//! through [`EditSession::execute`] via its private `commit` — by way of
+//! [`EditSession::execute_eager`], because the canvas has already applied the
+//! runtime half by the time it commits. So the live set is
+//! [`SemanticOperation`], [`SemanticHistory`], [`Origin`], [`EditSession`],
 //! [`OperationTarget::Full`], and [`apply`].
 //!
 //! One piece of the surface is deliberately retained without a production
@@ -884,6 +886,49 @@ impl EditSession {
         )?;
         self.history.record_from(origin, operation);
         Ok(true)
+    }
+
+    /// [`EditSession::execute`] for an operation whose runtime half the caller
+    /// has already applied.
+    ///
+    /// The canvas mutates the runtime while a gesture is happening, so by the
+    /// time it commits, the runtime already shows the `after` state. A refusal
+    /// from `execute` leaves the document and history untouched, as promised —
+    /// but the runtime would go on showing an edit that nothing accepted: a
+    /// created object drawn with no node behind it, or a deleted one gone from
+    /// the canvas while it stays in `lamine.yaml` with no undo entry to bring
+    /// it back.
+    ///
+    /// So a refusal here also replays the runtime members backwards, which is
+    /// what an undo of the same operation does to the runtime. Only the runtime
+    /// half is reversed because it is the only half applied early: structure
+    /// and rename members reach the document through `execute` alone, and
+    /// `execute` refuses at validation, before applying any of them. That rests
+    /// on the "Atomicity" rule above: once validation passes, structure and
+    /// runtime members cannot fail to apply. A compound of two renames is the
+    /// one shape that could, because validation does not carry a rename forward
+    /// to the next member; nothing builds one.
+    pub fn execute_eager(&mut self, operation: SemanticOperation) -> Result<bool, OperationError> {
+        // `execute` consumes the operation, and a refusal still has to know what
+        // to put back. The runtime commands are all it needs.
+        let runtime_half: Vec<DocumentCommand> = operation
+            .members()
+            .into_iter()
+            .filter_map(|member| match member {
+                SemanticOperation::Runtime(command) => Some(command.clone()),
+                _ => None,
+            })
+            .collect();
+        let result = self.execute(operation);
+        if result.is_err() {
+            // Reverse order, as an undo replays a compound: a later member's
+            // `before` is the state an earlier member left, so each one has to be
+            // taken back from where the next one found it.
+            for command in runtime_half.iter().rev() {
+                command.replay(&mut self.runtime, ReplayDirection::Undo);
+            }
+        }
+        result
     }
 
     pub fn undo(&mut self) -> Result<bool, OperationError> {
@@ -2603,5 +2648,97 @@ mod tests {
         assert_eq!(view.camera_offset, (120, -30));
         // Five undos leave only the seed creation that predates them.
         assert_eq!(session.history.undo_len(), depth);
+    }
+
+    // ── refusals of eagerly applied operations ─────────────────────────────
+
+    #[test]
+    fn a_refused_eager_creation_takes_its_object_back_off_the_runtime() {
+        // The canvas mints the object before it commits. The structural half is
+        // refused because the name is taken, and without the revert the object
+        // stayed drawn with no node behind it and no entry to undo.
+        let mut session = session();
+        let (id, runtime_insert) = plan_create_rect(&mut session);
+        let mut taken = structural("spool-new", "Alpha", None);
+        taken.kind = "rectangle".to_owned();
+        let operation = SemanticOperation::compound(vec![insert(taken, 2), runtime_insert]);
+
+        assert_eq!(
+            session.execute_eager(operation).unwrap_err(),
+            OperationError::DuplicateName("Alpha".into())
+        );
+        assert!(
+            session.runtime.object(id).is_none(),
+            "the refused object is no longer in the runtime"
+        );
+        assert_eq!(ids(&session.document), vec!["spool-a", "spool-b"]);
+        assert_eq!(session.history.undo_len(), 0, "and nothing was recorded");
+    }
+
+    #[test]
+    fn a_refused_eager_deletion_puts_its_objects_back_where_they_were() {
+        let mut session = session();
+        let first = seed_rect(&mut session);
+        let second = seed_rect(&mut session);
+        let geometry = geometry_of(&session, first);
+        let depth = session.history.undo_len();
+
+        // The canvas removes before it commits; the removal of a node that is not
+        // in the document is what gets refused.
+        let removed = session.runtime.remove_objects(&[first]);
+        let operation = SemanticOperation::compound(vec![
+            remove(structural("spool-gone", "Gone", None), 0),
+            SemanticOperation::Runtime(DocumentCommand::delete(removed)),
+        ]);
+
+        assert_eq!(
+            session.execute_eager(operation).unwrap_err(),
+            OperationError::MissingNode(NodeId::new("spool-gone").unwrap())
+        );
+        let order: Vec<ObjectId> = session.runtime.objects().iter().map(|o| o.id).collect();
+        assert_eq!(order, vec![first, second], "back at its original index");
+        assert_eq!(geometry_of(&session, first), geometry);
+        assert_eq!(session.history.undo_len(), depth);
+    }
+
+    #[test]
+    fn a_refused_eager_compound_is_taken_back_last_member_first() {
+        // Two moves of one object in one entry: the second starts where the first
+        // ended. Reverting them in forward order leaves the object halfway.
+        let mut session = session();
+        let id = seed_rect(&mut session);
+        let start = geometry_of(&session, id);
+        let first = plan_move(&session, &[id], 10.0, 0.0);
+        apply(
+            &first,
+            &mut OperationTarget::Runtime(&mut session.runtime),
+            ReplayDirection::Redo,
+        )
+        .unwrap();
+        let second = plan_move(&session, &[id], 0.0, 10.0);
+        apply(
+            &second,
+            &mut OperationTarget::Runtime(&mut session.runtime),
+            ReplayDirection::Redo,
+        )
+        .unwrap();
+        let operation = SemanticOperation::compound(vec![
+            first,
+            second,
+            remove(structural("spool-gone", "Gone", None), 0),
+        ]);
+
+        assert!(session.execute_eager(operation).is_err());
+        assert_eq!(geometry_of(&session, id), start);
+    }
+
+    #[test]
+    fn an_accepted_eager_operation_is_recorded_like_any_other() {
+        let mut session = session();
+        let (id, operation) = plan_create_rect(&mut session);
+
+        assert!(session.execute_eager(operation).unwrap());
+        assert!(session.runtime.object(id).is_some());
+        assert_eq!(session.history.undo_len(), 1);
     }
 }

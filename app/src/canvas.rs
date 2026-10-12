@@ -2304,6 +2304,12 @@ pub struct CanvasView {
     /// see is the same as an object that jumped for no reason, so the guide is
     /// part of the interaction, not a decoration added afterwards.
     snap_guides: Vec<snap::Guide>,
+    /// Why the last edit was refused, until the shell takes it to show.
+    ///
+    /// Editor state, never saved. A refused edit is put back and changes
+    /// nothing, which looks exactly like an edit that was never made unless
+    /// something says otherwise.
+    refusal: Option<String>,
     /// Debug-only: true pre-gesture positions for the runtime history probe.
     #[cfg(debug_assertions)]
     drag_start_positions: Vec<(f32, f32)>,
@@ -2412,6 +2418,7 @@ impl CanvasView {
             center_drag: false,
             hovered: None,
             snap_guides: Vec::new(),
+            refusal: None,
             #[cfg(debug_assertions)]
             drag_start_positions: Vec::new(),
         }
@@ -2461,8 +2468,8 @@ impl CanvasView {
         // Names are unique across the whole document, not just across the canvas,
         // so the counters have to start past whatever the project already calls its
         // objects. Without this a reopened project hands out `Rectangle 1` again,
-        // the structural change is refused for a duplicate name, and the creation
-        // silently does nothing.
+        // the structural change is refused for a duplicate name, and so is the
+        // creation.
         seed_object_names(
             &mut self.session.runtime,
             &self.session.document.structure.nodes,
@@ -2902,8 +2909,30 @@ impl CanvasView {
     /// a canvas edit to reach the document or the history, which is the property
     /// that keeps "one gesture is one history entry" true for the compound case
     /// as well as the simple one.
+    ///
+    /// A refusal puts the runtime back where the gesture found it — see
+    /// [`EditSession::execute_eager`] — so the selection loses whatever the
+    /// refused edit had created, and the reason is kept for the shell to show.
     fn commit_operation(&mut self, operation: SemanticOperation) -> bool {
-        self.session.execute(operation).unwrap_or(false)
+        match self.session.execute_eager(operation) {
+            Ok(changed) => changed,
+            Err(error) => {
+                self.retain_existing_selection();
+                self.refuse("apply the edit", &error);
+                false
+            }
+        }
+    }
+
+    /// Record why an operation was refused, for the shell's status line.
+    fn refuse(&mut self, action: &str, error: &OperationError) {
+        eprintln!("spool_operation_refused action={action:?} {error}");
+        self.refusal = Some(format!("Could not {action}: {error}"));
+    }
+
+    /// The last refusal, once. The shell moves it into its status line.
+    pub fn take_refusal(&mut self) -> Option<String> {
+        self.refusal.take()
     }
 
     pub fn is_text_editing(&self) -> bool {
@@ -3530,7 +3559,16 @@ impl CanvasView {
     fn undo_history(&mut self) -> bool {
         self.commit_text_edit();
         self.commit_in_flight_interaction();
-        let changed = self.session.undo().unwrap_or(false);
+        // Finishing what was in flight can itself be refused. The edit the user
+        // was making is then already gone, and going on would revert an older
+        // edit they never pointed this key at.
+        if self.refusal.is_some() {
+            return false;
+        }
+        let changed = self.session.undo().unwrap_or_else(|error| {
+            self.refuse("undo", &error);
+            false
+        });
         if changed {
             self.retain_existing_selection();
             self.refresh_object_names();
@@ -3542,7 +3580,13 @@ impl CanvasView {
     fn redo_history(&mut self) -> bool {
         self.commit_text_edit();
         self.commit_in_flight_interaction();
-        let changed = self.session.redo().unwrap_or(false);
+        if self.refusal.is_some() {
+            return false;
+        }
+        let changed = self.session.redo().unwrap_or_else(|error| {
+            self.refuse("redo", &error);
+            false
+        });
         if changed {
             self.retain_existing_selection();
             self.refresh_object_names();
@@ -3552,7 +3596,9 @@ impl CanvasView {
 
     pub fn undo(&mut self, cx: &mut Context<Self>) -> bool {
         let changed = self.undo_history();
-        if changed {
+        // A refusal changes nothing on the canvas, but it still has to reach the
+        // shell, and the shell hears about the canvas through its notifications.
+        if changed || self.refusal.is_some() {
             diagnostics::count("canvas_notify", 1);
             cx.notify();
         }
@@ -3561,7 +3607,7 @@ impl CanvasView {
 
     pub fn redo(&mut self, cx: &mut Context<Self>) -> bool {
         let changed = self.redo_history();
-        if changed {
+        if changed || self.refusal.is_some() {
             diagnostics::count("canvas_notify", 1);
             cx.notify();
         }
@@ -3736,12 +3782,18 @@ impl CanvasView {
         if current == name {
             return false;
         }
-        let Ok(operation) =
-            crate::operations::rename_node_in(&self.session.document, node.clone(), name)
-        else {
-            return false;
+        // Nothing here was applied early, so a refusal has nothing to put back —
+        // only something to say. A name already in use otherwise just snapped
+        // back to the old one.
+        let changed = crate::operations::rename_node_in(&self.session.document, node.clone(), name)
+            .and_then(|operation| self.session.execute(operation));
+        let changed = match changed {
+            Ok(changed) => changed,
+            Err(error) => {
+                self.refuse("rename", &error);
+                return false;
+            }
         };
-        let changed = self.session.execute(operation).unwrap_or(false);
         if !changed {
             return false;
         }
@@ -4935,7 +4987,7 @@ impl CanvasView {
     /// Committing only the runtime half is exactly what made a created object
     /// vanish on reopen. Committing them as one compound is what keeps "one
     /// gesture is one history entry" true now that both halves exist.
-    fn commit_created(&mut self, placements: Vec<ObjectPlacement>) {
+    fn commit_created(&mut self, placements: Vec<ObjectPlacement>) -> bool {
         let mut operations = Vec::with_capacity(placements.len() * 2);
         for placement in &placements {
             let Some(node) = self.structure_for_new(&placement.object) else {
@@ -4955,7 +5007,7 @@ impl CanvasView {
         operations.push(SemanticOperation::Runtime(DocumentCommand::insert(
             placements,
         )));
-        self.commit_operation(SemanticOperation::compound(operations));
+        self.commit_operation(SemanticOperation::compound(operations))
     }
 
     /// The persistent node for an object that does not have one yet.
@@ -5014,7 +5066,9 @@ impl CanvasView {
     pub fn delete_selection(&mut self, cx: &mut Context<Self>) -> bool {
         let had_interaction = self.interaction.is_active();
         let changed = self.delete_selected_objects();
-        if changed || had_interaction {
+        // A refused delete changes nothing, but its reason reaches the shell
+        // through this notification.
+        if changed || had_interaction || self.refusal.is_some() {
             diagnostics::count("canvas_notify", 1);
             cx.notify();
         }
@@ -5079,9 +5133,9 @@ impl CanvasView {
             }));
         }
         operations.push(SemanticOperation::Runtime(DocumentCommand::delete(deleted)));
-        self.commit_operation(SemanticOperation::compound(operations));
+        let committed = self.commit_operation(SemanticOperation::compound(operations));
         self.retain_existing_selection();
-        true
+        committed
     }
 
     /// The structure nodes a deletion of `ids` has to take with it, post-order.
@@ -5127,7 +5181,7 @@ impl CanvasView {
     pub fn duplicate_selection(&mut self, cx: &mut Context<Self>) -> bool {
         let had_interaction = self.interaction.is_active();
         let changed = self.duplicate_selected_objects();
-        if changed || had_interaction {
+        if changed || had_interaction || self.refusal.is_some() {
             diagnostics::count("canvas_notify", 1);
             cx.notify();
         }
@@ -5150,8 +5204,13 @@ impl CanvasView {
         self.selection
             .replace_normalized(duplicate_ids, &self.hierarchy());
         // The same path as creation, because a duplicate is a created object.
-        self.commit_created(duplicates);
-        true
+        let committed = self.commit_created(duplicates);
+        if !committed {
+            // The copies are gone again, so the selection goes back to the
+            // originals rather than to nothing.
+            self.selection.replace_normalized(ids, &self.hierarchy());
+        }
+        committed
     }
 
     fn retain_existing_selection(&mut self) {
@@ -13511,6 +13570,143 @@ mod tests {
         // halves cannot drift apart.
         let html = std::fs::read_to_string(root.join("pages/index.html")).expect("html");
         assert!(html.contains(created.spool_id.as_str()));
+    }
+
+    // -- Refused edits: the canvas takes back what it applied early, and says why.
+
+    #[test]
+    fn a_creation_refused_for_a_taken_name_leaves_nothing_behind() {
+        // A new object's name comes from a counter that only knows what the
+        // project was opened with. Renaming something to the name it will hand
+        // out next makes the creation's structural half a duplicate, and the
+        // document refuses it. The rectangle used to stay drawn anyway — with no
+        // node behind it, nothing to undo, and nothing that would save.
+        let root = project_scratch("landing.spool");
+        let mut view = project_view(&root);
+        let renamed = view.session.runtime.objects()[0].id;
+        let next = format!("Rectangle {}", view.session.runtime.next_names[1]);
+        assert!(view.rename_object(renamed, next.clone()));
+        let objects = view.session.runtime.objects().len();
+        let nodes = view.session.document.structure.nodes.clone();
+        let depth = view.session.history.undo_len();
+
+        let refused = create(&mut view, ObjectType::Rectangle);
+
+        assert!(
+            view.session.runtime.object(refused.id).is_none(),
+            "the refused rectangle is not left on the canvas"
+        );
+        assert_eq!(view.session.runtime.objects().len(), objects);
+        assert!(
+            !view.selection.ids().contains(&refused.id),
+            "nor in the selection"
+        );
+        assert_eq!(view.session.document.structure.nodes, nodes);
+        assert_eq!(
+            view.session.history.undo_len(),
+            depth,
+            "and there is no entry for an edit that did not happen"
+        );
+        let message = view.take_refusal().expect("the refusal is reported");
+        assert!(message.contains(&next), "naming the taken name: {message}");
+
+        // The source agrees: what saves is the rename, and nothing else.
+        view.save_project().expect("save succeeds");
+        let reloaded = reopen(&root);
+        assert_eq!(reloaded.runtime.objects().len(), objects);
+        assert!(!ids(&reloaded).contains(&refused.spool_id.as_str().to_owned()));
+
+        // And the history left behind is the one the user made: undo takes back
+        // the rename, not a creation that never happened.
+        assert!(view.undo_history());
+        assert_ne!(view.session.runtime.object(renamed).unwrap().name, next);
+    }
+
+    #[test]
+    fn a_rename_to_a_taken_name_is_reported_rather_than_dropped() {
+        let root = project_scratch("landing.spool");
+        let mut view = project_view(&root);
+        let first = view.session.runtime.objects()[0].clone();
+        let taken = view.session.runtime.objects()[1].name.clone();
+
+        assert!(!view.rename_object(first.id, taken.clone()));
+
+        assert_eq!(
+            view.session.runtime.object(first.id).unwrap().name,
+            first.name,
+            "the name is unchanged"
+        );
+        let message = view.take_refusal().expect("the refusal is reported");
+        assert!(message.contains(&taken), "naming the taken name: {message}");
+        assert!(view.take_refusal().is_none(), "once");
+    }
+
+    #[test]
+    fn an_undo_that_finishes_a_refused_creation_reverts_nothing_older() {
+        // Undo mid-gesture finishes the gesture first. When finishing it is
+        // refused, the creation is already gone; carrying on would revert the
+        // rename before it, which the key was never aimed at.
+        let root = project_scratch("landing.spool");
+        let mut view = project_view(&root);
+        let renamed = view.session.runtime.objects()[0].id;
+        let next = format!("Rectangle {}", view.session.runtime.next_names[1]);
+        assert!(view.rename_object(renamed, next.clone()));
+        let objects = view.session.runtime.objects().len();
+        view.interaction = Interaction::Creating(CreateGesture {
+            object_type: ObjectType::Rectangle,
+            pointer_start_screen: point(0.0, 0.0),
+            pointer_start_world: point(100.0, 100.0),
+            current_world: point(180.0, 160.0),
+            moved: true,
+        });
+
+        assert!(
+            !view.undo_history(),
+            "the key stops at the refused creation"
+        );
+        assert_eq!(view.session.runtime.objects().len(), objects);
+        assert_eq!(
+            view.session.runtime.object(renamed).unwrap().name,
+            next,
+            "and the rename before it is untouched"
+        );
+        assert!(view.take_refusal().is_some());
+
+        assert!(view.undo_history(), "the next undo reaches the rename");
+        assert_ne!(view.session.runtime.object(renamed).unwrap().name, next);
+    }
+
+    #[test]
+    fn a_refused_duplicate_keeps_the_originals_selected() {
+        let root = project_scratch("landing.spool");
+        let mut view = project_view(&root);
+        let original = view.session.runtime.objects()[1].clone();
+        let renamed = view.session.runtime.objects()[2].id;
+        // The copy will be given the next name for its type; take it first.
+        let next = view
+            .session
+            .runtime
+            .clone()
+            .allocate_name(original.object_type);
+        assert!(view.rename_object(renamed, next.clone()));
+        let objects = view.session.runtime.objects().len();
+        let depth = view.session.history.undo_len();
+        view.selection.replace(vec![original.id]);
+
+        assert!(
+            !view.duplicate_selected_objects(),
+            "a refused duplicate reports no change"
+        );
+
+        assert_eq!(view.session.runtime.objects().len(), objects);
+        assert_eq!(view.session.history.undo_len(), depth);
+        assert_eq!(
+            view.selection.ids(),
+            &[original.id],
+            "the original is still selected, not nothing"
+        );
+        let message = view.take_refusal().expect("the refusal is reported");
+        assert!(message.contains(&next), "naming the taken name: {message}");
     }
 
     #[test]

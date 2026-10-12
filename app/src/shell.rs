@@ -233,11 +233,12 @@ pub struct AppShell {
     new_project: Option<NewProjectPrompt>,
     /// A message shown over the canvas, and whether it reports a failure.
     ///
-    /// Carries the result of the last save and the result of opening the
-    /// requested project. Both have to be visible for the same reason: a save
-    /// that silently dropped an edit, or a project that silently failed to open
-    /// and left the starter scene on screen, would each look identical to one
-    /// that succeeded.
+    /// Carries the result of the last save, the result of opening the
+    /// requested project, and the last edit the canvas refused. All have to be
+    /// visible for the same reason: a save that silently dropped an edit, a
+    /// project that silently failed to open and left the starter scene on
+    /// screen, or an edit that was refused and put back, would each look
+    /// identical to one that succeeded.
     save_status: Option<(SharedString, bool)>,
     /// Repaint subscriptions that must outlive this function.
     ///
@@ -266,7 +267,16 @@ impl AppShell {
         // Held, not dropped: a GPUI subscription detaches its observer when it
         // goes away, and without it the chrome around the canvas would only
         // repaint when the shell itself changed.
-        let observations = vec![cx.observe(&canvas, |_, _, cx| cx.notify())];
+        //
+        // The same notification is how a refused edit reaches the status line:
+        // the canvas keeps the reason, and this moves it here, so the latest
+        // save, open, or refusal is the one message on screen.
+        let observations = vec![cx.observe(&canvas, |shell, canvas, cx| {
+            if let Some(message) = canvas.update(cx, |canvas, _| canvas.take_refusal()) {
+                shell.save_status = Some((message.into(), true));
+            }
+            cx.notify();
+        })];
         Self {
             canvas,
             layers,
@@ -559,6 +569,15 @@ impl AppShell {
     #[cfg(test)]
     pub fn canvas(&self) -> &Entity<canvas::CanvasView> {
         &self.canvas
+    }
+
+    /// The message over the canvas and whether it reports a failure, for the
+    /// window-level interaction tests.
+    #[cfg(test)]
+    pub fn status_message(&self) -> Option<(String, bool)> {
+        self.save_status
+            .as_ref()
+            .map(|(message, failed)| (message.to_string(), *failed))
     }
 
     /// Carry out one editor-wide command.

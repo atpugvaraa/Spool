@@ -1039,3 +1039,55 @@ fn text_typed_after_a_click_survives_a_save_and_a_reopen(cx: &mut TestAppContext
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[gpui::test]
+fn a_refused_rename_is_reported_in_the_status_line(cx: &mut TestAppContext) {
+    // The whole chain through real events: create, rename with F2, create again,
+    // try the same name. The second rename is refused because names are unique,
+    // and it used to snap back to the old name with nothing on screen to say why.
+    let root = scratch_project("refused-rename");
+    let (shell, window) = cx.add_window_view({
+        let root = root.clone();
+        move |_, cx| AppShell::new_with_project(Some(root), cx)
+    });
+    redraw(&shell, window);
+
+    let names = |shell: &Entity<AppShell>, window: &mut VisualTestContext| -> Vec<String> {
+        read(shell, window, |canvas| {
+            canvas
+                .document_objects()
+                .iter()
+                .map(|object| object.name.clone())
+                .collect()
+        })
+    };
+    let create_and_rename = |shell: &Entity<AppShell>, window: &mut VisualTestContext| {
+        choose_tool(window, "Rectangle");
+        let spot = empty_canvas_point(shell, window);
+        window.simulate_click(spot, Modifiers::none());
+        window.run_until_parked();
+        window.simulate_keystrokes("f2 t a k e n enter");
+        window.run_until_parked();
+    };
+
+    create_and_rename(&shell, window);
+    assert!(
+        names(&shell, window).contains(&"taken".to_owned()),
+        "precondition: the first rename is accepted"
+    );
+    create_and_rename(&shell, window);
+
+    let names = names(&shell, window);
+    assert_eq!(
+        names.iter().filter(|name| *name == "taken").count(),
+        1,
+        "the second rename is refused: {names:?}"
+    );
+    let (message, failed) = window
+        .update(|_, cx| shell.read_with(cx, |shell, _| shell.status_message()))
+        .expect("the refusal is on screen");
+    assert!(failed, "shown as a failure");
+    assert!(message.contains("taken"), "and says why: {message}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}

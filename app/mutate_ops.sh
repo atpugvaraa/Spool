@@ -142,6 +142,14 @@ run "no-op operations are recorded anyway" \
             document, runtime, ..
         } = self;'
 
+run "a refused eager operation leaves its runtime half applied" \
+  '                command.replay(&mut self.runtime, ReplayDirection::Undo);' \
+  '                let _ = command;'
+
+run "a refused eager compound is reverted first member first" \
+  '            for command in runtime_half.iter().rev() {' \
+  '            for command in runtime_half.iter() {'
+
 echo
 echo "== compound composition =="
 
