@@ -124,11 +124,11 @@ function PuzzlePieces({
             >
               <feGaussianBlur in="SourceAlpha" stdDeviation=".006" result="contact-blur" />
               <feOffset in="contact-blur" dx=".006" dy=".008" result="contact-offset" />
-              <feFlood floodColor="#1c1b18" floodOpacity=".2" result="contact-color" />
+              <feFlood className="puzzle-veil-contact-shadow" floodColor="#1c1b18" floodOpacity=".2" result="contact-color" />
               <feComposite in="contact-color" in2="contact-offset" operator="in" result="contact-shadow" />
               <feGaussianBlur in="SourceAlpha" stdDeviation=".018" result="ambient-blur" />
               <feOffset in="ambient-blur" dx=".008" dy=".025" result="ambient-offset" />
-              <feFlood floodColor="#1c1b18" floodOpacity=".1" result="ambient-color" />
+              <feFlood className="puzzle-veil-ambient-shadow" floodColor="#1c1b18" floodOpacity=".1" result="ambient-color" />
               <feComposite in="ambient-color" in2="ambient-offset" operator="in" result="ambient-shadow" />
               <feMerge result="combined-shadow">
                 <feMergeNode in="contact-shadow" />

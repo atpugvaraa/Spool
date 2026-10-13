@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import { anchorPosition, SCENE_ANCHORS, SCENE_NAV_ITEMS, type SceneAnchor, type WorldRegion } from "./composition";
+import { setTheme, useTheme } from "./use-theme";
 
 
 export type Camera = { x: number; y: number; scale: number };
@@ -144,6 +145,7 @@ export default function WorldCanvas({ phase }: { phase: WorldPhase }) {
   const [activeAnchor, setActiveAnchor] = useState<SceneAnchor | null>("home");
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [logoMarkup, setLogoMarkup] = useState("");
+  const darkTheme = useTheme() === "dark";
   const wordmarkRevealStarted = phase === "thread" || phase === "exploring";
 
   useEffect(() => {
@@ -562,6 +564,17 @@ export default function WorldCanvas({ phase }: { phase: WorldPhase }) {
           </a>
         </nav>
         <div className="site-actions">
+          <button
+            className="theme-toggle"
+            type="button"
+            aria-label="Dark mode"
+            aria-pressed={darkTheme}
+            title={darkTheme ? "Lights up" : "Lights down"}
+            disabled={!navigationActive}
+            onClick={() => setTheme(darkTheme ? "light" : "dark")}
+          >
+            <span className="theme-toggle__dial" aria-hidden="true" />
+          </button>
           <a
             className="site-github"
             href={GITHUB_URL}
