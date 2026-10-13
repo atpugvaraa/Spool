@@ -814,20 +814,37 @@ select { font: inherit; }
 .puzzle-style-toggle:hover { background: var(--color-paper-light); }
 .puzzle-style-toggle:focus-visible { outline-offset: 3px; }
 
+/* Above phone width the composition keeps the size it was art-directed at (the
+   1512 x 982 concept board) and scales as one piece to fit the window. Laid out
+   against the viewport instead, fixed-width artifacts slide into each other as
+   the window narrows and text ends up underneath its neighbours.
+   WorldCanvas sets --composition-scale from the viewport. */
+@media (min-width: 721px) {
+  .world-artifacts {
+    width: 1512px;
+    height: 982px;
+    transform: translate(-50%, -50%) scale(var(--composition-scale, 1));
+  }
+
+  /* These tracked the viewport; inside the composition they take their
+     design-size values, because the scale already accounts for the window. */
+  .hero-copy { width: 700px; }
+  .hero-copy h1 { font-size: 56px; }
+  .identity-wordmark { width: 700px; }
+}
+
 @media (max-width: 900px) {
   .site-brand, .site-actions { min-width: auto; }
   .site-links { gap: 14px; }
   .site-nav { padding-inline: 18px; }
-  .hero-copy { width: min(600px, 60vw); }
-  .hero-copy h1 { font-size: clamp(32px, 5vw, 46px); }
-  .identity-wordmark { width: 58vw; font-size: clamp(164px, 20vw, 220px); }
-  .opnest-board { width: min(var(--width), 320px); }
-  .dark-site--thoughtful { width: 190px; }
-  .exploration-index { font-size: 6px; }
 }
 
 @media (max-width: 720px) {
   .world-coordinate-space { width: max(240vw, 1600px); height: max(220dvh, 1800px); }
+  /* Taller than the phone screen, so the artifacts have room to sit apart rather
+     than stacking on top of one another. The home camera shows it from the top
+     (see homeCamera in WorldCanvas); the visitor drags up for the rest. */
+  .world-artifacts { height: 1650px; }
   .experience-viewport { min-height: 100dvh; }
   .site-nav { top: 0; height: 48px; padding-inline: 12px; }
   .site-brand { gap: 5px; font-size: 15px; }
@@ -867,36 +884,36 @@ select { font: inherit; }
   .site-actions { gap: 6px; font-size: 8px; }
   .download-small { min-width: 74px; height: 28px; margin-left: 4px; border-radius: 12px; font-size: 9px; }
 
-  .opnest-board { left: 28% !important; top: 17% !important; width: 51vw; transform: translate(-50%, -50%) rotate(-5deg); }
+  .opnest-board { left: 28% !important; top: 9.15% !important; width: 51vw; transform: translate(-50%, -50%) rotate(-5deg); }
   .opnest-board__image { height: 88px; }
   .opnest-board__image > span { font-size: 41px; }
   .opnest-board__image small { font-size: 6px; }
   .opnest-board__meta { height: 15px; font-size: 4px; }
-  .mini-browser { left: 79% !important; top: 19% !important; width: 30vw; }
+  .mini-browser { left: 79% !important; top: 10.7% !important; width: 30vw; }
   .mini-browser__image { height: 49px; }
   .mini-browser__caption { font-size: 6px; }
   .mini-browser__caption span { font-size: 5px; }
-  .pencil-note--generated { left: 10% !important; top: 23% !important; width: 82px; font-size: 10px; }
-  .swatch-note { left: 51% !important; top: 24% !important; width: 104px; }
+  .pencil-note--generated { left: 10% !important; top: 13.9% !important; width: 82px; font-size: 10px; }
+  .swatch-note { left: 51% !important; top: 14.7% !important; width: 104px; }
   .swatch-note__chips { gap: 4px; }
   .swatch-note__chips i { width: 17px; height: 18px; }
   .swatch-note p { margin: 5px 0 0 7px; font-size: 9px; }
   .paper-sketch, .eye-study, .exploration-index, .pencil-note--imagine { display: none; }
 
-  .dark-site--thoughtful { left: 85% !important; top: 31% !important; width: 30vw; min-height: 126px; padding: 6px; }
+  .dark-site--thoughtful { left: 85% !important; top: 18.2% !important; width: 30vw; min-height: 126px; padding: 6px; }
   .dark-site__bar { font-size: 4px; }
   .dark-site--thoughtful .dark-site__content { min-height: 99px; padding-top: 13px; }
   .dark-site--thoughtful .dark-site__content strong { font-size: 20px; }
   .dark-site--thoughtful .dark-site__content > div { height: 46px; }
   .dark-site small { font-size: 4px; }
-  .image-stack--left { left: 20% !important; top: 37% !important; width: 31vw; transform: translate(-50%, -50%) rotate(-3deg); }
+  .image-stack--left { left: 37% !important; top: 19.6% !important; width: 31vw; transform: translate(-50%, -50%) rotate(-3deg); }
   .image-stack { height: 96px; }
   .image-stack > div { height: 64px; border-width: 3px; }
-  .japanese-poster { left: 7% !important; top: 45% !important; width: 44px; font-size: 19px; }
-  .black-sketch { left: 9% !important; top: 30% !important; width: 74px; height: 58px; }
-  .side-copy { left: 11% !important; top: 55% !important; width: 78px; gap: 4px; font-size: 6px; }
+  .japanese-poster { left: 7% !important; top: 31.2% !important; width: 44px; font-size: 19px; }
+  .black-sketch { left: 9% !important; top: 19.4% !important; width: 74px; height: 58px; }
+  .side-copy { left: 11% !important; top: 47.9% !important; width: 78px; gap: 4px; font-size: 6px; }
 
-  .hero-copy { left: 50% !important; top: 40% !important; width: 84vw; }
+  .hero-copy { left: 50% !important; top: 28% !important; width: 84vw; }
   .hero-copy h1 { font-size: clamp(30px, 8vw, 40px); line-height: 1.1; }
   .hero-copy p { margin: 12px 0 16px; font-size: 11px; }
   .hero-download { width: 118px; height: 35px; gap: 7px; border-radius: 11px; font-size: 11px; }
@@ -904,51 +921,55 @@ select { font: inherit; }
   .hero-code { margin-top: 11px; font-size: 9px; }
   .hero-code b { font-size: 14px; }
 
-  .dark-site--human { left: 17% !important; top: 66% !important; width: 42vw; min-height: 136px; padding: 7px; }
+  .dark-site--human { left: 17% !important; top: 67.6% !important; width: 42vw; min-height: 136px; padding: 7px; }
   .dark-site--human .dark-site__content { min-height: 103px; padding-top: 12px; }
   .dark-site--human .dark-site__content strong { font-size: 17px; }
   .dark-site--human .flower-photo { height: 61px; }
-  .thought-card { left: 17% !important; top: 80% !important; width: 38vw; min-height: 108px; padding: 6px; }
+  .thought-card { left: 17% !important; top: 77% !important; width: 38vw; min-height: 108px; padding: 6px; }
   .thought-card__top { font-size: 4px; }
   .thought-card__photos { gap: 3px; margin-top: 5px; }
   .thought-card__photos i { width: 27px; height: 29px; }
   .thought-card strong { right: 4px; bottom: 16px; font-size: 12px; }
-  .process-sketch { left: 16% !important; top: 93% !important; width: 41vw; min-height: 95px; padding: 8px; font-size: 5px; }
+  .process-sketch { left: 16% !important; top: 90.9% !important; width: 41vw; min-height: 95px; padding: 8px; font-size: 5px; }
   .process-sketch svg { height: 66%; }
 
-  .identity-wordmark { left: 50% !important; top: 64% !important; width: 94vw; font-size: clamp(120px, 31vw, 185px); }
-  .pencil-note--styles { left: 27% !important; top: 76% !important; width: 86px; font-size: 9px; }
-  .editorial-fragment { left: 41% !important; top: 90% !important; width: 49vw; min-height: 98px; gap: 6px; padding: 5px; }
+  .identity-wordmark { left: 50% !important; top: 39.1% !important; width: 94vw; font-size: clamp(120px, 31vw, 185px); }
+  .pencil-note--styles { left: 49% !important; top: 74.8% !important; width: 86px; font-size: 9px; }
+  .editorial-fragment { left: 38.5% !important; top: 83.9% !important; width: 49vw; min-height: 98px; gap: 6px; padding: 5px; }
   .editorial-fragment__photo { height: 87px; }
   .editorial-fragment h2 { font-size: 13px; }
   .editorial-fragment p { margin-top: 6px; font-size: 5px; }
-  .local-terminal { left: 68% !important; top: 89% !important; width: 37vw; padding: 4px 6px; border-width: 3px; border-top-width: 5px; }
+  .local-terminal { left: 82% !important; top: 81.8% !important; width: 37vw; padding: 4px 6px; border-width: 3px; border-top-width: 5px; }
   .local-terminal pre { font-size: 5px; }
   .local-terminal__chrome { height: 5px; }
-  .pencil-note--local { left: 76% !important; top: 78% !important; width: 82px; font-size: 9px; }
+  .pencil-note--local { left: 30.8% !important; top: 55.8% !important; width: 82px; font-size: 9px; }
 
-  .note-card { left: 79% !important; top: 55% !important; width: 34vw; min-height: 72px; padding: 11px 9px; font-size: 11px; }
-  .build-card { left: 92% !important; top: 62% !important; width: 27vw; min-height: 125px; padding: 12px 8px; }
+  .note-card { left: 77% !important; top: 55.5% !important; width: 34vw; min-height: 72px; padding: 11px 9px; font-size: 11px; }
+  .build-card { left: 41% !important; top: 49.4% !important; width: 27vw; min-height: 125px; padding: 12px 8px; }
   .build-card h3 { font-size: 12px; }
   .build-card div { height: 49px; }
-  .image-stack--right { left: 77% !important; top: 45% !important; width: 34vw; }
+  .image-stack--right { left: 77% !important; top: 48.8% !important; width: 34vw; }
   .image-stack--right > div { height: 72px; }
-  .dark-site--ideas { left: 81% !important; top: 84% !important; width: 39vw; min-height: 142px; padding: 6px; }
+  .dark-site--ideas { left: 81% !important; top: 68.2% !important; width: 39vw; min-height: 142px; padding: 6px; }
   .dark-site--ideas .dark-site__content { min-height: 111px; padding-top: 12px; }
   .dark-site--ideas .dark-site__content strong { font-size: 19px; }
   .dark-site--ideas .earth-image { height: 97px; }
-  .process-index { left: 96% !important; top: 78% !important; width: 62px; gap: 7px; padding: 8px 6px; font-size: 6px; }
-  .pencil-note--drag { left: 76% !important; top: 69% !important; width: 96px; font-size: 9px; }
-  .pencil-note--same { left: 90% !important; top: 96% !important; width: 78px; font-size: 8px; }
-  .flower-photo-card { left: 88% !important; top: 92% !important; width: 43px; }
+  .process-index { left: 92% !important; top: 75.8% !important; width: 62px; gap: 7px; padding: 8px 6px; font-size: 6px; }
+  .pencil-note--drag { left: 77% !important; top: 60.3% !important; width: 96px; font-size: 9px; }
+  .pencil-note--same { left: 90% !important; top: 89.4% !important; width: 78px; font-size: 8px; }
+  .flower-photo-card { left: 85% !important; top: 86.1% !important; width: 43px; }
   .plus-mark { font-size: 16px; }
+  .plus-mark--one { left: 5% !important; top: 22.1% !important; }
+  .plus-mark--two { left: 64% !important; top: 17% !important; }
+  .plus-mark--three { left: 95% !important; top: 23.9% !important; }
+  .plus-mark--four { left: 95% !important; top: 60.6% !important; }
+  .plus-mark--five { left: 3% !important; top: 84.8% !important; }
 
 
 }
 
 @media (max-width: 390px) {
   .site-actions .site-github { display: none; }
-  .hero-copy { top: 41% !important; }
   .hero-copy h1 { font-size: 29px; }
   .identity-wordmark { width: 94vw; font-size: 29vw; }
   .dark-site--thoughtful { left: 87% !important; }
