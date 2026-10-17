@@ -1,0 +1,22 @@
+FigCraft
+Copyright (c) 2026 ArtCraft Team and the FigCraft contributors.
+Licensed under the MIT License or the Apache License, Version 2.0, at your option
+(LICENSE-MIT, LICENSE-APACHE).
+
+The ArtCraft name, wordmark and logos in docs/brand/ are trademarks of the ArtCraft Team. They are
+not open source and are not covered by the license above; their terms are in
+docs/brand/LICENSE-brand.txt.
+
+Third-party material
+
+This product bundles no third-party fonts, icons or images in the repository: every icon is
+drawn in code and original to FigCraft. The per-file list (author, source, license) of any bundled
+asset is in ATTRIBUTION.md.
+
+Release builds made with the optional craft-fonts build input (CRAFT_FONTS_DIR) embed the fonts
+listed in ATTRIBUTION.md (Inter and others, SIL Open Font License 1.1); each package carries their
+licence texts.
+
+Rust crate dependencies keep their own licenses (MIT, Apache-2.0, BSD, ISC, Zlib, OFL for egui's
+default fonts, CDLA-Permissive-2.0 for the root certificate list webpki-roots compiles in, and
+similar permissive licenses); see each crate's metadata.

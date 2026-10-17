@@ -4,9 +4,20 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-gpui = { git = "https://github.com/zed-industries/zed" }
+# The vendored figcraft engine. See vendor/figcraft/UPSTREAM.md.
+figcraft-doc = { workspace = true }
+figcraft-render = { workspace = true }
+figcraft-geom = { workspace = true }
+image = { workspace = true }
+tiny-skia = { workspace = true }
+# Pinned in the manifest, not only in Cargo.lock. An unpinned git dependency
+# tracks whatever the remote default branch happens to be, so deleting or
+# regenerating the lockfile silently upgrades the entire GPUI tree. This
+# revision is the one Spool was locked to before the workspace move.
+gpui = { git = "https://github.com/zed-industries/zed", rev = "397cbc84de333eeb56849dc90782d365b37e60d7" }
 gpui_platform = {
     git = "https://github.com/zed-industries/zed",
+    rev = "397cbc84de333eeb56849dc90782d365b37e60d7",
     features = ["font-kit"]
 }
 serde_json = "1"
@@ -29,4 +40,4 @@ tree-sitter-html = "0.23.2"
 # the flag cannot reach the shipped binary. Cargo unifies features across a
 # build, but a dev-dependency is only in the graph for `cargo test`.
 [dev-dependencies]
-gpui = { git = "https://github.com/zed-industries/zed", features = ["test-support"] }
+gpui = { git = "https://github.com/zed-industries/zed", rev = "397cbc84de333eeb56849dc90782d365b37e60d7", features = ["test-support"] }

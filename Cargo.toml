@@ -1,0 +1,141 @@
+# Spool workspace root.
+#
+# Spool is a native GPUI editor for source-authored designs. The engine layer —
+# document model, auto-layout, text shaping, renderer, SVG/PDF/raster codecs,
+# file formats and the command registry — is vendored from figcraft.
+# See vendor/figcraft/UPSTREAM.md for provenance, licensing and update policy.
+#
+# Spool's own layers sit alongside it and are deliberately *not* listed as
+# members yet; `app` is the current single crate and gains its own crates as the
+# source-backed layer is split out.
+
+[workspace]
+resolver = "3"
+members = [
+  "app",
+  "crates/spool-source",
+  "crates/spool-cli",
+  "vendor/figcraft/crates/geom",
+  "vendor/figcraft/crates/color",
+  "vendor/figcraft/crates/doc",
+  "vendor/figcraft/crates/layout",
+  "vendor/figcraft/crates/text",
+  "vendor/figcraft/crates/pathops",
+  "vendor/figcraft/crates/render",
+  "vendor/figcraft/crates/format",
+  "vendor/figcraft/crates/svg",
+  "vendor/figcraft/crates/pdf",
+  "vendor/figcraft/crates/collab",
+  "vendor/figcraft/crates/plugin",
+  "vendor/figcraft/crates/engine",
+]
+# Not compiled by Spool. See vendor/figcraft/UPSTREAM.md:
+#   ui-egui        egui/eframe frontend; Spool's frontend is GPUI
+#   collab-net     collaboration transport; scheduled, not yet built
+#   ui-egui/web/server apps and xtask: upstream tooling, out of scope
+exclude = ["vendor/figcraft", "vendor/figcraft/plugins"]
+
+# ---------------------------------------------------------------------------
+# Vendored crates inherit their package metadata from here.
+# Must stay compatible with vendor/figcraft/Cargo.toml.figcraft-upstream.
+# ---------------------------------------------------------------------------
+[workspace.package]
+version = "0.6.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.95"
+repository = "https://github.com/storytold/figcraft"
+
+[workspace.dependencies]
+# --- vendored figcraft engine crates ---
+figcraft-geom = { path = "vendor/figcraft/crates/geom" }
+figcraft-color = { path = "vendor/figcraft/crates/color" }
+figcraft-doc = { path = "vendor/figcraft/crates/doc" }
+figcraft-layout = { path = "vendor/figcraft/crates/layout" }
+figcraft-text = { path = "vendor/figcraft/crates/text" }
+figcraft-pathops = { path = "vendor/figcraft/crates/pathops" }
+figcraft-render = { path = "vendor/figcraft/crates/render" }
+figcraft-format = { path = "vendor/figcraft/crates/format" }
+figcraft-svg = { path = "vendor/figcraft/crates/svg" }
+figcraft-pdf = { path = "vendor/figcraft/crates/pdf" }
+figcraft-collab = { path = "vendor/figcraft/crates/collab" }
+figcraft-engine = { path = "vendor/figcraft/crates/engine" }
+figcraft-plugin = { path = "vendor/figcraft/crates/plugin" }
+
+# --- foundation, shared with upstream ---
+kurbo = { version = "0.13", features = ["serde"] }
+thiserror = "2"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+regex = "1.13"
+log = "0.4"
+proptest = "1"
+imbl = { version = "7", features = ["serde"] }
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+
+# --- rendering and file formats, shared with upstream ---
+tiny-skia = "0.12"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp", "tiff"] }
+moxcms = "0.8"
+png = "0.18"
+usvg = "0.48"
+krilla = "0.8"
+skrifa = "0.47"
+harfrust = "0.13"
+unicode-bidi = "0.3"
+unicode-segmentation = "1.13"
+linesweeper = "0.4"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+ruzstd = { version = "0.9.1", default-features = false, features = ["std"] }
+sha2 = "0.10"
+base64 = "0.22"
+crc32fast = "1"
+
+# --- wasm plugin sandbox (interpreter only: no JIT, no WASI, no host access) ---
+wasmi = { version = "2", default-features = false, features = ["std", "stable", "validate", "portable-dispatch"] }
+wat = "1.261"
+
+# ---------------------------------------------------------------------------
+# Lint policy for vendored crates. Inherited verbatim from upstream so that a
+# `git subtree pull` stays conflict-free.
+#
+# These apply ONLY to crates that opt in with `[lints] workspace = true`, which
+# today means the vendored crates. Spool's own crates are not yet held to this
+# policy; adopting it for them is a separate, deliberate change.
+# ---------------------------------------------------------------------------
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+# Index-heavy pixel code reads worse with these.
+needless_range_loop = "allow"
+# Upstream also allows `chunks_exact_to_as_chunks` here. That lint does not exist in
+# the toolchain Spool builds with, and naming an unknown lint in this table makes all
+# 13 vendored crates warn on every build. It is dropped here rather than there: this
+# table is Spool's, not vendored, so a `git subtree pull` stays clean. Re-add it if
+# the toolchain gains the lint.
+# The vendored crates also trip `clippy::nonminimal_bool` on this toolchain. That is
+# upstream's code, left exactly as shipped.
+# Shipped engine code returns Result/Option rather than panicking. Tests may.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+
+# ---------------------------------------------------------------------------
+# Profiles, inherited from upstream: the engine is pixel- and font-heavy, so a
+# fully unoptimised debug build is slow enough to make its tests painful.
+# ---------------------------------------------------------------------------
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+lto = "thin"
+codegen-units = 4

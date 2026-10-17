@@ -44,10 +44,19 @@ set "SPOOL_PROJECT=.\fixtures\landing" && cargo run
 ```
 
 The first build can take a while: GPUI is fetched from the Zed repository at
-the revision pinned in `app/Cargo.lock` and compiled from source. Network
+the revision pinned in `app/Cargo.toml` and compiled from source. Network
 access is needed the first time. Once dependencies are available locally,
 `cargo build --offline` can build without network access. Avoid `cargo update`,
 which changes dependency revisions.
+
+The pin lives in `app/Cargo.toml` rather than in `app/Cargo.lock` on purpose.
+An unpinned git dependency tracks whatever the remote's default branch happens
+to be, so regenerating or deleting the lockfile would silently upgrade the
+entire GPUI tree. Spool is a Cargo workspace, so its single lockfile is at the
+repository root, not in `app/`.
+
+`cargo test` runs from the repository root as well, since `app` is now a
+workspace member rather than a standalone package.
 
 ### Opening your own project during development
 
