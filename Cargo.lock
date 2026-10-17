@@ -5402,6 +5402,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "spool-cli"
+version = "0.6.0"
+dependencies = [
+ "figcraft-doc",
+ "figcraft-engine",
+ "figcraft-format",
+ "figcraft-pdf",
+ "figcraft-render",
+ "figcraft-svg",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "spool-source"
 version = "0.1.0"
 dependencies = [
