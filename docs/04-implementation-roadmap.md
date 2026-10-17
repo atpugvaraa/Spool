@@ -136,8 +136,10 @@ authoritative project; the engine is the disposable model compiled from them.
 ### Acceptance checks
 
 1. A `.spool` project opens, and the document model can be discarded and rebuilt
-   from source with the project byte-identical. This is the disposability
-   guarantee, and it is the one check that matters most.
+   from the project — authored HTML/CSS/SVG **and** `lamine.yaml` together, since
+   that pair is the authority — with the project byte-identical. This is the
+   disposability guarantee, and it is the one check that matters most.
+   **Status: unverified.** No such test exists yet.
 2. Every Owner A property that the editor can change round-trips through
    authored source. A property the writer cannot express is reported as
    unsupported, never held in memory and lost on save.
