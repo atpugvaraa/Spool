@@ -49,6 +49,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod css;
 pub mod manifest;
 
 pub use manifest::{Manifest, ManifestError, NodeRecord, SourceBinding};
