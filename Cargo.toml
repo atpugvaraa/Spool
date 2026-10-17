@@ -13,6 +13,7 @@
 resolver = "3"
 members = [
   "app",
+  "crates/spool-source",
   "vendor/figcraft/crates/geom",
   "vendor/figcraft/crates/color",
   "vendor/figcraft/crates/doc",
