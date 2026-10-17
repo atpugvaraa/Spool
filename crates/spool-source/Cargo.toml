@@ -1,0 +1,18 @@
+[package]
+name = "spool-source"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Spool's source-backed layer: lamine.yaml and authored HTML/CSS/SVG compiled to and from the engine document model"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+figcraft-doc = { workspace = true }
+figcraft-color = { workspace = true }
+figcraft-geom = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+noyalib-serde-yaml = "0.0.58"
