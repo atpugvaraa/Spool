@@ -8,6 +8,9 @@ edition = "2021"
 figcraft-doc = { workspace = true }
 figcraft-render = { workspace = true }
 figcraft-geom = { workspace = true }
+# Spool's source-backed layer. It owns the lamine.yaml schema and the
+# source -> engine compile; app calls it rather than keeping a second one.
+spool-source = { path = "../crates/spool-source" }
 image = { workspace = true }
 tiny-skia = { workspace = true }
 # Pinned in the manifest, not only in Cargo.lock. An unpinned git dependency
