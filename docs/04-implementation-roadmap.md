@@ -20,7 +20,34 @@ CSS, and SVG remain authored truth; `lamine.yaml` holds Spool identity and
 structure; editor runtime state is disposable; persistent changes use semantic
 operations and history.
 
-## Completed slices
+## Verified baseline — 2026-10-17
+
+Measured, not reported. Supersedes the agent-reported figures below.
+
+| Suite | Passed | Failed | Ignored |
+|---|---|---|---|
+| `Spool` (app) | 739 | 0 | 2 |
+| `figcraft-engine` | 925 | 0 | — |
+| `figcraft-render` + `figcraft-format` | 285 | 0 | — |
+| `figcraft-text` + `figcraft-pathops` + `figcraft-svg` + `figcraft-pdf` | 222 | 0 | — |
+| `figcraft-geom` + `figcraft-color` + `figcraft-doc` + `figcraft-layout` | 189 | 0 | — |
+| `figcraft-collab` + `figcraft-plugin` | 110 | 0 | — |
+| **Total** | **2,470** | **0** | 2 |
+
+Run with `CARGO_INCREMENTAL=0`, because incremental compilation exhausted the
+disk mid-run on a 99%-full volume. All 13 vendored engine crates build with no
+local patches and no unsafe (upstream forbids it workspace-wide). The whole
+workspace compiles `--all-targets`, so every test target type-checks.
+
+Not yet run: the vendored crates' examples, the `xtask` parity tooling, and
+upstream's benchmarks. `crates/ui-egui` and `crates/collab-net` are not built
+and have no place in this table.
+
+### Earlier agent-reported figures
+
+The implementation report for commit `f6453c1` claimed 730 passing tests. The
+current measured count for `Spool` alone is 739, and that figure was not
+re-derived at the time it was written. Treat the old number as superseded.
 
 - **Project lifecycle and source-backed editing:** open and create `.spool`
   projects; preserve authored source outside supported edit spans; save and
@@ -81,6 +108,65 @@ what happened when an operation is refused.
 No contributor owns these tasks yet. Assign one task per person with an
 acceptance check and review date; avoid parallel edits to high-coupling canvas
 or shell behavior without coordination.
+
+## Superseded milestone — reliable first editing workflow
+
+This milestone is **closed as the working focus**. It was written when Spool
+built its own engine, and the two tracked reliability gaps in it — refused
+operation feedback, and empty-project reopen — are real but no longer the
+constraint on progress. They remain valid work; they are simply not what
+decides the order any more.
+
+The engine is now vendored (see the verified baseline above). That changes what
+"useful" means: the binding question is no longer whether Spool can implement
+these operations, but whether the source-backed layer can express the model the
+engine already has. The four-owner property table in
+[Document and Source Model](02-document-and-source-model.md) is now the critical
+path, and its Owner B — the half of the model with no CSS spelling — has no
+storage at all today.
+
+## Current milestone — engine parity behind a source-backed boundary
+
+**Status: proposed 2026-10-17; owners and dates not assigned.**
+
+Spool's premise survives the adoption, and this milestone is where that has to
+be proven rather than asserted. HTML/CSS/SVG and `lamine.yaml` stay the
+authoritative project; the engine is the disposable model compiled from them.
+
+### Acceptance checks
+
+1. A `.spool` project opens, and the document model can be discarded and rebuilt
+   from source with the project byte-identical. This is the disposability
+   guarantee, and it is the one check that matters most.
+2. Every Owner A property that the editor can change round-trips through
+   authored source. A property the writer cannot express is reported as
+   unsupported, never held in memory and lost on save.
+3. Owner B properties have a `lamine.yaml` home and survive save and reopen.
+   No Owner A property is duplicated there.
+4. Authored `display: flex` produces the same result as the equivalent authored
+   auto-layout declaration, and divergences between the engine's auto-layout and
+   CSS flexbox are characterised and documented rather than smoothed over.
+5. Every panel action is a registered command. No panel mutates the document
+   directly.
+6. History exposes semantic intent, not only a label, and the intent journal
+   survives process restart.
+7. The command surface is reachable from a CLI and from MCP, and an agent can
+   complete a design task through either.
+
+### Candidate tasks (unassigned)
+
+- **Owner B storage.** The largest single piece of new work, and the one nothing
+  else can complete around. Roughly half the model has nowhere to live.
+- **CSS flex longhands.** `flex-direction`, `flex-wrap`, `gap`, `row-gap`,
+  `column-gap`, `justify-content`, `align-items`. Bounded, well specified, and
+  the prerequisite for check 4.
+- **Round-trip disposal test.** A test that deletes the document model and
+  rebuilds from source, asserting byte equality. Cheap, and it is what makes the
+  rest of this milestone honest.
+- **GPUI canvas on the vendored renderer.** Render on a worker thread, blit as a
+  GPUI texture, paint overlays from the engine's serialized overlay state.
+- **CLI and MCP surfaces.**
+- The two deferred reliability gaps above, unblocked but unscheduled.
 
 ## Later, when a concrete workflow needs it
 
