@@ -26,9 +26,14 @@ than "compile once, then edit in memory", and it is accepted deliberately:
   two models is how "the inspector shows a value the renderer ignores" happens.
 - **The disposability guarantee is unchanged and is the thing to test.** The
   document model still holds no authority. If `Document` is deleted and rebuilt
-  from source, the project is unchanged. If it cannot be rebuilt from source
-  without loss, Spool has violated this document, regardless of what the code
-  looks like. This is a testable property and must be covered by one.
+  from the project, the project is unchanged. Here "the project" means authored
+  HTML/CSS/SVG **and** `lamine.yaml` together — that pair is the authority, and
+  losing either loses project state. If the model cannot be rebuilt from that
+  pair without loss, Spool has violated this document, regardless of what the
+  code looks like. This is a testable property and must be covered by one.
+  Note the consequence for Owner B: because those properties have no CSS
+  spelling, their only re-entry path is `lamine.yaml`. `lamine.yaml` is not
+  optional bookkeeping; it is half the project.
 - **Round-tripping is therefore a correctness requirement, not a feature.** A
   property that the model holds but the writer cannot express is a property Spool
   does not yet support. It must be reported as unsupported rather than silently
