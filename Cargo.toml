@@ -14,6 +14,7 @@ resolver = "3"
 members = [
   "app",
   "crates/spool-source",
+  "crates/spool-cli",
   "vendor/figcraft/crates/geom",
   "vendor/figcraft/crates/color",
   "vendor/figcraft/crates/doc",

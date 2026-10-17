@@ -1,0 +1,30 @@
+# spool-cli: Spool's first agent-facing surface.
+#
+# Headless driver for the vendored figcraft engine: list commands, run one command, run a script
+# of them as one transaction, open/save a document, inspect it, export it.
+#
+# It depends on the engine crates only. In particular it does NOT depend on Spool's `app` or
+# `spool-source` crates, which is why it cannot open a `.spool` project (see `document.rs`).
+
+[package]
+name = "spool-cli"
+description = "Headless, agent-facing command line over Spool's document engine"
+version.workspace = true
+edition = "2021" # not the workspace default: this crate stays on 2021
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "spool-cli"
+path = "src/main.rs"
+
+[dependencies]
+figcraft-doc = { workspace = true }
+figcraft-engine = { workspace = true }
+figcraft-format = { workspace = true }
+figcraft-pdf = { workspace = true }
+figcraft-render = { workspace = true }
+figcraft-svg = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
