@@ -13,8 +13,9 @@ cd Spool
 
 ## Run the native app
 
-Install a current stable Rust toolchain with [rustup](https://rustup.rs/), then
-run the app from its Cargo package directory:
+Install a current stable Rust toolchain with [rustup](https://rustup.rs/). On
+Windows, GPUI also needs Visual Studio Build Tools with the "Desktop development
+with C++" workload and a Windows SDK. Then run the app from its Cargo package directory:
 
 ```sh
 cd app
@@ -25,8 +26,21 @@ With no project configured, Spool opens a blank starter scene. To open the
 included source-backed landing-page fixture instead:
 
 ```sh
+# macOS / Linux
 cd app
 SPOOL_PROJECT=./fixtures/landing cargo run
+```
+
+```powershell
+# Windows PowerShell
+cd app
+$env:SPOOL_PROJECT = ".\fixtures\landing"; cargo run
+```
+
+```bat
+:: Windows cmd
+cd app
+set "SPOOL_PROJECT=.\fixtures\landing" && cargo run
 ```
 
 The first build can take a while: GPUI is fetched from the Zed repository at
@@ -112,8 +126,21 @@ though the starter scene were the project.
 ### `SPOOL_PROJECT` is a development override
 
 ```sh
+# macOS / Linux
 cd app
 SPOOL_PROJECT=./fixtures/landing cargo run
+```
+
+```powershell
+# Windows PowerShell
+cd app
+$env:SPOOL_PROJECT = ".\fixtures\landing"; cargo run
+```
+
+```bat
+:: Windows cmd
+cd app
+set "SPOOL_PROJECT=.\fixtures\landing" && cargo run
 ```
 
 `SPOOL_PROJECT` still works and is still how the committed fixtures and the test

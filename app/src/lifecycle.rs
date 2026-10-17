@@ -106,8 +106,14 @@ pub fn install(cx: &mut App) {
 mod tests {
     use super::*;
 
+    /// `unparse` spells the platform modifier per OS (`cmd-`, `win-`, `super-`).
+    /// The binding is `cmd-*` everywhere, so compare on the neutral spelling.
     fn keystroke(binding: &KeyBinding) -> String {
-        binding.keystrokes()[0].unparse()
+        let key = binding.keystrokes()[0].unparse();
+        ["win-", "super-"]
+            .iter()
+            .find_map(|prefix| key.strip_prefix(prefix))
+            .map_or(key.clone(), |rest| format!("cmd-{rest}"))
     }
 
     #[test]
