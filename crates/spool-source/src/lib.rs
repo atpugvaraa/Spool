@@ -51,5 +51,6 @@
 
 pub mod css;
 pub mod manifest;
+pub mod reader;
 
 pub use manifest::{Manifest, ManifestError, NodeRecord, SourceBinding};

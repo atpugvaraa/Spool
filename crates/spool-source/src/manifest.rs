@@ -33,7 +33,7 @@ use std::collections::BTreeMap;
 pub const MANIFEST_VERSION: u32 = 2;
 
 /// Everything `lamine.yaml` can fail to be.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ManifestError {
     #[error("lamine.yaml is not valid YAML: {0}")]
     Yaml(String),
@@ -51,12 +51,12 @@ pub enum ManifestError {
     MissingChild { id: u64, child: u64 },
     #[error("node id {id} is its own parent")]
     SelfParent { id: u64 },
-    #[error("node id {id} is not reachable from a page")]
-    Unreachable { id: u64 },
     #[error("source key {0} is used by more than one node")]
     DuplicateSourceKey(String),
     #[error("node {id} binds to file {file}, which escapes the project root")]
     BindingEscapesRoot { id: u64, file: String },
+    #[error("node {id} is a {kind}, and the engine's model cannot give one children")]
+    NotAContainer { id: u64, kind: String },
     #[error("node {id} has a binding that is not project-root-relative")]
     BindingNotRelative { id: u64 },
     #[error("node {id} has no source binding at all")]
@@ -243,6 +243,20 @@ pub struct NodeRecord {
 
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+/// Whether the engine's model lets this kind hold children.
+///
+/// Mirrors `figcraft_doc::NodeKind::is_container`. Keep the two in step: a kind
+/// listed here but not there would let a manifest validate and then lose a subtree
+/// at compile time.
+pub fn is_container_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "page" | "Page" | "frame" | "Frame" | "group" | "Group" | "section" | "Section"
+            | "booleanOp" | "BooleanOp" | "component" | "Component" | "componentSet"
+            | "ComponentSet" | "instance" | "Instance"
+    )
 }
 
 impl NodeRecord {
@@ -434,6 +448,17 @@ impl Manifest {
             if node.parent == Some(node.id) {
                 return Err(ManifestError::SelfParent { id: node.id });
             }
+            // The engine's model gives children only to these kinds. A `Text` node
+            // with children describes a tree that cannot exist, and the compiler
+            // would drop the children with nothing but a per-node diagnostic --
+            // which is a managed layer silently vanishing. Refuse it here instead,
+            // before anything is written.
+            if !node.children.is_empty() && !is_container_kind(&node.kind) {
+                return Err(ManifestError::NotAContainer {
+                    id: node.id,
+                    kind: node.kind.clone(),
+                });
+            }
         }
 
         // Second pass: referential integrity, now that every id is known.
@@ -456,19 +481,10 @@ impl Manifest {
             }
         }
 
-        // Third pass: reachability. A node nothing points at cannot be compiled.
-        let mut referenced: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
-        for node in &self.nodes {
-            if let Some(p) = node.parent {
-                referenced.insert(p);
-            }
-            referenced.extend(node.children.iter().copied());
-        }
-        for node in &self.nodes {
-            if !referenced.contains(&node.id) && node.parent.is_some() {
-                return Err(ManifestError::Unreachable { id: node.id });
-            }
-        }
+        // A node whose parent does not list it is recoverable, not fatal: the
+        // compiler reports it with the context needed to fix the ordering. Only
+        // a dangling parent or child reference is a structural error, because
+        // those mean the hierarchy cannot be walked at all.
         Ok(())
     }
 }
@@ -600,6 +616,32 @@ mod tests {
             m.validate(),
             Err(ManifestError::BindingNotRelative { id: 1 })
         );
+    }
+
+    #[test]
+    fn rejects_a_child_under_a_kind_the_engine_cannot_give_children_to() {
+        // `Text` is the only kind that carries characters, and the engine's model
+        // gives it no children -- so this tree cannot exist. The compiler would
+        // drop the child with only a per-node diagnostic, which is a managed layer
+        // silently vanishing.
+        let mut m = page_with_child();
+        m.nodes[0].kind = "Text".to_string();
+        assert_eq!(
+            m.validate(),
+            Err(ManifestError::NotAContainer {
+                id: 1,
+                kind: "Text".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn a_leaf_kind_with_no_children_is_fine() {
+        let mut m = page_with_child();
+        m.nodes[0].kind = "Text".to_string();
+        m.nodes[0].children.clear();
+        m.nodes[1].parent = None;
+        assert_eq!(m.validate(), Ok(()));
     }
 
     #[test]
