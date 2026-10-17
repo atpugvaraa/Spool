@@ -28,6 +28,17 @@
 //! values are *not* part of it: the inline style is applied by the caller in
 //! `visual`, and inheritance belongs to the document tree rather than to a
 //! stylesheet. `docs/` records that boundary.
+//!
+//! # Flex longhands
+//!
+//! `flex-direction`, `flex-wrap`, `gap`, `row-gap`, `column-gap`,
+//! `justify-content`, and `align-items` are understood because `docs/02` records
+//! authored `display: flex` as the on-disk representation of auto-layout, which
+//! makes them authored properties rather than Spool-only facts. They are parsed,
+//! cascaded, and reported with their provenance like any other declaration.
+//! Nothing here lays anything out: what they mean for a frame is the engine's
+//! business, and the divergences between Figma's auto-layout and CSS flexbox are
+//! to be characterised where they are found rather than smoothed over here.
 
 use std::collections::BTreeMap;
 
@@ -37,6 +48,7 @@ use crate::canvas::Color;
 /// than guessed at, so an unsupported declaration can never masquerade as a
 /// supported one.
 pub const SUPPORTED_PROPERTIES: &[&str] = &[
+    "align-items",
     "background",
     "background-color",
     "border",
@@ -44,10 +56,15 @@ pub const SUPPORTED_PROPERTIES: &[&str] = &[
     "bottom",
     "box-sizing",
     "color",
+    "column-gap",
     "display",
+    "flex-direction",
+    "flex-wrap",
     "font-size",
     "font-weight",
+    "gap",
     "height",
+    "justify-content",
     "left",
     "margin",
     "margin-bottom",
@@ -66,6 +83,7 @@ pub const SUPPORTED_PROPERTIES: &[&str] = &[
     "padding-top",
     "position",
     "right",
+    "row-gap",
     "text-align",
     "top",
     "transform",
@@ -94,21 +112,29 @@ impl Declaration {
     }
 }
 
-/// The canonical longhand a supported property resolves against.
+/// The canonical longhands a supported declaration competes for under.
 ///
-/// `background` and `background-color` are one longhand spelled two ways. CSS
-/// expands a shorthand into longhands *before* the cascade runs, which is why a
-/// later `background: blue` overrides an earlier `background-color: red`. Keying
-/// both under one group is what makes author order mean the same thing here as
-/// in a browser, and it keeps the winning declaration's authored span pointing at
-/// the shorthand the author really wrote, so a later edit rewrites the text that
-/// produced the value.
+/// CSS expands a shorthand into longhands *before* the cascade runs, which is
+/// why a later `background: blue` overrides an earlier `background-color: red`.
+/// Keying both under one group is what makes author order mean the same thing
+/// here as in a browser, and it keeps the winning declaration's authored span
+/// pointing at the shorthand the author really wrote, so a later edit rewrites
+/// the text that produced the value.
+///
+/// `gap` is the one shorthand that expands into *two* longhands, because it
+/// carries both axes and a `row-gap` or `column-gap` written after it overrides
+/// exactly one of them. Its row comes first, so a caller asking for `gap` is
+/// answered with the declaration that won the row axis — the same
+/// "whichever spelling won" answer [`Stylesheet::declaration_value_range`]
+/// already gives for `background` and `background-color`. A writer that needs
+/// both axes rewrites them one longhand at a time.
 ///
 /// Every other supported property is its own group.
-fn property_group(property: &str) -> String {
+fn property_groups(property: &str) -> Vec<String> {
     match property {
-        "background" | "background-color" => "background-color".to_owned(),
-        other => other.to_owned(),
+        "background" | "background-color" => vec!["background-color".to_owned()],
+        "gap" => vec!["row-gap".to_owned(), "column-gap".to_owned()],
+        other => vec![other.to_owned()],
     }
 }
 
@@ -324,17 +350,18 @@ impl Stylesheet {
             }
             let specificity = rule.selector.specificity();
             for declaration in &rule.declarations {
-                let group = property_group(&declaration.property);
-                match winners.get(&group) {
-                    Some((current, current_specificity)) => {
-                        if declaration.rank_for(specificity)
-                            > current.rank_for(*current_specificity)
-                        {
+                for group in property_groups(&declaration.property) {
+                    match winners.get(&group) {
+                        Some((current, current_specificity)) => {
+                            if declaration.rank_for(specificity)
+                                > current.rank_for(*current_specificity)
+                            {
+                                winners.insert(group, (declaration, specificity));
+                            }
+                        }
+                        None => {
                             winners.insert(group, (declaration, specificity));
                         }
-                    }
-                    None => {
-                        winners.insert(group, (declaration, specificity));
                     }
                 }
             }
@@ -349,7 +376,8 @@ impl Stylesheet {
     ///
     /// `property` may be spelled either way — asking for `background` and asking
     /// for `background-color` both answer with whichever spelling the cascade
-    /// actually chose. That is deliberate: a caller that rewrites a declaration
+    /// actually chose, and asking for `gap` answers with whichever declaration
+    /// won the row axis. That is deliberate: a caller that rewrites a declaration
     /// has to be able to ask for the property it means and get the span that
     /// produced the value being replaced.
     fn winner<'a>(
@@ -359,9 +387,10 @@ impl Stylesheet {
         id: Option<&str>,
         property: &str,
     ) -> Option<&'a Declaration> {
-        self.cascaded(tag, classes, id)
-            .get(&property_group(property))
-            .copied()
+        let cascaded = self.cascaded(tag, classes, id);
+        property_groups(property)
+            .into_iter()
+            .find_map(|group| cascaded.get(&group).copied())
     }
 
     /// The authored span of the declaration that currently wins for `property`
@@ -619,6 +648,149 @@ pub fn parse_box(value: &str) -> Option<[f32; 4]> {
         4 => Some([parts[0], parts[1], parts[2], parts[3]]),
         _ => None,
     }
+}
+
+/// Normalise an authored keyword: CSS keywords are ASCII case-insensitive, and
+/// the cascade hands back the value exactly as it was written.
+// Landed with the parsing half; the auto-layout mapping is not built yet.
+#[allow(dead_code)]
+fn keyword(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+/// The main axis a flex container lays its children out along.
+///
+/// Each variant is one CSS keyword, so a value that reads back is the value
+/// that was authored. Nothing here claims how a frame uses the axis; that is
+/// the engine's auto-layout, and it is not CSS flexbox.
+// Landed with the parsing half; the auto-layout mapping is not built yet.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlexDirection {
+    Row,
+    RowReverse,
+    Column,
+    ColumnReverse,
+}
+
+/// Parse a `flex-direction` keyword.
+///
+/// `normal` is refused rather than folded into `row`: it is not one of the four
+/// keywords this subset supports, and choosing an axis the author did not name
+/// is the failure mode this module exists to avoid.
+// Landed with the parsing half; the auto-layout mapping is not built yet.
+#[allow(dead_code)]
+pub fn parse_flex_direction(value: &str) -> Option<FlexDirection> {
+    match keyword(value).as_str() {
+        "row" => Some(FlexDirection::Row),
+        "row-reverse" => Some(FlexDirection::RowReverse),
+        "column" => Some(FlexDirection::Column),
+        "column-reverse" => Some(FlexDirection::ColumnReverse),
+        _ => None,
+    }
+}
+
+/// Whether a flex container keeps its children on one line or breaks them onto
+/// new ones.
+// Landed with the parsing half; the auto-layout mapping is not built yet.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlexWrap {
+    NoWrap,
+    Wrap,
+    WrapReverse,
+}
+
+/// Parse a `flex-wrap` keyword.
+// Landed with the parsing half; the auto-layout mapping is not built yet.
+#[allow(dead_code)]
+pub fn parse_flex_wrap(value: &str) -> Option<FlexWrap> {
+    match keyword(value).as_str() {
+        "nowrap" => Some(FlexWrap::NoWrap),
+        "wrap" => Some(FlexWrap::Wrap),
+        "wrap-reverse" => Some(FlexWrap::WrapReverse),
+        _ => None,
+    }
+}
+
+/// How a flex container distributes free space along its main axis.
+///
+/// `start` and `end` are the CSS `flex-start` and `flex-end` under the spelling
+/// this subset supports. The `flex-` prefixed keywords are deliberately not
+/// accepted as aliases: they mean the same thing here, and carrying two
+/// spellings for one value would make a write-back able to change the author's
+/// words.
+// Landed with the parsing half; the auto-layout mapping is not built yet.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JustifyContent {
+    Start,
+    End,
+    Center,
+    SpaceBetween,
+    SpaceAround,
+    SpaceEvenly,
+}
+
+/// Parse a `justify-content` keyword.
+// Landed with the parsing half; the auto-layout mapping is not built yet.
+#[allow(dead_code)]
+pub fn parse_justify_content(value: &str) -> Option<JustifyContent> {
+    match keyword(value).as_str() {
+        "start" => Some(JustifyContent::Start),
+        "end" => Some(JustifyContent::End),
+        "center" => Some(JustifyContent::Center),
+        "space-between" => Some(JustifyContent::SpaceBetween),
+        "space-around" => Some(JustifyContent::SpaceAround),
+        "space-evenly" => Some(JustifyContent::SpaceEvenly),
+        _ => None,
+    }
+}
+
+/// How a flex container aligns its children on the cross axis.
+// Landed with the parsing half; the auto-layout mapping is not built yet.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AlignItems {
+    Start,
+    End,
+    Center,
+    Baseline,
+    Stretch,
+}
+
+/// Parse an `align-items` keyword.
+///
+/// As with [`JustifyContent`], the `flex-` prefixed spellings are refused
+/// rather than aliased, and `normal` is refused rather than read as `stretch`.
+// Landed with the parsing half; the auto-layout mapping is not built yet.
+#[allow(dead_code)]
+pub fn parse_align_items(value: &str) -> Option<AlignItems> {
+    match keyword(value).as_str() {
+        "start" => Some(AlignItems::Start),
+        "end" => Some(AlignItems::End),
+        "center" => Some(AlignItems::Center),
+        "baseline" => Some(AlignItems::Baseline),
+        "stretch" => Some(AlignItems::Stretch),
+        _ => None,
+    }
+}
+
+/// Parse a `gap`, `row-gap`, or `column-gap` value into pixels.
+///
+/// All three take one length, so they share a parser: `gap: 10px` and `gap: 10`
+/// are the same ten pixels, exactly as [`parse_length`] reads a bare number as
+/// pixels.
+///
+/// The two-value `gap: 10px 20px` form is refused rather than half-read — it
+/// carries a row and a column, and taking the first would silently drop the
+/// second. A negative gap is invalid CSS, so it is refused too rather than
+/// turned into an overlap the author never asked for.
+// Landed with the parsing half; the auto-layout mapping is not built yet.
+#[allow(dead_code)]
+pub fn parse_gap(value: &str) -> Option<f32> {
+    let parsed = parse_length(value)?;
+    (parsed >= 0.0).then_some(parsed)
 }
 
 #[cfg(test)]
@@ -1093,5 +1265,328 @@ a { padding: 1px; }
         assert_eq!(parse_box("1px 2px 3px 4px"), Some([1.0, 2.0, 3.0, 4.0]));
         assert!(parse_box("1px 2px 3px").is_none());
         assert!(parse_box("auto").is_none());
+    }
+
+    /// The authored bytes the cascade says won `property`, sliced back out of
+    /// the stylesheet it was parsed from.
+    fn winning_text<'a>(
+        source: &'a str,
+        sheet: &Stylesheet,
+        tag: &str,
+        classes: &[&str],
+        property: &str,
+    ) -> &'a str {
+        let range = sheet
+            .declaration_value_range(
+                tag,
+                &classes.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
+                None,
+                property,
+            )
+            .unwrap_or_else(|| panic!("{property} has a winning declaration"));
+        &source[range.0..range.1]
+    }
+
+    #[test]
+    fn every_flex_direction_keyword_is_read() {
+        for (value, expected) in [
+            ("row", FlexDirection::Row),
+            ("row-reverse", FlexDirection::RowReverse),
+            ("column", FlexDirection::Column),
+            ("column-reverse", FlexDirection::ColumnReverse),
+            ("  COLUMN-REVERSE  ", FlexDirection::ColumnReverse),
+        ] {
+            assert_eq!(parse_flex_direction(value), Some(expected), "{value}");
+        }
+        for unsupported in ["normal", "diagonal", "reverse", "row reverse", ""] {
+            assert_eq!(
+                parse_flex_direction(unsupported),
+                None,
+                "{unsupported} is not one of the four supported axes"
+            );
+        }
+    }
+
+    #[test]
+    fn every_flex_wrap_keyword_is_read() {
+        for (value, expected) in [
+            ("nowrap", FlexWrap::NoWrap),
+            ("wrap", FlexWrap::Wrap),
+            ("wrap-reverse", FlexWrap::WrapReverse),
+            (" WRAP ", FlexWrap::Wrap),
+        ] {
+            assert_eq!(parse_flex_wrap(value), Some(expected), "{value}");
+        }
+        for unsupported in ["no-wrap", "reverse", "wrap around", ""] {
+            assert_eq!(
+                parse_flex_wrap(unsupported),
+                None,
+                "{unsupported} is not one of the three supported wrap keywords"
+            );
+        }
+    }
+
+    #[test]
+    fn every_justify_content_keyword_is_read() {
+        for (value, expected) in [
+            ("start", JustifyContent::Start),
+            ("end", JustifyContent::End),
+            ("center", JustifyContent::Center),
+            ("space-between", JustifyContent::SpaceBetween),
+            ("space-around", JustifyContent::SpaceAround),
+            ("space-evenly", JustifyContent::SpaceEvenly),
+            ("  SPACE-BETWEEN ", JustifyContent::SpaceBetween),
+        ] {
+            assert_eq!(parse_justify_content(value), Some(expected), "{value}");
+        }
+        for unsupported in [
+            // The `flex-` prefixed spellings are not aliased onto `start`/`end`:
+            // one value gets one spelling, so a write-back cannot reword it.
+            "flex-start",
+            "flex-end",
+            "stretch",
+            "space",
+            "left",
+            "right",
+            "",
+        ] {
+            assert_eq!(
+                parse_justify_content(unsupported),
+                None,
+                "{unsupported} is outside the supported subset"
+            );
+        }
+    }
+
+    #[test]
+    fn every_align_items_keyword_is_read() {
+        for (value, expected) in [
+            ("start", AlignItems::Start),
+            ("end", AlignItems::End),
+            ("center", AlignItems::Center),
+            ("baseline", AlignItems::Baseline),
+            ("stretch", AlignItems::Stretch),
+            ("  BASELINE ", AlignItems::Baseline),
+        ] {
+            assert_eq!(parse_align_items(value), Some(expected), "{value}");
+        }
+        for unsupported in [
+            "flex-start",
+            "flex-end",
+            "normal",
+            "first baseline",
+            "self",
+            "",
+        ] {
+            assert_eq!(
+                parse_align_items(unsupported),
+                None,
+                "{unsupported} is outside the supported subset"
+            );
+        }
+    }
+
+    #[test]
+    fn a_gap_is_one_length_in_either_spelling() {
+        // `gap: 10` is ten pixels, the same as `gap: 10px`, for the same reason
+        // `parse_length` reads a bare number as pixels everywhere else.
+        assert_eq!(parse_gap("10px"), Some(10.0));
+        assert_eq!(parse_gap("10"), Some(10.0));
+        assert_eq!(parse_gap("  0  "), Some(0.0));
+        for unsupported in [
+            "2em",
+            "5%",
+            "auto",
+            "-4px",
+            "10px 20px",
+            "calc(2 * 4px)",
+            "",
+        ] {
+            assert_eq!(
+                parse_gap(unsupported),
+                None,
+                "{unsupported} is not a gap this subset can read"
+            );
+        }
+    }
+
+    #[test]
+    fn a_gap_shorthand_fills_both_axes_and_a_row_gap_overrides_only_the_row() {
+        // CSS expands `gap` into `row-gap` and `column-gap` before the cascade,
+        // so a later `row-gap` overrides the row the shorthand set and leaves
+        // the column alone. Resolving `gap` to one key would make the override
+        // silently take the column with it.
+        let source = "\
+a { gap: 10px; row-gap: 4px; }
+";
+        let resolved = resolved_map(source, "a", &[]);
+        assert_eq!(resolved.get("row-gap").map(String::as_str), Some("4px"));
+        assert_eq!(
+            resolved.get("column-gap").map(String::as_str),
+            Some("10px"),
+            "the shorthand's column survives the row override"
+        );
+        assert!(
+            !resolved.contains_key("gap"),
+            "the shorthand resolves under its longhand names, not the spelling used"
+        );
+
+        // Author order decides when specificity does not: written last, the
+        // shorthand takes the row axis back.
+        let reversed = resolved_map("a { row-gap: 4px; gap: 10px; }", "a", &[]);
+        assert_eq!(reversed.get("row-gap").map(String::as_str), Some("10px"));
+        assert_eq!(reversed.get("column-gap").map(String::as_str), Some("10px"));
+
+        // A unitless gap is the same gap, through the cascade as well.
+        assert_eq!(
+            resolved_map("a { gap: 10; }", "a", &[])
+                .get("row-gap")
+                .map(String::as_str),
+            Some("10")
+        );
+    }
+
+    #[test]
+    fn the_flex_longhands_cascade_like_every_other_property() {
+        // Nothing here is special-cased: the same specificity-then-order ranking
+        // decides these declarations that decides `color`, and a property only
+        // the weaker rule mentions is still kept.
+        let source = "\
+a { flex-direction: column; gap: 10px; }
+.cta { flex-direction: row; }
+";
+        let resolved = resolved_map(source, "a", &["cta"]);
+        assert_eq!(
+            resolved.get("flex-direction").map(String::as_str),
+            Some("row"),
+            "the later class rule wins on specificity"
+        );
+        assert_eq!(
+            resolved.get("column-gap").map(String::as_str),
+            Some("10px"),
+            "a longhand only the tag rule mentions is kept from it"
+        );
+        assert_eq!(
+            resolved.get("justify-content"),
+            None,
+            "an undeclared property resolves to nothing rather than an invented default"
+        );
+        assert!(
+            resolved_map(source, "a", &[]).get("flex-direction") == Some(&"column".to_owned()),
+            "and an element without the class still gets the tag rule's value"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_flex_value_falls_back_instead_of_being_guessed_at() {
+        // Resolution carries the authored text through unchanged, and the
+        // consumer parser declines it. That is the same contract `transform`
+        // already has: read what was written, refuse what cannot be understood,
+        // and let the CSS initial value stand rather than inventing one.
+        let source = "\
+.cta {
+  flex-direction: diagonal;
+  flex-wrap: wrap-around;
+  justify-content: stretch;
+  align-items: flex-start;
+  gap: 2em;
+}
+";
+        let resolved = resolved_map(source, "a", &["cta"]);
+        assert_eq!(
+            resolved.get("flex-direction").map(String::as_str),
+            Some("diagonal")
+        );
+        assert_eq!(parse_flex_direction("diagonal"), None);
+        assert_eq!(parse_flex_wrap("wrap-around"), None);
+        assert_eq!(parse_justify_content("stretch"), None);
+        assert_eq!(parse_align_items("flex-start"), None);
+        assert_eq!(parse_gap("2em"), None);
+
+        let sheet = Stylesheet::parse(source);
+        assert!(
+            sheet
+                .declaration_value_range("a", &["cta".to_owned()], None, "align-content")
+                .is_none(),
+            "a property nothing declared has no span to report"
+        );
+    }
+
+    #[test]
+    fn every_flex_longhand_reports_the_span_of_the_declaration_that_won_it() {
+        // The save layer rewrites exactly the bytes this reports, so each
+        // property has to answer with its own authored value — including `gap`,
+        // which answers with the row it won, and `column-gap`, which answers
+        // with the longhand rather than the shorthand that shares its axis.
+        let source = "\
+.row {
+  flex-direction: column-reverse;
+  flex-wrap: wrap-reverse;
+  gap: 12px;
+  row-gap: 3px;
+  column-gap: 8px;
+  justify-content: space-between;
+  align-items: baseline;
+}
+";
+        let sheet = Stylesheet::parse(source);
+        for (property, expected) in [
+            ("flex-direction", "column-reverse"),
+            ("flex-wrap", "wrap-reverse"),
+            ("gap", "3px"),
+            ("row-gap", "3px"),
+            ("column-gap", "8px"),
+            ("justify-content", "space-between"),
+            ("align-items", "baseline"),
+        ] {
+            assert_eq!(
+                winning_text(source, &sheet, "div", &["row"], property),
+                expected,
+                "{property} must point at the declaration that produced it"
+            );
+        }
+        assert!(
+            !resolved_map(source, "div", &["row"]).contains_key("flex"),
+            "`flex` itself is still unsupported: it has no place to live"
+        );
+    }
+
+    #[test]
+    fn a_flex_winner_in_a_later_stylesheet_owns_the_span_it_was_authored_in() {
+        // Stylesheets are resolved in document order by the caller, so each one
+        // reports its own bytes. Asking the later sheet for the row axis has to
+        // find its own declaration and not reach back into the earlier file's
+        // `gap`, and the earlier file still answers for the values it authored.
+        let base = ".row { gap: 10px; justify-content: center; }";
+        let later = ".row { row-gap: 4px; justify-content: space-between; }";
+        let base_sheet = Stylesheet::parse(base);
+        let later_sheet = Stylesheet::parse(later);
+        for (property, expected) in [
+            ("gap", "4px"),
+            ("row-gap", "4px"),
+            ("justify-content", "space-between"),
+        ] {
+            assert_eq!(
+                winning_text(later, &later_sheet, "div", &["row"], property),
+                expected,
+                "the later stylesheet owns {property}"
+            );
+        }
+        assert_eq!(
+            winning_text(base, &base_sheet, "div", &["row"], "gap"),
+            "10px",
+            "and the earlier stylesheet still reports its own shorthand"
+        );
+        assert_eq!(
+            winning_text(base, &base_sheet, "div", &["row"], "column-gap"),
+            "10px",
+            "which is also the column the later stylesheet never mentions"
+        );
+        assert!(
+            later_sheet
+                .declaration_value_range("div", &["row".to_owned()], None, "column-gap")
+                .is_none(),
+            "the later stylesheet declares no column gap, so it owns no span for one"
+        );
     }
 }
