@@ -1,4 +1,5 @@
 mod canvas;
+mod canvas_render;
 mod commands;
 mod diagnostics;
 mod document_runtime_bridge;

@@ -6,9 +6,14 @@ version = 4
 name = "Spool"
 version = "0.1.0"
 dependencies = [
+ "figcraft-doc",
+ "figcraft-geom",
+ "figcraft-render",
  "gpui",
  "gpui_platform",
+ "image",
  "serde_json",
+ "tiny-skia 0.12.0",
  "tree-sitter",
  "tree-sitter-html",
 ]
