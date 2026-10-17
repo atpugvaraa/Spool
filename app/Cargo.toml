@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# The vendored figcraft engine. See vendor/figcraft/UPSTREAM.md.
+figcraft-doc = { workspace = true }
+figcraft-render = { workspace = true }
+figcraft-geom = { workspace = true }
+image = { workspace = true }
+tiny-skia = { workspace = true }
 # Pinned in the manifest, not only in Cargo.lock. An unpinned git dependency
 # tracks whatever the remote default branch happens to be, so deleting or
 # regenerating the lockfile silently upgrades the entire GPUI tree. This
