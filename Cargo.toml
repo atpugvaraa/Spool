@@ -111,7 +111,13 @@ unsafe_code = "forbid"
 dbg_macro = "warn"
 # Index-heavy pixel code reads worse with these.
 needless_range_loop = "allow"
-chunks_exact_to_as_chunks = "allow"
+# Upstream also allows `chunks_exact_to_as_chunks` here. That lint does not exist in
+# the toolchain Spool builds with, and naming an unknown lint in this table makes all
+# 13 vendored crates warn on every build. It is dropped here rather than there: this
+# table is Spool's, not vendored, so a `git subtree pull` stays clean. Re-add it if
+# the toolchain gains the lint.
+# The vendored crates also trip `clippy::nonminimal_bool` on this toolchain. That is
+# upstream's code, left exactly as shipped.
 # Shipped engine code returns Result/Option rather than panicking. Tests may.
 unwrap_used = "deny"
 expect_used = "deny"
