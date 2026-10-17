@@ -71,6 +71,41 @@ These are high-coupling. If a change is required: inspect the existing
 implementation first, make the smallest possible change, preserve existing
 behavior, and explain the reason in your final report. No opportunistic refactors.
 
+## `vendor/figcraft/**` — never modify
+
+`vendor/figcraft` is a verbatim copy of the upstream figcraft engine
+(`storytold/figcraft`, MIT OR Apache-2.0), recorded in
+`vendor/figcraft/UPSTREAM.md` with its exact revision. **Do not edit, reformat,
+or "fix" anything under it** — not to satisfy a lint, not to rename a field, not
+to remove an `allow`, not to add a feature flag.
+
+It exists so that `git subtree pull` produces a reviewable diff. An edit inside
+it is a permanent merge conflict against every future upstream sync.
+
+If the engine genuinely lacks something Spool needs, the change goes in a
+Spool-owned crate that depends on it — an extension trait, an adapter, a wrapper
+— or upstream, to be vendored when it lands there. If neither is possible, stop
+and report it rather than patching the copy.
+
+There are exactly two sanctioned local modifications, both documented in
+`UPSTREAM.md` and both mechanical: upstream's root `Cargo.toml` is renamed
+because two workspace roots cannot nest, and `plugins/` is removed because it is
+a separate wasm-only workspace.
+
+## Project layout
+
+Spool is a Cargo workspace rooted at `Cargo.toml`: `app/` holds the GPUI
+application and `vendor/figcraft/` holds the upstream engine.
+
+`app/` is not moving to `crates/`. Doing so would churn the protected paths
+above, break the `dist/` packaging scripts and the `mutate_*.sh` harnesses, and
+buy nothing.
+
+The workspace compiles the **engine side** of figcraft only. `crates/ui-egui` is
+deliberately excluded: it is the egui/eframe frontend, and Spool's frontend is
+GPUI. `crates/collab-net` is excluded until collaboration is built. Adding
+either to the workspace members is a deliberate act, not a cleanup.
+
 ## Source and metadata rules
 
 Never duplicate canonical HTML/CSS/SVG data into `lamine.yaml` for convenience.
@@ -82,6 +117,15 @@ hierarchy, frame/group/mask/component semantics, structural relationships, sourc
 bindings, provenance, and Spool-specific metadata.
 
 Authored source remains authoritative for authored implementation.
+
+**Which owner a property belongs to is decided in
+`docs/02-document-and-source-model.md`, and it is not a matter of taste.** Every
+persisted property is authored in HTML/CSS/SVG, is a Spool-specific fact in
+`lamine.yaml`, is derived, or is session state. The evidence behind each call
+is in `docs/research/document/property-ownership.md`. Assigning a property to
+two owners is a defect. If you find yourself wanting an authored property in
+`lamine.yaml` because writing it to CSS is awkward, that is the signal the
+ownership decision was wrong — report it rather than routing around it.
 
 ## Runtime rules
 
@@ -120,6 +164,28 @@ Unless explicitly assigned, do not implement:
 - A second document database
 
 Do not solve future problems before the current implementation gate requires them.
+
+### Assigned on 2026-10-17 — these four are now in scope
+
+The list above was written when Spool was building its own engine from scratch.
+The following are now **explicitly assigned** and are no longer gated on a new
+request. Everything not named here is still deferred.
+
+- **Core design parity** with the vendored engine: layers, frames, auto-layout,
+  components, variables, styles, vector editing, text, prototype, effects,
+  masks, import and export, Dev Mode.
+- **CLI and the command surface.** Every registered command runnable from a
+  terminal, plus a JSON control channel over a local port.
+- **MCP server.** The agent-facing surface. This is the concrete form Spool's
+  long-term "local AI that understands the project" direction takes.
+- **Collaboration and the server.** Inherited from upstream rather than written.
+
+Still deferred, despite figcraft shipping them: the WebAssembly plugin sandbox,
+the browser/wasm build, and the collaboration server app. Do not start them.
+
+Note the tension worth naming: "do not implement a layout engine" is satisfied by
+adopting one, not by writing one. The rule's purpose is to stop Spool from
+growing a parallel system. Vendoring the engine is the opposite move.
 
 ## Agent image limit
 
