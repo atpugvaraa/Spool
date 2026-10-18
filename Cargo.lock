@@ -7,6 +7,7 @@ name = "Spool"
 version = "0.1.0"
 dependencies = [
  "figcraft-doc",
+ "figcraft-engine",
  "figcraft-geom",
  "figcraft-render",
  "gpui",

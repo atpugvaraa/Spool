@@ -3,6 +3,7 @@ mod canvas_render;
 mod commands;
 mod diagnostics;
 mod document_runtime_bridge;
+pub mod engine;
 mod engine_project;
 mod hierarchy;
 mod inspector;

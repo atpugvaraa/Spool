@@ -8,6 +8,11 @@ edition = "2021"
 figcraft-doc = { workspace = true }
 figcraft-render = { workspace = true }
 figcraft-geom = { workspace = true }
+# The command registry, the menu catalog and the keymap: the data behind the menu bar, the
+# keyboard shortcuts and the Actions palette (see app/src/engine/).
+# The engine's Session and command registry. The Layers panel reads its rows
+# through `Session` and acts only through `Session::execute`.
+figcraft-engine = { workspace = true }
 # Spool's source-backed layer. It owns the lamine.yaml schema and the
 # source -> engine compile; app calls it rather than keeping a second one.
 spool-source = { path = "../crates/spool-source" }
