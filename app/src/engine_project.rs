@@ -311,10 +311,7 @@ fn to_manifest(
 /// file can refer to one (`component`). Only a node with no authored record is
 /// given a fresh id, allocated above every id in use so it cannot collide with a
 /// reference that is still live.
-fn overlay_structure(
-    authored: Manifest,
-    structure: &LamineStructure,
-) -> (Manifest, Vec<String>) {
+fn overlay_structure(authored: Manifest, structure: &LamineStructure) -> (Manifest, Vec<String>) {
     let mut notes = Vec::new();
     // One map, holding only the nodes the *document* holds. A parent or child it
     // does not hold is therefore a miss even when the metadata still describes
@@ -343,8 +340,10 @@ fn overlay_structure(
     // malformed document naming a child it does not hold. That is reported and
     // the edge dropped, rather than becoming a manifest that fails `validate`
     // with a dangling-reference error that says less than this does.
-    let edge = |notes: &mut Vec<String>, owner: &str, relation: &str, id: &SourceNodeId| {
-        match model_ids.get(id.as_str()) {
+    let edge =
+        |notes: &mut Vec<String>, owner: &str, relation: &str, id: &SourceNodeId| match model_ids
+            .get(id.as_str())
+        {
             Some(model) => Some(*model),
             None => {
                 notes.push(format!(
@@ -354,8 +353,7 @@ fn overlay_structure(
                 ));
                 None
             }
-        }
-    };
+        };
 
     let records: Vec<NodeRecord> = structure
         .nodes
@@ -413,7 +411,13 @@ fn overlay_structure(
 
     // Everything document-level — variables, collections, comments, the colour
     // profile — is the metadata's alone and is carried across untouched.
-    (Manifest { nodes: records, ..authored }, notes)
+    (
+        Manifest {
+            nodes: records,
+            ..authored
+        },
+        notes,
+    )
 }
 
 /// Project a manifest onto the structure the editor speaks.
@@ -623,7 +627,10 @@ mod tests {
         ));
 
         // Every managed node is present, hanging off that page.
-        let root = compiled.document.node(NodeId(1)).expect("model id 1 is the root");
+        let root = compiled
+            .document
+            .node(NodeId(1))
+            .expect("model id 1 is the root");
         assert_eq!(root.name, "Landing Frame");
         assert_eq!(root.parent, Some(page));
         assert_eq!(
@@ -695,10 +702,12 @@ mod tests {
         }
         for property in ["width", "height"] {
             assert!(
-                compiled.unresolved.iter().any(|line| line
-                    .contains("(spool-frame-root)")
-                    && line.contains(property)
-                    && line.contains("not authored")),
+                compiled
+                    .unresolved
+                    .iter()
+                    .any(|line| line.contains("(spool-frame-root)")
+                        && line.contains(property)
+                        && line.contains("not authored")),
                 "the missing {property} is reported: {:?}",
                 compiled.unresolved
             );
@@ -722,7 +731,10 @@ mod tests {
         // And nothing was invented for it: a property the stylesheet did not
         // author is still reported as missing rather than guessed.
         assert!(
-            compiled.unresolved.iter().any(|line| line.contains("opacity")),
+            compiled
+                .unresolved
+                .iter()
+                .any(|line| line.contains("opacity")),
             "an unauthored property is still reported: {:?}",
             compiled.unresolved
         );
@@ -951,19 +963,22 @@ mod tests {
         // No Owner B field was invented: everything `spool-source` defines beyond
         // identity, hierarchy, name, kind and binding is still the default, because
         // a structure holds none of it and this path is the fallback.
-        assert_eq!(manifest.nodes[0], NodeRecord {
-            id: 1,
-            key: "spool-frame-root".to_string(),
-            name: "Landing Frame".to_string(),
-            kind: "frame".to_string(),
-            parent: None,
-            children: vec![2, 3],
-            binding: SourceBinding {
-                file: "index.html".to_string(),
-                selector: "[data-spool-id=\"spool-frame-root\"]".to_string(),
-            },
-            ..NodeRecord::default()
-        });
+        assert_eq!(
+            manifest.nodes[0],
+            NodeRecord {
+                id: 1,
+                key: "spool-frame-root".to_string(),
+                name: "Landing Frame".to_string(),
+                kind: "frame".to_string(),
+                parent: None,
+                children: vec![2, 3],
+                binding: SourceBinding {
+                    file: "index.html".to_string(),
+                    selector: "[data-spool-id=\"spool-frame-root\"]".to_string(),
+                },
+                ..NodeRecord::default()
+            }
+        );
     }
 
     #[test]
@@ -1043,10 +1058,18 @@ mod tests {
     fn the_fixture_root_helper_resolves_against_this_crate() {
         // Guards the tests above from silently pointing at a path that does not
         // exist: `open_project` would fail, but for the wrong reason.
-        assert!(Path::new(&fixture_root("landing")).join("lamine.yaml").exists());
-        assert!(Path::new(&fixture_root("landing")).join("styles.css").exists());
-        assert!(Path::new(&fixture_root("owner-b")).join("lamine.yaml").exists());
-        assert!(Path::new(&fixture_root("owner-b")).join("styles.css").exists());
+        assert!(Path::new(&fixture_root("landing"))
+            .join("lamine.yaml")
+            .exists());
+        assert!(Path::new(&fixture_root("landing"))
+            .join("styles.css")
+            .exists());
+        assert!(Path::new(&fixture_root("owner-b"))
+            .join("lamine.yaml")
+            .exists());
+        assert!(Path::new(&fixture_root("owner-b"))
+            .join("styles.css")
+            .exists());
     }
 
     // --- version 2 and Owner B ---------------------------------------------
@@ -1098,7 +1121,10 @@ mod tests {
         assert_eq!(compiled.document.color_profile, ColorProfile::DisplayP3);
 
         assert!(
-            compiled.unresolved.iter().all(|line| !line.contains("lamine.yaml")),
+            compiled
+                .unresolved
+                .iter()
+                .all(|line| !line.contains("lamine.yaml")),
             "nothing about the manifest had to be reported: {:?}",
             compiled.unresolved
         );
@@ -1149,7 +1175,9 @@ mod tests {
         // defect, so the check that matters is the one on the metadata: the one
         // Owner B field that looks geometric is corner *smoothing*, and the
         // authored radii are absent.
-        let text = bundle.manifest_yaml().expect("the bundle kept the metadata bytes");
+        let text = bundle
+            .manifest_yaml()
+            .expect("the bundle kept the metadata bytes");
         let manifest = Manifest::from_yaml(text).expect("the metadata parses as a manifest");
         assert_eq!(manifest.nodes.len(), 3);
         let record = manifest
@@ -1352,22 +1380,45 @@ mod tests {
     fn owner_b_survives_the_real_open_path() {
         let loaded = open_project(fixture_root("owner-b")).expect("a v2 project opens");
 
-        let frame = loaded.engine.document.node(NodeId(1)).expect("the frame is in the document");
+        let frame = loaded
+            .engine
+            .document
+            .node(NodeId(1))
+            .expect("the frame is in the document");
         assert_eq!(frame.name, "Release Frame");
-        assert_eq!(frame.constraints.horizontal, HConstraint::Center, "Owner B: resize behaviour");
+        assert_eq!(
+            frame.constraints.horizontal,
+            HConstraint::Center,
+            "Owner B: resize behaviour"
+        );
         assert_eq!(frame.constraints.vertical, VConstraint::Bottom);
-        assert_eq!(frame.dev_status, DevStatus::ReadyForDev, "Owner B: handoff status has no CSS spelling");
+        assert_eq!(
+            frame.dev_status,
+            DevStatus::ReadyForDev,
+            "Owner B: handoff status has no CSS spelling"
+        );
         assert_eq!(
             frame.plugin_data.get("spool.agent").map(String::as_str),
             Some("release-owner"),
             "Owner B: free-form agent data reaches the node"
         );
 
-        let headline = loaded.engine.document.node(NodeId(2)).expect("the headline is in the document");
-        assert!(headline.locked, "Owner B: a locked layer is still locked after the compile");
+        let headline = loaded
+            .engine
+            .document
+            .node(NodeId(2))
+            .expect("the headline is in the document");
+        assert!(
+            headline.locked,
+            "Owner B: a locked layer is still locked after the compile"
+        );
         assert_eq!(headline.constraints.horizontal, HConstraint::LeftRight);
 
-        let badge = loaded.engine.document.node(NodeId(3)).expect("the badge is in the document");
+        let badge = loaded
+            .engine
+            .document
+            .node(NodeId(3))
+            .expect("the badge is in the document");
         assert!(badge.is_mask, "Owner B: what masks what is not CSS");
         assert_eq!(badge.mask_type, MaskType::Luminance);
 

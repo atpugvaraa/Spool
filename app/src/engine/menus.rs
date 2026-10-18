@@ -464,7 +464,10 @@ mod tests {
             .copied()
             .filter(|id| find_command(id).is_some())
             .collect();
-        assert!(!both.is_empty(), "some UI ids are programmatic engine commands too");
+        assert!(
+            !both.is_empty(),
+            "some UI ids are programmatic engine commands too"
+        );
         for id in &both {
             assert!(
                 !request(id, Value::Object(Default::default())).is_engine(),
@@ -645,7 +648,10 @@ mod tests {
             Node::Submenu { title, items } if title == "Boolean groups" => Some(items),
             _ => None,
         });
-        assert!(booleans.is_some_and(|items| items.len() == 5), "Union, Subtract, Intersect, Exclude, Flatten");
+        assert!(
+            booleans.is_some_and(|items| items.len() == 5),
+            "Union, Subtract, Intersect, Exclude, Flatten"
+        );
 
         let outlines = menu("View").into_iter().find_map(|n| match n {
             Node::Submenu { title, items } if title == "Outlines" => Some(items),
@@ -759,7 +765,11 @@ mod tests {
                     continue;
                 };
                 let path = format!("{prefix}/{title}");
-                assert_eq!(path.matches('/').count(), prefix.matches('/').count() + 1, "{path}");
+                assert_eq!(
+                    path.matches('/').count(),
+                    prefix.matches('/').count() + 1,
+                    "{path}"
+                );
                 assert!(!items.is_empty(), "{path} is empty");
                 check(&path, items);
             }

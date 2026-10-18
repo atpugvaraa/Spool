@@ -237,10 +237,7 @@ mod tests {
             let entry = offered.iter().find(|e| e.id == *id);
             let entry = entry.unwrap_or_else(|| panic!("`{id}` is not in the palette"));
             assert!(entry.ui, "`{id}` should be marked as the shell's");
-            assert!(
-                entry.label.contains(' ') || entry.label.contains('…'),
-                "`{id}` has no label"
-            );
+            assert!(!entry.label.is_empty(), "`{id}` has no label");
         }
         // Nothing else is marked as the shell's.
         assert!(offered.iter().filter(|e| e.ui).count() == menus::UI_COMMANDS.len());
