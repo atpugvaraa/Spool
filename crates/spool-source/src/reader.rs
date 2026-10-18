@@ -63,7 +63,7 @@ use figcraft_doc::{
     NodeKind, StrokeProps, TextAlignH, TextData,
 };
 
-use crate::css::Stylesheet;
+use crate::css::{RankedValue, Stylesheet};
 use crate::manifest::{Manifest, ManifestError, NodeRecord};
 
 /// The identity of the page every compiled node hangs from.
@@ -962,7 +962,7 @@ impl<'a> Builder<'a> {
                 );
             }
             let element = self.element_for(record)?;
-            let declarations = self.declarations_for(record, &element);
+            let declarations = self.declarations_for(record, &element)?;
             for property in OWNER_A_APPLIED {
                 if let Some(value) = declarations.get(*property) {
                     check_cascade(record, property, value)?;
@@ -1045,29 +1045,62 @@ impl<'a> Builder<'a> {
 
     /// Every declaration that applies to one element, in cascade order.
     ///
-    /// Linked stylesheets are consulted in the order the document links them, so
-    /// a later sheet overwrites an earlier one — the same cross-file order a
-    /// browser uses. The element's own `style` attribute is applied last, because
-    /// an inline declaration outranks any stylesheet.
+    /// Linked stylesheets are each resolved on their own, and the winners are
+    /// then ranked against each other: specificity first, then which sheet the
+    /// document links them from, then author order within it. Link order is
+    /// therefore the *last* tie-break rather than an override, which is the
+    /// whole difference between the cascade and "the last sheet that mentions
+    /// the property". Ranking on link order alone lets a later `.theme` beat an
+    /// earlier `#hero`, which is a value the author never asked for.
+    ///
+    /// A `!important` declaration this cascade cannot order is refused rather
+    /// than resolved: by the time a winner exists, the declaration that lost has
+    /// been discarded along with the evidence that the cascade could not rank
+    /// them. It is asked of each sheet before that happens.
+    ///
+    /// The element's own `style` attribute is applied last, because an inline
+    /// declaration outranks any stylesheet.
     fn declarations_for(
         &self,
         record: &NodeRecord,
         element: &Element,
-    ) -> BTreeMap<String, String> {
-        let mut out: BTreeMap<String, String> = BTreeMap::new();
+    ) -> Result<BTreeMap<String, String>, ReadError> {
+        let mut winners = Winners::default();
         if let Some(parsed) = self.files.get(&record.binding.file) {
-            for sheet in &parsed.stylesheets {
-                for (property, resolved) in
-                    &sheet.resolve(&element.tag, &element.classes, element.id.as_deref())
+            for (index, sheet) in parsed.stylesheets.iter().enumerate() {
+                // Scoped to the properties this reader actually compiles, the
+                // same set `check_cascade` refuses. A flag on a property nobody
+                // reads is not this node's ambiguity.
+                let important = sheet.important_properties(
+                    &element.tag,
+                    &element.classes,
+                    element.id.as_deref(),
+                );
+                if let Some(property) = OWNER_A_APPLIED
+                    .iter()
+                    .copied()
+                    .find(|property| important.contains(property))
                 {
-                    out.insert(property.to_owned(), resolved.value.clone());
+                    return Err(ReadError::AmbiguousCascade {
+                        id: record.id,
+                        property: property.to_owned(),
+                    });
+                }
+                for (property, resolved) in
+                    sheet.resolve_ranked(&element.tag, &element.classes, element.id.as_deref())
+                {
+                    winners.consider(property.to_owned(), index, resolved);
                 }
             }
+        }
+        let mut out: BTreeMap<String, String> = BTreeMap::new();
+        for (property, winner) in winners.by_property {
+            out.insert(property, winner.value);
         }
         for (property, value) in &element.inline {
             out.insert(property.clone(), value.clone());
         }
-        out
+        Ok(out)
     }
 
     /// Fill the inherited properties down the managed ancestor chain.
@@ -1298,12 +1331,68 @@ fn page_node() -> Node {
     )
 }
 
+/// One declaration competing for a property across every sheet the document
+/// links, with the ranking that decides it.
+///
+/// Three criteria, in the order a browser applies them: selector specificity,
+/// then which sheet the document links the declaration from, then author order
+/// inside that sheet. Link order sits *between* specificity and author order
+/// rather than replacing both, so an earlier `#hero` outranks a later `.theme`
+/// and a later `.theme` still beats an earlier `.theme`.
+struct Winner {
+    specificity: u32,
+    sheet: usize,
+    order: usize,
+    value: String,
+}
+
+impl Winner {
+    /// The comparable rank, for deciding whether this beats the incumbent.
+    fn rank(&self) -> (u32, usize, usize) {
+        (self.specificity, self.sheet, self.order)
+    }
+}
+
+/// The sheet-wide winner map, ranked rather than overwritten.
+#[derive(Default)]
+struct Winners {
+    by_property: BTreeMap<String, Winner>,
+}
+
+impl Winners {
+    /// Keep this declaration if it outranks the incumbent for `property`.
+    ///
+    /// A tie cannot happen across sheets: `order` is unique within a sheet and
+    /// `sheet` separates them, so exactly one declaration wins each property.
+    fn consider(&mut self, property: String, sheet: usize, resolved: RankedValue) {
+        let candidate = Winner {
+            specificity: resolved.specificity,
+            sheet,
+            order: resolved.order,
+            value: resolved.value,
+        };
+        match self.by_property.get(&property) {
+            Some(current) if current.rank() >= candidate.rank() => {}
+            _ => {
+                self.by_property.insert(property, candidate);
+            }
+        }
+    }
+}
+
 /// Refuse a value this cascade cannot order.
 ///
 /// `!important` is the one precedence rule [`crate::css`] documents that it does
 /// not implement, so it cannot tell whether such a declaration won. Reading it
 /// as though it had would hand the node a value the author may not have meant,
 /// and ignoring it would do the same. Either way the answer is a report.
+///
+/// This sees only the value that already won the cascade, so it is a check on
+/// the *inline* `style` attribute — where the authored text is the value. The
+/// stylesheet case is refused earlier, by
+/// [`Stylesheet::important_properties`], because by the time a stylesheet
+/// declaration has won, a losing `!important` has been discarded and this can
+/// no longer see it.
 fn check_cascade(record: &NodeRecord, property: &str, value: &str) -> Result<(), ReadError> {
     if value.to_ascii_lowercase().contains("!important") {
         return Err(ReadError::AmbiguousCascade {
@@ -2399,6 +2488,218 @@ mod tests {
                 .and_then(|fills| fills.first().map(solid_color)),
             Some(hex("00ff00"))
         );
+    }
+
+    #[test]
+    fn specificity_outranks_the_order_stylesheets_are_linked_in() {
+        let manifest = Manifest {
+            nodes: vec![record(1, "card", None, vec![])],
+            ..Default::default()
+        };
+        let width_of = |sources: &[(&str, &str)]| -> Result<f64, ReadError> {
+            let read = read_with_diagnostics(&manifest, &files(sources))?;
+            Ok(node_of(&read.document, 1).width)
+        };
+        let linked = "<link rel=\"stylesheet\" href=\"first.css\">\n\
+                      <link rel=\"stylesheet\" href=\"second.css\">\n\
+                      <div id=\"hero\" class=\"theme card\" data-spool-id=\"card\"></div>";
+        let reversed = "<link rel=\"stylesheet\" href=\"second.css\">\n\
+                        <link rel=\"stylesheet\" href=\"first.css\">\n\
+                        <div id=\"hero\" class=\"theme card\" data-spool-id=\"card\"></div>";
+        let by_id = "#hero { width: 320px; }";
+        let by_class = ".theme { width: 40px; }";
+
+        // The id rule is authored first and the class rule second. Only the
+        // cascade can tell that `#hero` outranks `.theme`; link order says the
+        // opposite, and a merge that reads it that way compiles a width the
+        // author never asked for — with no diagnostic to say so.
+        assert_eq!(
+            width_of(&[
+                ("index.html", linked),
+                ("first.css", by_id),
+                ("second.css", by_class)
+            ]),
+            Ok(320.0),
+            "an id beats a class even when its stylesheet is linked first"
+        );
+        assert_eq!(
+            width_of(&[
+                ("index.html", reversed),
+                ("first.css", by_id),
+                ("second.css", by_class)
+            ]),
+            Ok(320.0),
+            "and still beats it when its stylesheet is linked last"
+        );
+
+        // The same two rules in one sheet, where the cascade has always been
+        // applied: merging several sheets must not change that answer.
+        assert_eq!(
+            width_of(&[
+                ("index.html", linked),
+                (
+                    "first.css",
+                    "#hero { width: 320px; }\n.theme { width: 40px; }"
+                ),
+                ("second.css", "")
+            ]),
+            Ok(320.0),
+            "the same rules in one stylesheet resolve the same way"
+        );
+
+        // Equal specificity is the case link order *does* decide, and it decides
+        // it before author order, because author order is local to one sheet.
+        assert_eq!(
+            width_of(&[
+                ("index.html", linked),
+                ("first.css", ".theme { width: 320px; }"),
+                ("second.css", by_class)
+            ]),
+            Ok(40.0),
+            "two class rules of equal specificity are decided by link order"
+        );
+        assert_eq!(
+            width_of(&[
+                ("index.html", linked),
+                (
+                    "first.css",
+                    ".theme { width: 320px; }\n.theme { width: 40px; }"
+                ),
+                ("second.css", "")
+            ]),
+            Ok(40.0),
+            "and two of them in one sheet by author order"
+        );
+        assert_eq!(
+            width_of(&[
+                ("index.html", linked),
+                ("first.css", ".theme { width: 320px; }"),
+                ("second.css", ".theme { width: 40px; }")
+            ]),
+            Ok(40.0),
+            "which agrees in both directions"
+        );
+
+        // An inline declaration outranks both sheets, whichever of them wins.
+        assert_eq!(
+            width_of(&[
+                ("index.html", "<link rel=\"stylesheet\" href=\"first.css\">\n<link rel=\"stylesheet\" href=\"second.css\">\n<div id=\"hero\" class=\"theme card\" data-spool-id=\"card\" style=\"width: 8px\"></div>"),
+                ("first.css", by_id),
+                ("second.css", by_class),
+            ]),
+            Ok(8.0),
+            "an inline style still beats every stylesheet"
+        );
+    }
+
+    #[test]
+    fn an_important_declaration_is_refused_even_when_it_loses_the_cascade() {
+        let manifest = Manifest {
+            nodes: vec![record(1, "card", None, vec![])],
+            ..Default::default()
+        };
+        // `#hero` outranks `.theme`, so a cascade that ignores `!important`
+        // resolves 320px and discards the flagged 40px on the way. Reading the
+        // winner and never seeing the flag would compile a width the author
+        // explicitly marked as not-to-be-overridden, and say nothing.
+        //
+        // CSS would answer 40px, because `!important` outranks an id. This
+        // cascade does not implement that rule, so it cannot answer at all:
+        // reporting is the only answer that is not a value the author did not
+        // write.
+        let document = "<link rel=\"stylesheet\" href=\"theme.css\">\n\
+                        <link rel=\"stylesheet\" href=\"layout.css\">\n\
+                        <div id=\"hero\" class=\"theme card\" data-spool-id=\"card\"></div>";
+        assert_eq!(
+            read(
+                &manifest,
+                &files(&[
+                    ("index.html", document),
+                    ("theme.css", ".theme { width: 40px !important; }"),
+                    ("layout.css", "#hero { width: 320px; }"),
+                ]),
+            ),
+            Err(ReadError::AmbiguousCascade {
+                id: 1,
+                property: "width".to_owned(),
+            }),
+            "a losing !important is the case that must be reported, not the one that is dropped"
+        );
+        // The same two rules in one sheet, where the flagged declaration still
+        // loses: the flag does not become reportable only by being linked first.
+        assert_eq!(
+            read(
+                &manifest,
+                &files(&[
+                    ("index.html", "<link rel=\"stylesheet\" href=\"theme.css\">\n<div id=\"hero\" class=\"theme card\" data-spool-id=\"card\"></div>"),
+                    ("theme.css", ".theme { width: 40px !important; } #hero { width: 320px; }"),
+                ]),
+            ),
+            Err(ReadError::AmbiguousCascade {
+                id: 1,
+                property: "width".to_owned(),
+            })
+        );
+        // And in the order where the flagged rule *would* win the cascade as
+        // implemented, which the old check did catch — that one must stay an
+        // error too, not become a value.
+        assert_eq!(
+            read(
+                &manifest,
+                &files(&[
+                    ("index.html", "<link rel=\"stylesheet\" href=\"theme.css\">\n<div id=\"hero\" class=\"theme card\" data-spool-id=\"card\"></div>"),
+                    ("theme.css", "#hero { width: 320px; } .theme { width: 40px !important; }"),
+                ]),
+            ),
+            Err(ReadError::AmbiguousCascade {
+                id: 1,
+                property: "width".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn an_important_declaration_on_a_selector_that_does_not_match_is_ignored() {
+        let manifest = Manifest {
+            nodes: vec![record(1, "card", None, vec![])],
+            ..Default::default()
+        };
+        let element = "<link rel=\"stylesheet\" href=\"styles.css\">\n\
+                       <div class=\"card\" data-spool-id=\"card\"></div>";
+        // `.other` never matches this element, so the flag on it competes with
+        // nothing and says nothing about this node. Refusing here would make the
+        // restriction unusable: any project with an important declaration
+        // anywhere in its stylesheets would stop compiling.
+        let read = read_with_diagnostics(
+            &manifest,
+            &files(&[
+                ("index.html", element),
+                (
+                    "styles.css",
+                    ".other { width: 40px !important; }\n.card { width: 320px; }",
+                ),
+            ]),
+        )
+        .expect("an important declaration on another selector is not this node's problem");
+        assert_eq!(
+            node_of(&read.document, 1).width,
+            320.0,
+            "and the matching rule is the one that styles the element"
+        );
+
+        // A stylesheet with no flag at all is untouched by any of this.
+        let read = read_with_diagnostics(
+            &manifest,
+            &files(&[
+                ("index.html", element),
+                (
+                    "styles.css",
+                    ".other { width: 40px; }\n.card { width: 320px; }",
+                ),
+            ]),
+        )
+        .expect("compiles");
+        assert_eq!(node_of(&read.document, 1).width, 320.0);
     }
 
     #[test]
