@@ -19,7 +19,7 @@
 //! the engine every frame, and [`PanelState`] keeps only what is genuinely the editor's (which
 //! rows are open, what is being dragged, where the list is scrolled).
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
 use std::rc::Rc;
@@ -1185,8 +1185,15 @@ pub struct IconCache {
 }
 
 /// The Layers panel: pages on top, the virtualised layer tree below, an icon rail down the side.
+///
+/// The engine is held as `Rc<RefCell<Session>>`, the same handle
+/// [`EngineCanvas`](crate::engine::canvas::EngineCanvas) hands out through
+/// [`session_handle`](crate::engine::canvas::EngineCanvas::session_handle), so one editor has one
+/// session. Every borrow here is statement-scoped: read the value out, drop the borrow, then act,
+/// so no borrow is ever held across a call that borrows again.
 pub struct LayersPanel {
-    session: Session,
+    /// The engine, shared with the canvas. Read through `borrow()`, changed through `borrow_mut()`.
+    session: Rc<RefCell<Session>>,
     state: PanelState,
     icons: IconCache,
     cache: RowCache,
@@ -1200,9 +1207,10 @@ pub struct LayersPanel {
 }
 
 impl LayersPanel {
-    /// A panel over `session`. Everything it shows comes from the session; everything it changes
-    /// goes through it.
-    pub fn new(session: Session, cx: &mut Context<Self>) -> Self {
+    /// A panel over a session handle something else owns — normally
+    /// [`EngineCanvas::session_handle`](crate::engine::canvas::EngineCanvas::session_handle).
+    /// Everything it shows comes from the session; everything it changes goes through it.
+    pub fn new(session: Rc<RefCell<Session>>, cx: &mut Context<Self>) -> Self {
         Self {
             session,
             state: PanelState {
@@ -1219,13 +1227,15 @@ impl LayersPanel {
         }
     }
 
-    /// The session the panel reads and acts through.
-    pub fn session(&self) -> &Session {
-        &self.session
+    /// The session handle the panel reads and acts through. Same shape as
+    /// [`EngineCanvas::session_handle`](crate::engine::canvas::EngineCanvas::session_handle), so
+    /// the two agree on which engine they are talking to.
+    pub fn session(&self) -> Rc<RefCell<Session>> {
+        Rc::clone(&self.session)
     }
 
-    /// Replace the session, e.g. when a project is opened.
-    pub fn set_session(&mut self, session: Session, cx: &mut Context<Self>) {
+    /// Replace the session handle, e.g. when a project is opened.
+    pub fn set_session(&mut self, session: Rc<RefCell<Session>>, cx: &mut Context<Self>) {
         self.session = session;
         self.cache = RowCache::default();
         self.state.seen_sel.clear();
@@ -1240,12 +1250,12 @@ impl LayersPanel {
 
     /// Run an engine command. The only way this panel changes the document.
     fn run(&mut self, id: &str, params: Value) -> bool {
-        self.session.execute(id, &params).is_ok()
+        self.session.borrow_mut().execute(id, &params).is_ok()
     }
 
     /// The active document, cloned so it can be read without holding the session borrowed.
     fn doc_arc(&self) -> Option<Arc<Document>> {
-        self.session.ds().ok().map(|ds| ds.doc.clone())
+        self.session.borrow().ds().ok().map(|ds| ds.doc.clone())
     }
 
     /// The rows as listed. Cached: nothing here re-walks the tree when nothing changed.
@@ -1253,7 +1263,7 @@ impl LayersPanel {
         let Some(doc) = self.doc_arc() else {
             return Arc::new(Vec::new());
         };
-        let Ok(page) = self.session.page() else {
+        let Ok(page) = self.session.borrow().page() else {
             return Arc::new(Vec::new());
         };
         let filter = self.filter();
@@ -1274,7 +1284,10 @@ impl LayersPanel {
 
     /// The pages as listed: `(id, name, divider)`.
     pub fn pages(&self) -> Vec<PageRow> {
-        let Ok(doc) = self.session.doc() else {
+        // The one place the borrow is held across a block rather than a statement: every row is
+        // read out of the document, so nothing here borrows the session again.
+        let session = self.session.borrow();
+        let Ok(doc) = session.doc() else {
             return Vec::new();
         };
         doc.pages
@@ -1292,7 +1305,9 @@ impl LayersPanel {
     /// Consume the engine's requests for this panel: `layers.rename` (a rename asked for from the
     /// keyboard or a menu) and `layers.collapseAll`.
     fn drain_ui_requests(&mut self) {
-        let requests = std::mem::take(&mut self.session.ui_requests);
+        // Taken in one statement so the mutable borrow is gone before any of the handlers below
+        // read or change the session again.
+        let requests = std::mem::take(&mut self.session.borrow_mut().ui_requests);
         for r in requests {
             match r.kind.as_str() {
                 "layers.rename" => {
@@ -1307,7 +1322,7 @@ impl LayersPanel {
                 "layers.collapseAll" => self.collapse_all(),
                 // Requests for other surfaces (dialogs, files) are put back untouched rather than
                 // dropped: another panel owns them and losing one would hang the engine.
-                _ => self.session.ui_requests.push(r),
+                _ => self.session.borrow_mut().ui_requests.push(r),
             }
         }
     }
@@ -1316,7 +1331,7 @@ impl LayersPanel {
     /// and opens the rows above the layer. figcraft's `layers::start_rename`.
     pub fn start_rename(&mut self, ids: &[NodeId]) {
         let Some(doc) = self.doc_arc() else { return };
-        let Ok(page) = self.session.page() else {
+        let Ok(page) = self.session.borrow().page() else {
             return;
         };
         for a in ancestors_to_expand(&doc, page, ids) {
@@ -1335,10 +1350,10 @@ impl LayersPanel {
     pub fn collapse_all(&mut self) {
         self.state.expanded.clear();
         let Some(doc) = self.doc_arc() else { return };
-        let Ok(page) = self.session.page() else {
+        let Ok(page) = self.session.borrow().page() else {
             return;
         };
-        let sel = self.session.selection();
+        let sel = self.session.borrow().selection();
         for a in ancestors_to_expand(&doc, page, &sel) {
             self.state.expanded.insert(a);
         }
@@ -1352,18 +1367,19 @@ impl LayersPanel {
         };
         self.state.rename = Some(Rename { id, start: true });
         self.state.rename_field = Some(TextField::new(name, true));
-        if self.session.selection() != [id] {
+        if self.session.borrow().selection() != [id] {
             self.run("select.set", json!({"ids": [id]}));
         }
         self.state.anchor = Some(id);
         // The rename scrolls its own row into view.
-        self.state.seen_sel = self.session.selection();
+        self.state.seen_sel = self.session.borrow().selection();
     }
 
     /// Open a page's name for editing (double click or "Rename page").
     fn start_page_rename(&mut self, id: NodeId) {
         let name = self
             .session
+            .borrow()
             .doc()
             .ok()
             .and_then(|d| d.node(id))
@@ -1377,7 +1393,7 @@ impl LayersPanel {
 
     /// Apply a selection mode to `id` and record the anchor.
     fn select(&mut self, id: NodeId, mode: SelectMode) {
-        let sel = self.session.selection();
+        let sel = self.session.borrow().selection();
         match mode {
             SelectMode::Replace => {
                 self.state.anchor = Some(id);
@@ -1412,15 +1428,16 @@ impl LayersPanel {
             }
         }
         // A click in the panel needs no reveal scroll.
-        self.state.seen_sel = self.session.selection();
+        self.state.seen_sel = self.session.borrow().selection();
         // Editing text on the canvas ends when a layer is picked out of the panel.
         let editing = self
             .session
+            .borrow()
             .ds()
             .map(|ds| ds.text_edit.is_some())
             .unwrap_or(false);
         if editing {
-            let _ = figcraft_engine::textedit::end(&mut self.session);
+            let _ = figcraft_engine::textedit::end(&mut self.session.borrow_mut());
         }
     }
 
@@ -1457,6 +1474,7 @@ impl LayersPanel {
             RowAction::ToggleVisible { .. } => {
                 let visible = self
                     .session
+                    .borrow()
                     .doc()
                     .ok()
                     .and_then(|d| d.node(id))
@@ -1470,6 +1488,7 @@ impl LayersPanel {
             RowAction::ToggleLock { .. } => {
                 let locked = self
                     .session
+                    .borrow()
                     .doc()
                     .ok()
                     .and_then(|d| d.node(id))
@@ -1528,7 +1547,7 @@ impl LayersPanel {
         let rows = self.current_rows();
         if let Some(i) = vp.row_at(x, y, self.state.offset, rows.len()) {
             let Some(row) = rows.get(i) else { return };
-            let sel = self.session.selection();
+            let sel = self.session.borrow().selection();
             let ids = dragged_layers(Some(row.id), &sel);
             self.state.drag = Some(Dragging::Layers { ids, from: i });
             self.state.pending = None;
@@ -1669,7 +1688,7 @@ impl LayersPanel {
         // A release over a page row moves the layers to that page.
         let pov = self.state.pages_viewport.unwrap_or_default();
         let pages = self.pages();
-        let cur = self.session.page().ok();
+        let cur = self.session.borrow().page().ok();
         if let Some(p) = pov
             .row_at(x, y, self.state.pages_offset, pages.len())
             .and_then(|i| pages.get(i))
@@ -1751,7 +1770,7 @@ impl LayersPanel {
         }
         // Rename the selection: Cmd/Ctrl+R, as figcraft's shortcut.
         if cmd && key == "r" {
-            let ids = self.session.selection();
+            let ids = self.session.borrow().selection();
             self.start_rename(&ids);
             cx.notify();
             return true;
@@ -1979,13 +1998,13 @@ impl LayersPanel {
     /// Move the selection with the arrow keys.
     fn navigate(&mut self, nav: NavKey, shift: bool, cx: &mut Context<Self>) {
         let Some(doc) = self.doc_arc() else { return };
-        let Ok(page) = self.session.page() else {
+        let Ok(page) = self.session.borrow().page() else {
             return;
         };
         let rows = self.current_rows();
         let filtering = !self.filter().is_empty();
         let expanded = std::mem::take(&mut self.state.expanded);
-        let selection = self.session.selection();
+        let selection = self.session.borrow().selection();
         let anchor = self.state.anchor;
         let outcome = nav_step(
             &rows,
@@ -2003,7 +2022,7 @@ impl LayersPanel {
             NavOutcome::Select { ids, anchor } => {
                 self.state.anchor = Some(anchor);
                 self.run("select.set", json!({"ids": ids}));
-                self.state.seen_sel = self.session.selection();
+                self.state.seen_sel = self.session.borrow().selection();
             }
             NavOutcome::Toggle(id) => {
                 if nav == NavKey::Right {
@@ -2073,18 +2092,18 @@ impl Render for LayersPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
         self.drain_ui_requests();
 
-        let (Some(doc), Ok(page)) = (self.doc_arc(), self.session.page()) else {
+        let (Some(doc), Ok(page)) = (self.doc_arc(), self.session.borrow().page()) else {
             return div()
                 .flex_col()
                 .size_full()
                 .bg(rgb(theme::SURFACE))
                 .into_any_element();
         };
-        let selection = self.session.selection();
+        let selection = self.session.borrow().selection();
         let hover = self
             .state
             .hover
-            .or_else(|| self.session.ds().ok().and_then(|ds| ds.hover));
+            .or_else(|| self.session.borrow().ds().ok().and_then(|ds| ds.hover));
 
         // Reveal a new selection: expand its ancestors and scroll its row into view, once, so
         // "Collapse layers" and manual collapsing stick. figcraft's `reveal`.
@@ -2282,6 +2301,7 @@ impl LayersPanel {
                 .map(|f| f.text.clone())
                 .unwrap_or_else(|| {
                     self.session
+                        .borrow()
                         .doc()
                         .map(|d| d.name.clone())
                         .unwrap_or_default()
@@ -2308,6 +2328,7 @@ impl LayersPanel {
                     .on_click(cx.listener(|this, _e, _w, cx| {
                         let name = this
                             .session
+                            .borrow()
                             .doc()
                             .map(|d| d.name.clone())
                             .unwrap_or_default();
@@ -2530,10 +2551,10 @@ impl LayersPanel {
                             return;
                         }
                         this.press_page(id, e.click_count());
-                        if let Ok(cur) = this.session.page() {
-                            if cur != id {
-                                this.run("page.select", json!({"id": id}));
-                            }
+                        // Read the current page out and drop the borrow before `run` mutates.
+                        let cur = this.session.borrow().page().ok();
+                        if cur.is_some() && cur != Some(id) {
+                            this.run("page.select", json!({"id": id}));
                         }
                         cx.notify();
                     }))
@@ -2804,7 +2825,7 @@ impl LayersPanel {
             .pl(px(8.0 + depth as f32 * INDENT))
             .cursor_default()
             .on_mouse_move(cx.listener(move |this, _e, _w, cx| {
-                if let Ok(ds) = this.session.ds_mut() {
+                if let Ok(ds) = this.session.borrow_mut().ds_mut() {
                     if ds.hover != Some(id) {
                         ds.hover = Some(id);
                     }
@@ -2821,6 +2842,7 @@ impl LayersPanel {
                         // pointer passes, so a drag over ten rows is one command.
                         let on = this
                             .session
+                            .borrow()
                             .doc()
                             .ok()
                             .and_then(|d| d.node(id))
@@ -2981,6 +3003,7 @@ impl LayersPanel {
                     .on_click(cx.listener(move |this, _e, _w, cx| {
                         let visible = this
                             .session
+                            .borrow()
                             .doc()
                             .ok()
                             .and_then(|d| d.node(id))
@@ -3022,6 +3045,7 @@ impl LayersPanel {
                     .on_click(cx.listener(move |this, _e, _w, cx| {
                         let locked_now = this
                             .session
+                            .borrow()
                             .doc()
                             .ok()
                             .and_then(|d| d.node(id))
@@ -3850,6 +3874,54 @@ mod tests {
     }
 
     // --- the panel against a real session ----------------------------------
+
+    #[test]
+    fn the_canvas_and_the_panel_share_one_session() {
+        // The panel cannot be built without a GPUI context, so what is checked here is the thing
+        // the shared handle buys: one engine, two holders, one set of changes.
+        let (doc, _, ids) = doc_with(2);
+        let canvas = Rc::new(RefCell::new(Session::with_document(doc)));
+        let panel = Rc::clone(&canvas);
+        panel
+            .borrow_mut()
+            .execute("select.set", &json!({"ids": [ids[0]]}))
+            .unwrap();
+        assert_eq!(canvas.borrow().selection(), vec![ids[0]]);
+        canvas
+            .borrow_mut()
+            .execute(
+                "object.rename",
+                &json!({"ids": [ids[1]], "name": "Renamed"}),
+            )
+            .unwrap();
+        // The panel's own read: the document cloned out so nothing is held borrowed.
+        let doc = panel.borrow().ds().ok().map(|ds| ds.doc.clone());
+        assert_eq!(doc.unwrap().node(ids[1]).unwrap().name, "Renamed");
+    }
+
+    #[test]
+    fn taking_the_ui_requests_holds_no_borrow_across_the_handlers() {
+        // `drain_ui_requests` shape: take with `borrow_mut`, drop it, act, then put back with a
+        // fresh `borrow_mut`. A borrow held across either would panic at runtime, not at compile.
+        let (doc, _, ids) = doc_with(1);
+        let session = Rc::new(RefCell::new(Session::with_document(doc)));
+        session
+            .borrow_mut()
+            .execute("layers.collapseAll", &json!({}))
+            .unwrap();
+        let requests = std::mem::take(&mut session.borrow_mut().ui_requests);
+        assert!(requests.iter().any(|r| r.kind == "layers.collapseAll"));
+        let _ = session.borrow().selection();
+        let _ = session.borrow().page();
+        session
+            .borrow_mut()
+            .execute("select.set", &json!({"ids": [ids[0]]}))
+            .unwrap();
+        for r in requests {
+            session.borrow_mut().ui_requests.push(r);
+        }
+        assert_eq!(session.borrow().selection(), vec![ids[0]]);
+    }
 
     #[test]
     fn the_rows_come_from_the_session() {
