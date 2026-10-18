@@ -50,6 +50,7 @@
 //! shortcut. Both are handled, and both are pinned by tests over the whole table.
 
 pub mod keymap;
+pub mod canvas;
 pub mod layers;
 pub mod menus;
 pub mod palette;
