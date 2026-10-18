@@ -157,6 +157,11 @@ pub fn open_project(root: impl AsRef<Path>) -> Result<LoadedProject, ProjectOpen
     //    exactly one authored element.
     let bundle = ProjectBundle::load(root)?;
     let root = bundle.root().to_path_buf();
+    // Taken before `bundle.document` is moved out below. These are the bytes
+    // `load` already read -- never a re-read -- and they are where a version 2
+    // lamine.yaml keeps its Owner B facts. Without them every Owner B field is
+    // silently defaulted, which is exactly the failure `docs/02` forbids.
+    let manifest_yaml = bundle.manifest_yaml().map(str::to_owned);
     let document = bundle.document;
 
     // 2. Confirm identity against the authored parse rather than trusting the
@@ -209,7 +214,7 @@ pub fn open_project(root: impl AsRef<Path>) -> Result<LoadedProject, ProjectOpen
     //    and non-fatal: nothing below reads it yet, and a project the stages
     //    above accepted must not start failing because the engine compile
     //    cannot represent something in it.
-    let engine = crate::engine_project::compile_or_report(&document);
+    let engine = crate::engine_project::compile_or_report(&document, manifest_yaml.as_deref());
 
     Ok(LoadedProject {
         root,

@@ -1,0 +1,34 @@
+:root {
+  --ink: #16161d;
+  --accent: #3b5bfd;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, sans-serif;
+  color: var(--ink);
+}
+
+/* Every value in this file is Owner A. The version 2 metadata holds none of
+   them, which is the point: a property has exactly one owner. */
+main {
+  width: 640px;
+  height: 480px;
+  padding: 32px;
+  border-radius: 12px;
+  background: #ffffff;
+}
+
+h1 {
+  margin: 0 0 16px;
+  font-size: 32px;
+  line-height: 1.2;
+  color: var(--ink);
+}
+
+.badge {
+  width: 96px;
+  height: 32px;
+  border-radius: 16px;
+  background: var(--accent);
+}

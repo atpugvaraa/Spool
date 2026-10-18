@@ -1,0 +1,60 @@
+# Spool project metadata — version 2.
+#
+# The same file the other fixtures carry, plus the Owner B fields: the facts a
+# stylesheet has no honest spelling for. Everything in styles.css is Owner A and
+# is deliberately absent here — see docs/02-document-and-source-model.md.
+#
+# This fixture exists to prove that a version 2 file opens and compiles with
+# those values intact, so each block below is asserted by a test.
+version: 2
+nodes:
+  # Owner B on a container: how it resizes, whether it is ready for handoff, and
+  # free-form data for the agent. No CSS says any of these.
+  - id: 1
+    key: spool-frame-release
+    name: Release Frame
+    kind: frame
+    children:
+      - 2
+      - 3
+    binding:
+      file: index.html
+      selector: "[data-spool-id=\"spool-frame-release\"]"
+    constraints:
+      horizontal: center
+      vertical: bottom
+    dev_status: readyForDev
+    plugin_data:
+      spool.agent: release-owner
+      spool.ticket: SPOOL-412
+
+  # Owner B on a leaf: pinned in the editor, and a different resize behaviour
+  # from its parent.
+  - id: 2
+    key: spool-text-headline
+    name: Release Headline
+    kind: text
+    parent: 1
+    binding:
+      file: index.html
+      selector: "[data-spool-id=\"spool-text-headline\"]"
+    constraints:
+      horizontal: leftRight
+      vertical: center
+    dev_status: completed
+    locked: true
+
+  # Masks are Owner B: `overflow: hidden` is CSS, "what hides what" is not.
+  - id: 3
+    key: spool-frame-badge
+    name: Status Badge
+    kind: frame
+    parent: 1
+    binding:
+      file: index.html
+      selector: "[data-spool-id=\"spool-frame-badge\"]"
+    is_mask: true
+    mask_type: luminance
+
+# Document-level Owner B: the space this document's colour values are in.
+color_profile: displayP3

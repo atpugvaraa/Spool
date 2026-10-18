@@ -17,28 +17,66 @@
 //! string node ids, six fields per node, and a hand-parsed `lamine.yaml` v1.
 //! That model stays where it is — it is what the editor runtime, the layers
 //! panel and the save path all speak today, and replacing it is not this
-//! change's job. The job is to prove the engine can be fed from a real project.
+//! change's job.
 //!
 //! So the conversion happens here, in one direction, and everything about it is
 //! additive: the compiled document is *produced*, not *installed*. Nothing in
 //! the editor reads it yet, so no existing behaviour can depend on it.
+//!
+//! # Two readers of `lamine.yaml`, and which one this module uses
+//!
+//! The repository has two of them, and choosing between them is what this module
+//! is for:
+//!
+//! - [`LamineStructure::from_yaml`] is the app's own. It understands version 1
+//!   and refuses everything else, because it is a hand parser over a contract
+//!   with six fields per node. It is what the runtime, the layers panel and the
+//!   save path speak.
+//! - [`Manifest::from_yaml`] is [`spool_source`]'s, and it is the one that
+//!   defines the schema. It understands version 1 *and* version 2. Version 2 is
+//!   where Owner B lives: constraints, sizing, masks, locks, dev status, grids,
+//!   guides, exports, interactions, components, variable bindings, plugin data.
+//!
+//! When the raw metadata text is available, it is parsed here by the crate that
+//! defines the schema, so a version 2 project compiles with its Owner B intact.
+//! The text is the bytes [`ProjectBundle`] already read, never a second read of
+//! the file: two reads of one file is two answers to what the author wrote.
+//!
+//! When no text is available, the manifest is rebuilt from the app's structure,
+//! which is then the only description of the project in hand. That fallback
+//! carries identity, hierarchy and the source binding and nothing else: every
+//! Owner B field stays at its default, because inventing one would be a lie.
+//!
+//! # Who decides what, when both sources speak
+//!
+//! Owner B comes from the metadata text. Identity, hierarchy and the source
+//! binding come from the open document, because that is what the editor loaded
+//! and the only thing that knows about an edit which has not been saved. So a
+//! rename in the editor reaches the compiled document *and* the node keeps the
+//! constraints, lock, dev status and plugin data it was authored with.
+//!
+//! The two can disagree, and neither disagreement is resolved by guessing: a node
+//! the document holds and the metadata does not is compiled with no Owner B and
+//! says so in [`EngineProject::unresolved`]; a record the document does not hold
+//! is not compiled and also says so.
 //!
 //! # The two ids
 //!
 //! The app's [`crate::source_document::NodeId`] is a string; the engine's
 //! [`figcraft_doc::NodeId`] is a `u64`. Neither is derived from the other —
 //! `spool-source`'s crate docs explain why that separation is the whole point.
-//! This module allocates the model id from 1 in document order, exactly as
-//! `Manifest::from_yaml` does when it upgrades a v1 file, and carries the
-//! string through as the record's `key`.
+//! With no metadata text, the model id is allocated from 1 in document order,
+//! exactly as `Manifest::from_yaml` does when it upgrades a v1 file. With it, the
+//! authored id is kept as written — it is the identity other Owner B fields refer
+//! to, so renumbering it would silently repoint them — and only a node the
+//! metadata does not describe is given a fresh id above every one in use.
 //!
 //! # Ownership
 //!
-//! Only what the app actually holds is converted: identity, hierarchy, the
-//! source binding, and the layer name. Every Owner B field `spool-source`
-//! defines beyond those stays at its default, because this slice is not about
-//! populating them and inventing values would be a lie. Geometry, paint and
-//! text come from the authored CSS and markup, resolved by `spool-source`.
+//! Geometry, paint and text are never read out of `lamine.yaml`: they come from
+//! the authored CSS and markup, resolved by `spool-source`. A property with two
+//! owners is a defect, so nothing Owner A owns is duplicated into the manifest by
+//! this module.
 //!
 //! # Failure
 //!
@@ -53,7 +91,11 @@ use figcraft_doc::Document;
 use spool_source::manifest::{Manifest, ManifestError, NodeRecord, SourceBinding};
 use spool_source::reader::{self, ReadError};
 
-use crate::source_document::{LamineStructure, NodeId as SourceNodeId, PersistentDocument};
+use crate::project_bundle::{ProjectBundle, METADATA_FILE};
+use crate::source_document::{
+    LamineStructure, ModelError, NodeId as SourceNodeId, PersistentDocument,
+    SourceBinding as NodeSource, StructuralNode,
+};
 
 /// The name carried by the placeholder document a failed compile reports.
 ///
@@ -132,16 +174,38 @@ pub struct EngineProject {
 
 /// Compile a persistent document into the engine's document model.
 ///
-/// The three steps, in order: convert the app's structure into a
-/// [`Manifest`], hand it and the authored bytes to
-/// [`spool_source::reader::read_with_diagnostics`], and flatten the returned
-/// [`spool_source::reader::Read`] into this crate's shape.
+/// The three steps, in order: build a [`Manifest`], hand it and the authored
+/// bytes to [`spool_source::reader::read_with_diagnostics`], and flatten the
+/// returned [`spool_source::reader::Read`] into this crate's shape.
+///
+/// With no metadata text in hand — see [`compile_with_metadata`] — the manifest
+/// is rebuilt from the document's structure, so this is the version 1 path: it
+/// describes identity, hierarchy, binding and the layer name, and every Owner B
+/// field stays at its default.
 ///
 /// Fails rather than approximating. A duplicate id, a dangling parent, a
 /// binding that matches nothing in the markup and a kind the engine does not
 /// have are all returned as errors; none of them becomes a default.
 pub fn compile(persistent: &PersistentDocument) -> Result<EngineProject, EngineProjectError> {
-    let manifest = to_manifest(persistent)?;
+    compile_with_metadata(persistent, None)
+}
+
+/// Compile a document, preferring the metadata text it was loaded from.
+///
+/// `metadata` is the `lamine.yaml` bytes [`ProjectBundle`] read, verbatim. When
+/// it is `Some`, [`Manifest::from_yaml`] parses it — so a version 2 file is read
+/// by the crate that defines the schema, every Owner B field it carries reaches
+/// the compiled node, and [`Manifest::validate`] runs over the real file rather
+/// than over a structure this module built.
+///
+/// `None` is the honest fallback and not a silent downgrade: without the bytes
+/// there is nothing that could parse a version 2 file, so the structure is all
+/// the project is described by.
+pub fn compile_with_metadata(
+    persistent: &PersistentDocument,
+    metadata: Option<&str>,
+) -> Result<EngineProject, EngineProjectError> {
+    let (manifest, notes) = to_manifest(persistent, metadata)?;
     // `spool-source` keys sources by the same project-root-relative paths the
     // bindings use, so the app's map converts without renaming anything. It
     // wants a `BTreeMap` so the compile reads files in a stable order.
@@ -153,12 +217,36 @@ pub fn compile(persistent: &PersistentDocument) -> Result<EngineProject, EngineP
     let read = reader::read_with_diagnostics(&manifest, &sources)?;
     Ok(EngineProject {
         document: read.document,
-        unresolved: read
-            .unresolved
-            .iter()
-            .map(spool_source::reader::Unresolved::to_string)
+        // What this module had to say about the manifest comes first, so a
+        // reader sees why a value is missing before the reader's own list of
+        // values the authored source never stated.
+        unresolved: notes
+            .into_iter()
+            .chain(
+                read.unresolved
+                    .iter()
+                    .map(spool_source::reader::Unresolved::to_string),
+            )
             .collect(),
     })
+}
+
+/// Compile the project a bundle was loaded from, metadata text and all.
+///
+/// The one call a caller that already holds a [`ProjectBundle`] should make: the
+/// bundle read `lamine.yaml` once, and this hands those exact bytes to the parser
+/// that defines the schema instead of rebuilding a manifest from the structure
+/// and losing every Owner B field the file carried.
+///
+/// Not called by [`crate::project_open::open_project`] yet, which moves the
+/// document out of the bundle before compiling it and so cannot reach the text.
+/// That is a gap in the open path, not in this function: `open_project` keeps
+/// using [`compile_or_report`], and nothing reads an engine document yet, so no
+/// behaviour depends on the difference. Closing the gap means changing the open
+/// path, which is a separate change.
+#[allow(dead_code, reason = "wired for the open path; see the note above")]
+pub fn compile_bundle(bundle: &ProjectBundle) -> Result<EngineProject, EngineProjectError> {
+    compile_with_metadata(&bundle.document, bundle.manifest_yaml())
 }
 
 /// Compile a persistent document, or report why it could not be compiled.
@@ -172,8 +260,8 @@ pub fn compile(persistent: &PersistentDocument) -> Result<EngineProject, EngineP
 /// What this deliberately does *not* do is publish a partial document. A
 /// document missing some of its nodes looks like a project with fewer nodes,
 /// which is a different lie from a project that did not compile at all.
-pub fn compile_or_report(persistent: &PersistentDocument) -> EngineProject {
-    match compile(persistent) {
+pub fn compile_or_report(persistent: &PersistentDocument, metadata: Option<&str>) -> EngineProject {
+    match compile_with_metadata(persistent, metadata) {
         Ok(compiled) => compiled,
         Err(error) => EngineProject {
             document: Document::without_pages(FAILED_DOCUMENT_NAME),
@@ -182,30 +270,214 @@ pub fn compile_or_report(persistent: &PersistentDocument) -> EngineProject {
     }
 }
 
-/// Convert the app's structure into a `spool-source` manifest.
+/// The manifest to compile, plus what had to be said to get it.
 ///
-/// Model ids are allocated from 1 in document order — the same allocation
-/// `Manifest::from_yaml` performs when it upgrades a version 1 file, so a
-/// project converted here and a project loaded through `spool-source`'s own
-/// loader agree on which node is which.
-///
-/// The string id becomes the record's `key`, because it is the authored
-/// identity: it is what `data-spool-id` carries in markup and what the
-/// binding's selector resolves against. Everything else Owner B — constraints,
-/// auto-layout, masks, grids, exports, components — stays at its default,
-/// because the app's structure does not hold any of it and this slice is not
-/// about inventing it.
-///
-/// Validated before returning, so a structure that cannot become a compilable
+/// Validated before returning, so a project that cannot become a compilable
 /// manifest is refused here rather than downstream with a less specific
-/// complaint.
-fn to_manifest(persistent: &PersistentDocument) -> Result<Manifest, EngineProjectError> {
-    let manifest = manifest_from_structure(&persistent.structure);
+/// complaint. The notes are the divergences between the two sources — never
+/// errors, because neither side is authoritative enough to overrule the other
+/// while the project is open — and they are reported next to the document rather
+/// than swallowed.
+fn to_manifest(
+    persistent: &PersistentDocument,
+    metadata: Option<&str>,
+) -> Result<(Manifest, Vec<String>), EngineProjectError> {
+    let (manifest, notes) = match metadata {
+        Some(text) => {
+            let authored = Manifest::from_yaml(text)?;
+            overlay_structure(authored, &persistent.structure)
+        }
+        None => (manifest_from_structure(&persistent.structure), Vec::new()),
+    };
     manifest.validate()?;
-    Ok(manifest)
+    Ok((manifest, notes))
+}
+
+/// Overlay the open document's identity and hierarchy onto the authored manifest.
+///
+/// The metadata owns Owner B; the document owns who exists, what it is called and
+/// what it contains. Neither is allowed to quietly overrule the other, so this is
+/// the only place the two are combined, and each divergence is named:
+///
+/// - a node the document holds and the metadata does not is compiled from the
+///   document alone, with every Owner B field at its default, and reported —
+///   otherwise a node with no constraints would be indistinguishable from a node
+///   whose author wrote none;
+/// - a record the document does not hold is not compiled, and is reported, since
+///   an edit that removed it is the document's answer and silence would make the
+///   compiled document look like a project that never had the layer.
+///
+/// Model ids are the metadata's own, because an Owner B field elsewhere in the
+/// file can refer to one (`component`). Only a node with no authored record is
+/// given a fresh id, allocated above every id in use so it cannot collide with a
+/// reference that is still live.
+fn overlay_structure(
+    authored: Manifest,
+    structure: &LamineStructure,
+) -> (Manifest, Vec<String>) {
+    let mut notes = Vec::new();
+    // One map, holding only the nodes the *document* holds. A parent or child it
+    // does not hold is therefore a miss even when the metadata still describes
+    // it: the compiled document has the document's hierarchy, and an edge to a
+    // node that was removed is not compilable.
+    let mut model_ids: HashMap<&str, u64> = HashMap::new();
+    let mut next_id = authored
+        .nodes
+        .iter()
+        .map(|record| record.id)
+        .max()
+        .unwrap_or_default()
+        .saturating_add(1);
+    for node in &structure.nodes {
+        let id = authored
+            .node_by_key(node.id.as_str())
+            .map(|record| record.id)
+            .unwrap_or_else(|| {
+                let id = next_id;
+                next_id = next_id.saturating_add(1);
+                id
+            });
+        model_ids.insert(node.id.as_str(), id);
+    }
+    // Every node the document names has an id by now, so the only miss below is a
+    // malformed document naming a child it does not hold. That is reported and
+    // the edge dropped, rather than becoming a manifest that fails `validate`
+    // with a dangling-reference error that says less than this does.
+    let edge = |notes: &mut Vec<String>, owner: &str, relation: &str, id: &SourceNodeId| {
+        match model_ids.get(id.as_str()) {
+            Some(model) => Some(*model),
+            None => {
+                notes.push(format!(
+                    "node {owner} names {relation} {}, which the document does not \
+                     describe, so that edge does not compile",
+                    id.as_str()
+                ));
+                None
+            }
+        }
+    };
+
+    let records: Vec<NodeRecord> = structure
+        .nodes
+        .iter()
+        .map(|node| {
+            let key = node.id.as_str();
+            // Unconditional: every node in the structure was entered into the map
+            // above, whatever the metadata held.
+            let id = model_ids[key];
+            let mut record = authored.node_by_key(key).cloned().unwrap_or_else(|| {
+                notes.push(format!(
+                    "node {key} is in the document but not in {METADATA_FILE}, \
+                     so it compiles with no Owner B values"
+                ));
+                NodeRecord::default()
+            });
+            record.id = id;
+            record.key = key.to_owned();
+            record.name = node.name.clone();
+            // Passed through verbatim, exactly as in the fallback. `spool-source`
+            // normalises it when it builds the kind; normalising here would be a
+            // second place where kind means something slightly different from
+            // what the author wrote.
+            record.kind = node.kind.clone();
+            record.parent = node
+                .parent
+                .as_ref()
+                .and_then(|parent| edge(&mut notes, key, "parent", parent));
+            record.children = node
+                .children
+                .iter()
+                .filter_map(|child| edge(&mut notes, key, "child", child))
+                .collect();
+            record.binding = SourceBinding {
+                file: node.source.file.clone(),
+                selector: node.source.selector.clone(),
+            };
+            record
+        })
+        .collect();
+
+    for record in &authored.nodes {
+        if !structure
+            .nodes
+            .iter()
+            .any(|node| node.id.as_str() == record.key)
+        {
+            notes.push(format!(
+                "node {} ({}) is in {METADATA_FILE} but not in the document, \
+                 so it does not compile",
+                record.id, record.key
+            ));
+        }
+    }
+
+    // Everything document-level — variables, collections, comments, the colour
+    // profile — is the metadata's alone and is carried across untouched.
+    (Manifest { nodes: records, ..authored }, notes)
+}
+
+/// Project a manifest onto the structure the editor speaks.
+///
+/// The reverse direction of [`overlay_structure`], and deliberately lossy in the
+/// other direction: the editor's model has six fields per node, so Owner B
+/// cannot live here. It stays in the metadata text, which is what
+/// [`compile_with_metadata`] reads.
+///
+/// Exists because a version 2 file must still open in the editor. Refusing it
+/// instead would mean Spool cannot open a project its own schema defines, and
+/// the Owner B fields would be unreachable rather than merely not displayed.
+pub fn structure_from_manifest(manifest: &Manifest) -> Result<LamineStructure, ModelError> {
+    // Refused before projecting: a dangling parent or child would otherwise be
+    // silently dropped here, and a layer vanishing is not a lossy conversion.
+    manifest
+        .validate()
+        .map_err(|error| ModelError::InvalidOperation(error.to_string()))?;
+    let key_of = |id: u64| -> Option<String> {
+        manifest
+            .node(figcraft_doc::NodeId(id))
+            .map(|record| record.key.clone())
+    };
+    let structure = LamineStructure {
+        nodes: manifest
+            .nodes
+            .iter()
+            .map(|record| {
+                Ok(StructuralNode {
+                    id: SourceNodeId::new(record.key.clone())?,
+                    name: record.name.clone(),
+                    kind: record.kind.clone(),
+                    parent: record
+                        .parent
+                        .and_then(key_of)
+                        .map(SourceNodeId::new)
+                        .transpose()?,
+                    children: record
+                        .children
+                        .iter()
+                        .filter_map(|child| key_of(*child))
+                        .map(SourceNodeId::new)
+                        .collect::<Result<Vec<SourceNodeId>, ModelError>>()?,
+                    source: NodeSource {
+                        file: record.binding.file.clone(),
+                        selector: record.binding.selector.clone(),
+                    },
+                })
+            })
+            .collect::<Result<Vec<StructuralNode>, ModelError>>()?,
+    };
+    // The editor's own rules as well: unique names, non-empty bindings, and ids
+    // it can actually spell.
+    structure.validate()?;
+    Ok(structure)
 }
 
 /// Build the manifest records for one structure.
+///
+/// The fallback: used when no metadata text is in hand, so it is the version 1
+/// path. Model ids are allocated from 1 in document order — the same allocation
+/// `Manifest::from_yaml` performs when it upgrades a version 1 file, so a
+/// project converted here and a project read by `spool-source`'s own loader
+/// agree on which node is which.
 ///
 /// Split from [`to_manifest`] only so the record-building loop reads as what it
 /// is: a table of one row per node, with the id translation applied to every
@@ -254,7 +526,10 @@ fn manifest_from_structure(structure: &LamineStructure) -> Manifest {
 mod tests {
     use super::*;
     use crate::project_open::open_project;
-    use figcraft_doc::{Node, NodeId, NodeKind};
+    use figcraft_doc::color::ColorProfile;
+    use figcraft_doc::{
+        Constraints, DevStatus, HConstraint, MaskType, Node, NodeId, NodeKind, VConstraint,
+    };
     use std::path::{Path, PathBuf};
 
     /// One of the committed fixtures, resolved against this crate.
@@ -262,6 +537,12 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("fixtures")
             .join(fixture)
+    }
+
+    /// The version 2 fixture, loaded as a bundle so the metadata bytes are in
+    /// hand — which is the whole difference between the two compile paths.
+    fn owner_b_bundle() -> ProjectBundle {
+        ProjectBundle::load(fixture_root("owner-b")).expect("the version 2 fixture loads")
     }
 
     /// The managed nodes of a compiled document, page excluded.
@@ -577,7 +858,7 @@ mod tests {
             "the old path drew it, so the project does open"
         );
 
-        let reported = compile_or_report(&loaded.document);
+        let reported = compile_or_report(&loaded.document, None);
         assert_eq!(
             reported.document.node_count(),
             0,
@@ -599,7 +880,7 @@ mod tests {
         // A project that does compile is untouched by the wrapper.
         let ok = open_project(fixture_root("landing")).expect("landing opens");
         assert_eq!(
-            compile_or_report(&ok.document).document.node_count(),
+            compile_or_report(&ok.document, None).document.node_count(),
             4,
             "the non-fatal path returns the whole document when there is one"
         );
@@ -643,7 +924,12 @@ mod tests {
     #[test]
     fn model_ids_follow_document_order_and_keys_carry_the_authored_identity() {
         let loaded = open_project(fixture_root("landing")).expect("landing opens");
-        let manifest = to_manifest(&loaded.document).expect("landing is a valid manifest");
+        let (manifest, notes) = to_manifest(&loaded.document, None).expect("landing is a manifest");
+        assert!(
+            notes.is_empty(),
+            "the fallback rebuilds the manifest from the document, so there is \
+             nothing to report: {notes:?}"
+        );
 
         assert_eq!(manifest.nodes.len(), 3);
         for (index, record) in manifest.nodes.iter().enumerate() {
@@ -663,7 +949,8 @@ mod tests {
         assert_eq!(manifest.nodes[2].parent, Some(1));
 
         // No Owner B field was invented: everything `spool-source` defines beyond
-        // identity, hierarchy, name, kind and binding is still the default.
+        // identity, hierarchy, name, kind and binding is still the default, because
+        // a structure holds none of it and this path is the fallback.
         assert_eq!(manifest.nodes[0], NodeRecord {
             id: 1,
             key: "spool-frame-root".to_string(),
@@ -690,7 +977,7 @@ mod tests {
         let ghost = document.structure.nodes[2].id.clone();
         document.structure.nodes[1].children.push(ghost);
 
-        let error = to_manifest(&document).expect_err("a text node cannot hold children");
+        let error = to_manifest(&document, None).expect_err("a text node cannot hold children");
         assert!(
             matches!(
                 error,
@@ -758,5 +1045,342 @@ mod tests {
         // exist: `open_project` would fail, but for the wrong reason.
         assert!(Path::new(&fixture_root("landing")).join("lamine.yaml").exists());
         assert!(Path::new(&fixture_root("landing")).join("styles.css").exists());
+        assert!(Path::new(&fixture_root("owner-b")).join("lamine.yaml").exists());
+        assert!(Path::new(&fixture_root("owner-b")).join("styles.css").exists());
+    }
+
+    // --- version 2 and Owner B ---------------------------------------------
+
+    #[test]
+    fn a_version_two_manifest_lands_its_owner_b_on_the_compiled_node() {
+        let compiled = compile_bundle(&owner_b_bundle()).expect("a version 2 project compiles");
+
+        // `app/fixtures/owner-b/lamine.yaml` constraints the release frame to the
+        // centre horizontally and the bottom vertically, marks it ready for
+        // handoff, and carries two plugin entries. None of these has a CSS
+        // spelling; all three are Owner B and all three reach the node.
+        let release = node_named(&compiled.document, "Release Frame");
+        assert_eq!(release.constraints.horizontal, HConstraint::Center);
+        assert_eq!(release.constraints.vertical, VConstraint::Bottom);
+        assert_eq!(release.dev_status, DevStatus::ReadyForDev);
+        assert_eq!(
+            release.plugin_data.get("spool.agent").map(String::as_str),
+            Some("release-owner")
+        );
+        assert_eq!(
+            release.plugin_data.get("spool.ticket").map(String::as_str),
+            Some("SPOOL-412")
+        );
+        assert!(
+            !release.locked,
+            "the metadata did not lock this node, and an absent lock is not a lock"
+        );
+
+        // A different node, a different set: the values are per record, not
+        // applied uniformly by the compile.
+        let headline = node_named(&compiled.document, "Release Headline");
+        assert!(headline.locked);
+        assert_eq!(headline.dev_status, DevStatus::Completed);
+        assert_eq!(headline.constraints.horizontal, HConstraint::LeftRight);
+        assert_eq!(headline.constraints.vertical, VConstraint::Center);
+        assert!(
+            headline.plugin_data.is_empty(),
+            "the release frame's plugin data did not spread"
+        );
+
+        // Masks are Owner B as well: `overflow: hidden` is CSS, what hides what
+        // is not.
+        let badge = node_named(&compiled.document, "Status Badge");
+        assert!(badge.is_mask);
+        assert_eq!(badge.mask_type, MaskType::Luminance);
+
+        // Document-level Owner B is the manifest's alone and survives the compile.
+        assert_eq!(compiled.document.color_profile, ColorProfile::DisplayP3);
+
+        assert!(
+            compiled.unresolved.iter().all(|line| !line.contains("lamine.yaml")),
+            "nothing about the manifest had to be reported: {:?}",
+            compiled.unresolved
+        );
+    }
+
+    #[test]
+    fn the_owner_b_values_come_from_the_metadata_and_nowhere_else() {
+        // The same document, compiled without the metadata bytes. If this one
+        // still produced a locked node, the previous test would be proving
+        // nothing about the metadata.
+        let bundle = owner_b_bundle();
+        let compiled = compile(&bundle.document).expect("the fallback compiles the same project");
+
+        assert_eq!(
+            names(&compiled.document),
+            vec!["Release Frame", "Release Headline", "Status Badge"],
+            "and it is the same project: same nodes, same order"
+        );
+        let headline = node_named(&compiled.document, "Release Headline");
+        assert!(!headline.locked);
+        assert_eq!(headline.dev_status, DevStatus::None);
+        assert_eq!(headline.constraints, Constraints::default());
+        assert!(headline.plugin_data.is_empty());
+        let badge = node_named(&compiled.document, "Status Badge");
+        assert!(!badge.is_mask);
+        assert_eq!(badge.mask_type, MaskType::Alpha);
+        assert_eq!(
+            compiled.document.color_profile,
+            ColorProfile::Srgb,
+            "the document's own default stands"
+        );
+    }
+
+    #[test]
+    fn owner_a_still_comes_from_the_stylesheet_and_is_not_written_into_the_metadata() {
+        let bundle = owner_b_bundle();
+        let compiled = compile_bundle(&bundle).expect("compiles");
+
+        // `styles.css` authors `main { width: 640px; height: 480px; }` and a 12px
+        // corner radius. Those reach the node from the stylesheet, as they always
+        // have.
+        let release = node_named(&compiled.document, "Release Frame");
+        assert_eq!(release.width, 640.0);
+        assert_eq!(release.height, 480.0);
+        assert_eq!(release.corners.radii, [12.0, 12.0, 12.0, 12.0]);
+
+        // And the manifest holds none of them. A property with two owners is a
+        // defect, so the check that matters is the one on the metadata: the one
+        // Owner B field that looks geometric is corner *smoothing*, and the
+        // authored radii are absent.
+        let text = bundle.manifest_yaml().expect("the bundle kept the metadata bytes");
+        let manifest = Manifest::from_yaml(text).expect("the metadata parses as a manifest");
+        assert_eq!(manifest.nodes.len(), 3);
+        let record = manifest
+            .node_by_key("spool-frame-release")
+            .expect("the frame is described");
+        assert!(
+            record.corners.is_none(),
+            "a radius belongs to CSS; lamine.yaml may only carry the smoothing"
+        );
+    }
+
+    #[test]
+    fn an_unsaved_edit_compiles_with_the_owner_b_the_metadata_carried() {
+        let mut bundle = owner_b_bundle();
+        bundle.document.structure.nodes[1].name = "Release headline".into();
+
+        let compiled = compile_bundle(&bundle).expect("compiles");
+        let headline = node_named(&compiled.document, "Release headline");
+        assert!(
+            headline.locked && headline.dev_status == DevStatus::Completed,
+            "the rename came from the document and the lock from the metadata"
+        );
+        assert!(
+            !names(&compiled.document).contains(&"Release Headline"),
+            "and the name the document no longer holds is not still there"
+        );
+    }
+
+    #[test]
+    fn a_record_the_document_does_not_hold_is_reported_and_not_compiled() {
+        let mut bundle = owner_b_bundle();
+        // Removed the way the editor removes a node: off its parent's children
+        // too, so the only thing left inconsistent is the metadata.
+        bundle.document.structure.nodes.pop();
+        let badge = SourceNodeId::new("spool-frame-badge").expect("a valid fixture id");
+        bundle.document.structure.nodes[0]
+            .children
+            .retain(|child| *child != badge);
+
+        let compiled = compile_bundle(&bundle).expect("the rest still compiles");
+        assert_eq!(
+            names(&compiled.document),
+            vec!["Release Frame", "Release Headline"]
+        );
+        let note = compiled
+            .unresolved
+            .iter()
+            .find(|line| line.contains("spool-frame-badge"))
+            .unwrap_or_else(|| panic!("no report: {:?}", compiled.unresolved));
+        assert!(
+            note.contains("is in lamine.yaml but not in the document"),
+            "the missing record is named, not dropped quietly: {note}"
+        );
+    }
+
+    #[test]
+    fn a_node_the_metadata_does_not_describe_compiles_without_owner_b_and_says_so() {
+        // The reverse divergence: the editor holds a layer the file has no record
+        // of — a node added since the last save. It has to compile, because a
+        // layer the user can see must not vanish from the derived document, and it
+        // has to be reported, because a node with no constraints looks exactly
+        // like a node whose author wrote none.
+        let yaml = "version: 1\nnodes:\n  - id: \"spool-frame-root\"\n    name: \"Root\"\n    kind: \"frame\"\n    parent: null\n    file: \"index.html\"\n    selector: \"[data-spool-id=\\\"spool-frame-root\\\"]\"\n    children: []\n";
+        let html = "<!doctype html>\n<html>\n  <body>\n    <main data-spool-id=\"spool-frame-root\">\n      <p data-spool-id=\"spool-text-added\">added in the editor</p>\n    </main>\n  </body>\n</html>\n";
+        let root = scratch_project("added", yaml, html, "");
+        let mut bundle = ProjectBundle::load(&root).expect("the scratch project loads");
+        let added = SourceNodeId::new("spool-text-added").expect("a valid id");
+        bundle.document.structure.nodes.push(StructuralNode {
+            id: added.clone(),
+            name: "Added".into(),
+            kind: "text".into(),
+            parent: Some(bundle.document.structure.nodes[0].id.clone()),
+            children: Vec::new(),
+            source: NodeSource {
+                file: "index.html".into(),
+                selector: "[data-spool-id=\"spool-text-added\"]".into(),
+            },
+        });
+        bundle.document.structure.nodes[0].children.push(added);
+
+        let compiled = compile_bundle(&bundle).expect("an added layer still compiles");
+        let node = node_named(&compiled.document, "Added");
+        assert_eq!(
+            node.kind.text().map(|text| text.characters.as_str()),
+            Some("added in the editor"),
+            "and it is bound to the element the editor named"
+        );
+        assert_eq!(node.constraints, Constraints::default());
+        let note = compiled
+            .unresolved
+            .iter()
+            .find(|line| line.contains("spool-text-added"))
+            .unwrap_or_else(|| panic!("no report: {:?}", compiled.unresolved));
+        assert!(
+            note.contains("is in the document but not in lamine.yaml"),
+            "the missing record is named: {note}"
+        );
+    }
+
+    #[test]
+    fn an_edge_the_document_does_not_describe_is_reported_rather_than_a_panic() {
+        // A document naming a child it does not hold is malformed, and the old
+        // path answers that by indexing a map that has no entry for it. The
+        // manifest path has to say so instead.
+        let mut bundle = owner_b_bundle();
+        bundle.document.structure.nodes.pop();
+        let compiled = compile_bundle(&bundle).expect("the rest still compiles");
+        let note = compiled
+            .unresolved
+            .iter()
+            .find(|line| line.contains("child spool-frame-badge"))
+            .unwrap_or_else(|| panic!("no report: {:?}", compiled.unresolved));
+        assert!(
+            note.contains("does not describe"),
+            "the dangling edge is named: {note}"
+        );
+    }
+
+    #[test]
+    fn a_version_two_project_opens_in_the_editor_and_still_draws() {
+        let opened = open_project(fixture_root("owner-b")).expect("a version 2 project opens");
+
+        assert_eq!(opened.runtime.objects().len(), 3, "all three nodes drew");
+        assert!(opened.unrendered.is_empty());
+        assert_eq!(opened.document.structure.nodes.len(), 3);
+        // The persistent document is the six fields the editor has always held.
+        // Owner B did not move into it, because a property with two owners is a
+        // defect: the values are in the metadata and nowhere else.
+        assert!(
+            opened.document.sources.contains_key("styles.css"),
+            "authored source is still what the document carries"
+        );
+        assert!(opened.engine.document.current_page.is_some());
+    }
+
+    // --- the version 1 fixtures must not move -------------------------------
+
+    #[test]
+    fn every_version_one_fixture_compiles_the_same_with_and_without_its_metadata_text() {
+        let mut compiled_count = 0;
+        for fixture in ["landing", "nested", "landing.spool"] {
+            let bundle = ProjectBundle::load(fixture_root(fixture)).expect("fixture loads");
+            match (compile(&bundle.document), compile_bundle(&bundle)) {
+                (Ok(without), Ok(with)) => {
+                    compiled_count += 1;
+                    assert_eq!(
+                        without, with,
+                        "{fixture} compiles to the same document either way"
+                    );
+                }
+                (Err(without), Err(with)) => assert_eq!(
+                    without.to_string(),
+                    with.to_string(),
+                    "{fixture} is refused the same way either way"
+                ),
+                (without, with) => panic!(
+                    "{fixture}: the metadata text changed the outcome — {without:?} vs {with:?}"
+                ),
+            }
+        }
+        // Two of the three compile and one does not, for the same reason as
+        // before: `nested` declares a node of kind `image`, which the engine has
+        // no node kind for. Pinned so this test cannot pass by every fixture
+        // failing.
+        assert_eq!(compiled_count, 2, "landing and landing.spool compile");
+
+        // `awkward` cannot be compared this way at all: its markup spells the
+        // identity with single quotes and spaces around `=`, which the strict
+        // loader has always refused. It is a `source_binding` fixture, not a
+        // loadable project — and it is still refused, which is the behaviour that
+        // matters here.
+        assert!(
+            matches!(
+                ProjectBundle::load(fixture_root("awkward")),
+                Err(crate::project_bundle::BundleError::UnresolvedBinding { .. })
+            ),
+            "awkward is still a project the loader refuses, as it always was"
+        );
+    }
+
+    #[test]
+    fn the_open_path_produces_the_same_engine_document_it_always_did() {
+        // `open_project` compiles from the document alone — it cannot reach the
+        // metadata text — and that must stay exactly what it produced before this
+        // change existed.
+        let opened = open_project(fixture_root("landing")).expect("landing opens");
+        let bundle = ProjectBundle::load(fixture_root("landing")).expect("landing loads");
+        let with_text = compile_bundle(&bundle).expect("landing compiles");
+        assert_eq!(
+            with_text.document, opened.engine.document,
+            "the metadata text changes nothing for a version 1 project"
+        );
+    }
+
+    /// The one that matters end to end. `open_project` used to move
+    /// `bundle.document` out before compiling, which discarded the raw metadata
+    /// and silently defaulted every Owner B field. This asserts the real open
+    /// path, not the compile helper, so that cannot come back unnoticed.
+    #[test]
+    fn owner_b_survives_the_real_open_path() {
+        let loaded = open_project(fixture_root("owner-b")).expect("a v2 project opens");
+
+        let frame = loaded.engine.document.node(NodeId(1)).expect("the frame is in the document");
+        assert_eq!(frame.name, "Release Frame");
+        assert_eq!(frame.constraints.horizontal, HConstraint::Center, "Owner B: resize behaviour");
+        assert_eq!(frame.constraints.vertical, VConstraint::Bottom);
+        assert_eq!(frame.dev_status, DevStatus::ReadyForDev, "Owner B: handoff status has no CSS spelling");
+        assert_eq!(
+            frame.plugin_data.get("spool.agent").map(String::as_str),
+            Some("release-owner"),
+            "Owner B: free-form agent data reaches the node"
+        );
+
+        let headline = loaded.engine.document.node(NodeId(2)).expect("the headline is in the document");
+        assert!(headline.locked, "Owner B: a locked layer is still locked after the compile");
+        assert_eq!(headline.constraints.horizontal, HConstraint::LeftRight);
+
+        let badge = loaded.engine.document.node(NodeId(3)).expect("the badge is in the document");
+        assert!(badge.is_mask, "Owner B: what masks what is not CSS");
+        assert_eq!(badge.mask_type, MaskType::Luminance);
+
+        assert_eq!(
+            loaded.engine.document.color_profile,
+            ColorProfile::DisplayP3,
+            "document-level Owner B reaches the document"
+        );
+
+        // Owner A still comes from CSS, not the metadata. The fixture authors
+        // 640x480 and a 12px radius in styles.css and repeats neither.
+        assert_eq!(frame.width, 640.0);
+        assert_eq!(frame.height, 480.0);
+        assert_eq!(frame.corners.radii, [12.0; 4]);
     }
 }
