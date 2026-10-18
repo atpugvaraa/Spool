@@ -6,6 +6,10 @@
 //! window, no dialog and no prompt: a command that would ask the interface for something has its
 //! request reported on stderr and otherwise ignored.
 //!
+//! One thing is deliberately out of reach: the engine's WebAssembly plugin sandbox. The engine
+//! registers its commands, but `Agents.md` defers the subsystem, so `list-commands` does not list
+//! them and `run`/`script` refuse them by name and by policy. See [`deferred`].
+//!
 //! What this is NOT: it does not open Spool projects. A `.spool` project is a *directory* of
 //! authored HTML/CSS/SVG plus `lamine.yaml`; this crate may only depend on the engine crates, so it
 //! reads and writes the engine's own `.figcraft` / `.json` documents and refuses `.spool` paths
@@ -22,6 +26,7 @@
 )]
 
 mod args;
+mod deferred;
 mod document;
 mod export;
 mod out;
@@ -52,6 +57,8 @@ USAGE:
 COMMANDS
   list-commands  Every engine command: id, label, whether it edits the document, its shortcut
                  and its parameter documentation. --filter matches id, label or params.
+                 The WebAssembly plugin sandbox (plugin.*, plugin.directory.*, widget.*) is
+                 deferred by policy: it is neither listed nor runnable here. See Agents.md.
   run             Run one command (the same ids `list-commands` prints) with JSON params. Prints
                  the command's JSON result. --in opens a document first, --out saves it after.
   script          Run a JSON array of {\"id\", \"params\"} steps as ONE transaction: a failing step
@@ -262,8 +269,11 @@ fn list_commands(out: &mut Out, a: &Args) -> CliResult<()> {
             .as_ref()
             .is_none_or(|f| haystack.to_lowercase().contains(f))
     };
+    // Deferred commands are filtered out before the filter matches, so `--filter plugin` cannot
+    // even mention one (see `deferred`: the WebAssembly plugin sandbox is out of scope).
     let list: Vec<&figcraft_engine::CommandSpec> = figcraft_engine::all_commands()
         .iter()
+        .filter(|c| !deferred::is_deferred(c.id))
         .filter(|c| matches(c.id) || matches(c.label) || matches(c.params))
         .collect();
     if out.json() {
@@ -306,6 +316,11 @@ fn run_command(out: &mut Out, a: &Args) -> CliResult<()> {
         .map_err(CliError::Usage)?;
     let params = params_of(a.value("params"))?;
     // Refuse a bad command before a document is opened, so the error names the real problem.
+    // A deferred one is refused first: it *is* registered, so "unknown command" would be false,
+    // and running it would be the thing Spool's scope policy forbids.
+    if deferred::is_deferred(id) {
+        return Err(CliError::Failed(deferred::refusal(id)));
+    }
     if figcraft_engine::find_command(id).is_none() {
         return Err(CliError::Failed(format!(
             "unknown command `{id}` (see `spool-cli list-commands --filter {id}`)"
@@ -332,6 +347,15 @@ fn run_script(out: &mut Out, a: &Args) -> CliResult<()> {
         .map_err(|e| CliError::Failed(format!("can't read {file}: {e}")))?;
     let steps =
         script::parse_script(&text).map_err(|e| CliError::Failed(format!("{file}: {e}")))?;
+    // The whole script is refused before anything opens, so no step can reach a deferred command.
+    if let Some((step, id)) = steps
+        .iter()
+        .enumerate()
+        .find(|(_, s)| deferred::is_deferred(&s.id))
+        .map(|(i, s)| (i, s.id.as_str()))
+    {
+        return Err(CliError::Failed(deferred::script_refusal(step, id)));
+    }
     let (mut session, notes) = document::session(a.value("in"))?;
     report_notes(out, &notes);
     let run = script::execute_all(&mut session, &steps);
@@ -619,6 +643,160 @@ mod tests {
             r.stderr.contains("list-commands"),
             "the error says where to look"
         );
+    }
+
+    // ---- The deferred plugin sandbox: unreachable through the CLI (see `deferred`) ----
+
+    #[test]
+    fn no_listed_command_is_a_deferred_plugin_command() {
+        // Every filter that could surface a plugin id, not just "plugin": a sandbox command whose
+        // label or parameter documentation mentions a plugin must not appear either.
+        for filter in [
+            "plugin",
+            "plugins",
+            "widget",
+            "wasm",
+            "sandbox",
+            "runLast",
+            "manage",
+            "import",
+            "directory",
+        ] {
+            let r = cli(&["list-commands", "--filter", filter, "--json"]);
+            assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+            let items: Vec<Value> = serde_json::from_str(&r.stdout).unwrap();
+            for item in &items {
+                let id = item["id"].as_str().unwrap();
+                assert!(
+                    !deferred::is_deferred(id),
+                    "`{id}` matched --filter {filter}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_filter_naming_the_plugin_sandbox_lists_nothing() {
+        let r = cli(&["list-commands", "--filter", "plugin", "--json"]);
+        assert_eq!(r.code, 0);
+        let items: Vec<Value> = serde_json::from_str(&r.stdout).unwrap();
+        for item in &items {
+            // `node.set`'s parameter documentation mentions `pluginData`, a document property
+            // rather than the sandbox: it is a real command and stays listed.
+            let id = item["id"].as_str().unwrap();
+            assert!(
+                !id.starts_with("plugin") && !id.starts_with("widget"),
+                "`{id}` is a sandbox command"
+            );
+        }
+        // Human mode agrees with JSON mode.
+        let r = cli(&["list-commands", "--filter", "plugin"]);
+        assert_eq!(r.code, 0);
+        assert!(!r.stdout.contains("plugin.run"));
+        assert!(!r.stdout.contains("plugin.directory"));
+        assert!(!r.stdout.contains("widget."));
+    }
+
+    #[test]
+    fn the_whole_registry_is_filtered_the_same_way() {
+        // The unfiltered listing is the whole visible surface: same count as the registry minus
+        // the deferred ids, and not one deferred id in it.
+        let r = cli(&["list-commands", "--json"]);
+        assert_eq!(r.code, 0);
+        let items: Vec<Value> = serde_json::from_str(&r.stdout).unwrap();
+        let all = figcraft_engine::all_commands().len();
+        assert_eq!(items.len(), all - deferred::deferred().len());
+        for item in &items {
+            assert!(!deferred::is_deferred(item["id"].as_str().unwrap()));
+        }
+    }
+
+    #[test]
+    fn run_refuses_every_deferred_command_with_the_policy_on_stderr() {
+        for id in deferred::deferred() {
+            let r = cli(&["run", id, "--json"]);
+            assert_ne!(r.code, 0, "`{id}` must not succeed");
+            assert_eq!(r.code, 1, "`{id}` is a refusal, not a usage error");
+            assert_eq!(r.stdout, "", "stdout is data: a refusal produces none");
+            assert!(r.stderr.contains("deferred"), "`{id}`: {}", r.stderr);
+            assert!(r.stderr.contains("Agents.md"), "`{id}`: {}", r.stderr);
+            assert!(r.stderr.contains(&format!("`{id}`")), "`{id}` is named");
+            assert!(
+                !r.stderr.contains(&format!("unknown command `{id}`")),
+                "`{id}` is registered: calling it unknown would be false"
+            );
+        }
+    }
+
+    #[test]
+    fn a_deferred_command_is_refused_before_a_document_is_read() {
+        // `--in` points at a file that does not exist: the error must still be the policy, so the
+        // refusal cannot be bypassed by supplying a document (or by the order of the checks).
+        let r = cli(&[
+            "run",
+            "plugin.run",
+            "--in",
+            "/nonexistent/nope.figcraft",
+            "--json",
+        ]);
+        assert_eq!(r.code, 1);
+        assert_eq!(r.stdout, "");
+        assert!(r.stderr.contains("deferred"));
+        assert!(!r.stderr.contains("can't open"));
+    }
+
+    #[test]
+    fn script_refuses_a_deferred_step_and_runs_nothing() {
+        let dir = scratch("deferred-script");
+        let path = dir.join("steps.json");
+        std::fs::write(
+            &path,
+            r#"[{"id": "node.create", "params": {"type": "frame", "name": "Made", "width": 8, "height": 8}},
+                {"id": "plugin.import", "params": {"path": "p.json"}}]"#,
+        )
+        .unwrap();
+        let doc = dir.join("never.figcraft");
+        let r = cli(&[
+            "script",
+            path.to_str().unwrap(),
+            "--out",
+            doc.to_str().unwrap(),
+            "--json",
+        ]);
+        assert_eq!(r.code, 1);
+        assert_eq!(r.stdout, "", "the script is refused whole: no step results");
+        assert!(r.stderr.contains("script step 1"), "stderr: {}", r.stderr);
+        assert!(r.stderr.contains("`plugin.import`"));
+        assert!(r.stderr.contains("Agents.md"));
+        assert!(!doc.exists(), "nothing ran, so nothing was written");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn collaboration_is_untouched_by_the_filter() {
+        // Listed...
+        for id in ["collab.host", "collab.join", "collab.peers"] {
+            let r = cli(&["list-commands", "--filter", id, "--json"]);
+            assert_eq!(r.code, 0);
+            let items: Vec<Value> = serde_json::from_str(&r.stdout).unwrap();
+            assert!(
+                items.iter().any(|i| i["id"] == id),
+                "`{id}` is assigned by Agents.md and must stay listed"
+            );
+        }
+        // ...and runnable: `collab.peers` answers headlessly, so a real result comes back on
+        // stdout with no policy refusal anywhere.
+        let r = cli(&["run", "collab.peers", "--json"]);
+        assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+        assert!(!r.stderr.contains("deferred"), "stderr: {}", r.stderr);
+        let value: Value = serde_json::from_str(&r.stdout).unwrap();
+        assert_eq!(value["peers"], json!([]));
+        // A collaboration command that cannot run here fails with the engine's own reason, not
+        // with the CLI's policy.
+        let r = cli(&["run", "collab.host", "--json"]);
+        assert_eq!(r.code, 1);
+        assert!(!r.stderr.contains("deferred"), "stderr: {}", r.stderr);
+        assert!(r.stderr.contains("collab.host"), "the engine names it");
     }
 
     #[test]
