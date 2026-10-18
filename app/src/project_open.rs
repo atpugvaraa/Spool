@@ -22,6 +22,7 @@
 //!   -> source_binding::reconcile (identity confirmed against the authored parse)
 //!   -> RuntimeProjection         (runtime keys and prototype geometry derived)
 //!   -> canvas::Document          (the disposable scene the editor draws)
+//!   -> engine_project::compile   (the engine's own model, for the engine)
 //! ```
 //!
 //! # What is authoritative and what is derived
@@ -87,6 +88,22 @@ pub struct LoadedProject {
     /// draw, it still exists in `document` and `projection`, and it is counted
     /// here so the caller can say so.
     pub unrendered: Vec<String>,
+    /// The engine document compiled from the project. Derived and disposable.
+    ///
+    /// This is the first thing in the pipeline that speaks the engine's own
+    /// model, and nothing reads it yet: it is produced on open so the claim
+    /// "a real project compiles into an engine document" is true of the running
+    /// program rather than only of a test.
+    ///
+    /// A compile failure is not fatal. A project the path above can open must
+    /// keep opening, so the failure becomes an empty document plus a readable
+    /// line in `engine.unresolved` — see [`crate::engine_project`].
+    // Dead code today, exactly as `projection` and `visuals` were when they
+    // were added: the compile is wired in so that the production open path
+    // produces an engine document, and the reader that will consume it is a
+    // later change. Nothing reads it, so say so rather than pretend otherwise.
+    #[allow(dead_code)]
+    pub engine: crate::engine_project::EngineProject,
 }
 
 /// Why a project could not be opened.
@@ -140,6 +157,11 @@ pub fn open_project(root: impl AsRef<Path>) -> Result<LoadedProject, ProjectOpen
     //    exactly one authored element.
     let bundle = ProjectBundle::load(root)?;
     let root = bundle.root().to_path_buf();
+    // Taken before `bundle.document` is moved out below. These are the bytes
+    // `load` already read -- never a re-read -- and they are where a version 2
+    // lamine.yaml keeps its Owner B facts. Without them every Owner B field is
+    // silently defaulted, which is exactly the failure `docs/02` forbids.
+    let manifest_yaml = bundle.manifest_yaml().map(str::to_owned);
     let document = bundle.document;
 
     // 2. Confirm identity against the authored parse rather than trusting the
@@ -188,6 +210,12 @@ pub fn open_project(root: impl AsRef<Path>) -> Result<LoadedProject, ProjectOpen
         return Err(ProjectOpenError::NothingRenderable);
     }
 
+    // 6. Compile the same project into the engine's document model. Additive
+    //    and non-fatal: nothing below reads it yet, and a project the stages
+    //    above accepted must not start failing because the engine compile
+    //    cannot represent something in it.
+    let engine = crate::engine_project::compile_or_report(&document, manifest_yaml.as_deref());
+
     Ok(LoadedProject {
         root,
         document,
@@ -196,6 +224,7 @@ pub fn open_project(root: impl AsRef<Path>) -> Result<LoadedProject, ProjectOpen
         visuals,
         unstyled,
         unrendered,
+        engine,
     })
 }
 

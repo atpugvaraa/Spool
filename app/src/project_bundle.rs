@@ -37,6 +37,32 @@
 //! (`styles/site.css`), never by the href that found it
 //! (`../styles/site.css`). Keeping one namespace is what lets a save address a
 //! file without knowing whether metadata or markup discovered it.
+//!
+//! # Two metadata formats, and why the load is not the save
+//!
+//! `lamine.yaml` has two formats. Version 1 is the six-fields-per-node contract
+//! the editor has always spoken, and [`LamineStructure::from_yaml`] is its
+//! reader. Version 2 is defined by `spool-source` and is where Owner B lives —
+//! constraints, sizing, masks, locks, dev status, grids, guides, exports,
+//! interactions, components, variable bindings, plugin data.
+//!
+//! [`ProjectBundle::load`] reads version 1 with the editor's own reader first, so
+//! a project that has always opened keeps going through exactly the code it
+//! always went through. Only a file that reader rejects *for not being its
+//! format* is handed to [`spool_source::Manifest`], the crate that defines the
+//! schema, and projected onto the editor's structure by
+//! [`crate::engine_project::structure_from_manifest`]. A version 1 file with a
+//! fault in it stays refused with the reason that reader gave. The Owner B fields
+//! are not in the projection and were never going to be: they stay in the bytes,
+//! which the bundle keeps as [`ProjectBundle::manifest_yaml`] for
+//! [`crate::engine_project::compile_with_metadata`] to read.
+//!
+//! [`ProjectBundle::load_structure`], by contrast, stays on the strict version 1
+//! reader on purpose. It is what a save compares the editor's document against,
+//! and a version 2 project failing there is what stops a save from writing a
+//! version 1 file over it and losing every Owner B value it carried. Making the
+//! save understand version 2 is real work — it has to merge structural edits into
+//! the manifest rather than re-encode it — and belongs in its own change.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -55,7 +81,12 @@ pub const METADATA_FILE: &str = "lamine.yaml";
 pub enum BundleError {
     /// No `lamine.yaml` at the bundle root.
     MissingMetadata { root: PathBuf },
-    /// `lamine.yaml` was read but is not valid version-1 metadata.
+    /// `lamine.yaml` was read but is not valid metadata in either format.
+    ///
+    /// Carries the app's [`ModelError`] whether the file was refused by the
+    /// version 1 reader or by `spool-source`'s; a refusal from the second is
+    /// carried as its own wording inside `InvalidYaml`, so the reason a file was
+    /// turned away reaches the caller rather than being replaced by a generic one.
     MalformedMetadata { path: PathBuf, source: ModelError },
     /// A source binding named a file that is not present in the bundle.
     MissingSource { file: String, referenced_by: NodeId },
@@ -91,7 +122,7 @@ impl fmt::Display for BundleError {
                 write!(f, "no {METADATA_FILE} found in project root {}", root.display())
             }
             Self::MalformedMetadata { path, source } => {
-                write!(f, "{} is not valid version-1 metadata: {source}", path.display())
+                write!(f, "{} is not valid project metadata: {source}", path.display())
             }
             Self::MissingSource {
                 file,
@@ -146,6 +177,14 @@ impl std::error::Error for BundleError {
 pub struct ProjectBundle {
     root: PathBuf,
     pub document: PersistentDocument,
+    /// `lamine.yaml` exactly as it was read, when this bundle read it.
+    ///
+    /// The bytes, not a re-parse and not a re-read of the file: the file could
+    /// have changed on disk since, and "what did this project say when it was
+    /// opened" has exactly one answer. `None` for a bundle built by
+    /// [`ProjectBundle::from_document`], which wraps a document that has no file
+    /// behind it.
+    manifest_yaml: Option<String>,
 }
 
 impl ProjectBundle {
@@ -176,12 +215,7 @@ impl ProjectBundle {
         let root = root.as_ref().to_path_buf();
         let metadata_path = Self::locate_metadata(&root)?;
         let metadata = read(&metadata_path)?;
-        let structure = LamineStructure::from_yaml(&metadata).map_err(|source| {
-            BundleError::MalformedMetadata {
-                path: metadata_path.clone(),
-                source,
-            }
-        })?;
+        let structure = parse_structure(&metadata_path, &metadata)?;
 
         // Read each bound file once, in deterministic order. A reference that
         // escapes the root is rejected before any file is opened.
@@ -276,7 +310,19 @@ impl ProjectBundle {
                 structure,
                 sources: authored.into_iter().collect(),
             },
+            manifest_yaml: Some(metadata),
         })
+    }
+
+    /// The `lamine.yaml` text this bundle was loaded from, if it read one.
+    ///
+    /// Reaches the engine compile as the authoritative answer to "what does this
+    /// project's metadata say", which is what a version 2 file needs: the
+    /// document beside it cannot express Owner B, so a compile from the document
+    /// alone would quietly produce a project with no constraints, no locks and no
+    /// plugin data. See [`crate::engine_project::compile_with_metadata`].
+    pub fn manifest_yaml(&self) -> Option<&str> {
+        self.manifest_yaml.as_deref()
     }
 
     /// Read only `lamine.yaml`, as it currently stands on disk.
@@ -286,6 +332,11 @@ impl ProjectBundle {
     /// authored file: by the time a save runs, its edits are already resolved,
     /// and a full reload could fail for a reason that has nothing to do with
     /// the metadata being written. Nothing here touches authored source.
+    ///
+    /// Deliberately strict: this is the version 1 reader, and it is the reason a
+    /// save of a version 2 project stops rather than overwriting the file with a
+    /// version 1 encoding that would drop every Owner B value in it. See the
+    /// module docs.
     pub fn load_structure(root: impl AsRef<Path>) -> Result<LamineStructure, BundleError> {
         let root = root.as_ref();
         let metadata_path = Self::locate_metadata(root)?;
@@ -310,6 +361,9 @@ impl ProjectBundle {
         Ok(Self {
             root: root.as_ref().to_path_buf(),
             document,
+            // No file was read, so there are no bytes to claim about one. A
+            // caller that has the file should use [`ProjectBundle::load`].
+            manifest_yaml: None,
         })
     }
 
@@ -345,6 +399,62 @@ impl ProjectBundle {
         let target = self.root.join(METADATA_FILE);
         write_atomically(&target, encoded.as_bytes())
     }
+}
+
+/// Read `lamine.yaml` into the structure the editor speaks.
+///
+/// The editor's own reader goes first, and a file it accepts is finished: a
+/// project that has always opened must keep going through exactly the code it
+/// always went through, byte for byte. That is also what keeps a version 1 file
+/// from being re-encoded on load, which would reformat a file the author wrote
+/// and throw away every comment in it.
+///
+/// A refusal only moves the question to [`spool_source::Manifest::from_yaml`],
+/// which understands both versions, when it is a refusal about the *format* —
+/// see [`is_another_format`]. A version 1 file with a fault in it stays refused,
+/// with the reason the editor's own reader gave, because that reader is the
+/// authority on version 1 and looking for the same mistake in a second reader
+/// would only find it stated more loosely.
+fn parse_structure(path: &Path, metadata: &str) -> Result<LamineStructure, BundleError> {
+    let malformed = |source: ModelError| BundleError::MalformedMetadata {
+        path: path.to_path_buf(),
+        source,
+    };
+    let version_one = match LamineStructure::from_yaml(metadata) {
+        Ok(structure) => return Ok(structure),
+        Err(error) if !is_another_format(&error) => return Err(malformed(error)),
+        Err(error) => error,
+    };
+    match spool_source::manifest::Manifest::from_yaml(metadata) {
+        Ok(manifest) => {
+            crate::engine_project::structure_from_manifest(&manifest).map_err(malformed)
+        }
+        // Both readers turned it away, for the same reason: the file is not
+        // either format's. Answering with the version 1 reader's reason alone is
+        // what this file would have got before, so there is nothing to add.
+        Err(version_two) if version_two.to_string() == version_one.to_string() => {
+            Err(malformed(version_one))
+        }
+        // The format-aware reader has something specific to say — an unsupported
+        // version, a field that does not exist — and that is the reason an author
+        // needs. The version 1 reader's "expected version: 1" is not: they have
+        // already been told, and repeating it buries the useful half.
+        Err(version_two) => Err(malformed(ModelError::InvalidYaml(version_two.to_string()))),
+    }
+}
+
+/// Whether the editor's reader refused the file for not being its format.
+///
+/// The version 1 reader checks `version: 1` and `nodes:` before it looks at a
+/// single node, and this is the one refusal that means "not a version 1 file"
+/// rather than "a mistake inside one". Every other refusal names a fault in a
+/// file that *is* version 1 — a duplicate id, a dangling child, an empty binding
+/// — and those are reported unchanged. Going to the schema's reader for those
+/// would be worse, not better: its version 1 upgrade resolves hierarchy by
+/// silently discarding references it does not recognise, so a dangling child
+/// would stop being an error and become a layer quietly gone.
+fn is_another_format(error: &ModelError) -> bool {
+    matches!(error, ModelError::InvalidYaml(detail) if detail.contains("expected version: 1"))
 }
 
 /// Stylesheet paths an HTML document links, relative to that document.
@@ -784,10 +894,23 @@ mod tests {
     #[test]
     fn malformed_metadata_is_reported_against_the_metadata_path() {
         let dir = scratch("landing");
-        std::fs::write(dir.join(METADATA_FILE), "version: 2\nnodes: []\n").unwrap();
+        // Refused by both readers, and it has to be refused by both for this to be
+        // the interesting case: a version 2 file the editor's reader rejects is now
+        // handed to the reader that defines the schema, so only a refusal from
+        // that one is a malformed project. This file has a field that does not
+        // exist, which is a mistake rather than a format.
+        std::fs::write(
+            dir.join(METADATA_FILE),
+            "version: 2\nnodes: []\nnot_a_field: true\n",
+        )
+        .unwrap();
         match ProjectBundle::load(&dir) {
-            Err(BundleError::MalformedMetadata { path, .. }) => {
+            Err(BundleError::MalformedMetadata { path, source }) => {
                 assert_eq!(path, dir.join(METADATA_FILE));
+                assert!(
+                    source.to_string().contains("not_a_field"),
+                    "and the reason is the schema's own wording: {source}"
+                );
             }
             other => panic!(
                 "expected MalformedMetadata, got {other:?}",
@@ -1135,6 +1258,108 @@ mod tests {
 
         // CSS is not in metadata and was byte-identical throughout.
         assert_eq!(std::fs::read(dir.join("styles.css")).unwrap(), css_before);
+    }
+
+    #[test]
+    fn a_version_two_manifest_loads_into_the_fields_the_editor_speaks() {
+        let bundle = ProjectBundle::load(fixture_root("owner-b")).expect("the fixture loads");
+        let nodes = &bundle.document.structure.nodes;
+
+        // Version 2 is a superset of what the editor reads, so every node is
+        // there with the same six fields a version 1 fixture carries.
+        assert_eq!(nodes.len(), 3);
+        let root = &nodes[0];
+        assert_eq!(root.id.as_str(), "spool-frame-release");
+        assert_eq!(root.name, "Release Frame");
+        assert_eq!(root.kind, "frame");
+        assert_eq!(root.parent, None);
+        assert_eq!(
+            root.children,
+            vec![
+                NodeId::new("spool-text-headline").unwrap(),
+                NodeId::new("spool-frame-badge").unwrap(),
+            ],
+            "hierarchy came across, in the order the file states"
+        );
+        assert_eq!(root.source.file, "index.html");
+        assert_eq!(
+            root.source.selector,
+            "[data-spool-id=\"spool-frame-release\"]"
+        );
+        assert_eq!(nodes[1].kind, "text");
+        assert_eq!(nodes[1].parent.as_ref(), Some(&root.id));
+        assert_eq!(nodes[2].name, "Status Badge");
+
+        // Bindings were still resolved against the authored markup, so this is a
+        // project rather than a metadata file pointing at nothing.
+        let mut loaded = bundle.document.sources.keys().collect::<Vec<_>>();
+        loaded.sort();
+        assert_eq!(loaded, ["index.html", "styles.css"]);
+    }
+
+    #[test]
+    fn a_loaded_bundle_keeps_the_metadata_bytes_it_read() {
+        let bundle = ProjectBundle::load(fixture_root("owner-b")).expect("the fixture loads");
+        let text = bundle
+            .manifest_yaml()
+            .expect("a loaded bundle has the bytes it read");
+        assert!(text.starts_with("# Spool project metadata"), "{text}");
+        assert_eq!(
+            text,
+            std::fs::read_to_string(fixture_root("owner-b").join(METADATA_FILE))
+                .expect("the fixture is on disk"),
+            "verbatim: the same bytes, not a re-encoding"
+        );
+
+        // A bundle built from a document has no file behind it, so it claims
+        // nothing about one.
+        let wrapped =
+            ProjectBundle::from_document(fixture_root("landing"), PersistentDocument::default())
+                .expect("wrapping a document needs no file");
+        assert_eq!(wrapped.manifest_yaml(), None);
+    }
+
+    #[test]
+    fn load_structure_refuses_a_version_two_project_so_a_save_cannot_overwrite_it() {
+        // The save path compares the editor's document against `load_structure`,
+        // so this refusal is what stops a save from writing a version 1 encoding
+        // over a version 2 file and losing every Owner B value in it. The honest
+        // answer is that a version 2 project is not savable yet, not that it is
+        // savable into something smaller.
+        assert!(matches!(
+            ProjectBundle::load_structure(fixture_root("owner-b")),
+            Err(BundleError::MalformedMetadata { .. })
+        ));
+        // Version 1 is untouched: the comparison a save actually depends on.
+        assert_eq!(
+            ProjectBundle::load_structure(fixture_root("landing"))
+                .expect("version 1 metadata still reads")
+                .nodes
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn a_version_one_project_saves_exactly_as_it_did() {
+        let dir = scratch("landing");
+        let before = std::fs::read_to_string(dir.join(METADATA_FILE)).unwrap();
+        let mut bundle = ProjectBundle::load(&dir).expect("scratch loads");
+
+        bundle.document.structure.nodes[1].name = "Hero headline".into();
+        bundle.save().expect("save succeeds");
+
+        let after = std::fs::read_to_string(dir.join(METADATA_FILE)).unwrap();
+        assert!(
+            after.starts_with("version: 1\nnodes:\n"),
+            "a version 1 project is still written as version 1: {after}"
+        );
+        assert_eq!(
+            after,
+            format!("{}\n", before.replace("\"Headline\"", "\"Hero headline\"")),
+            "and the encoding is byte-identical to the one the file already used, \
+             apart from the trailing newline the writer always emits"
+        );
     }
 
     #[test]

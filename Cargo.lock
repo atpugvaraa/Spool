@@ -13,6 +13,7 @@ dependencies = [
  "gpui_platform",
  "image",
  "serde_json",
+ "spool-source",
  "tiny-skia 0.12.0",
  "tree-sitter",
  "tree-sitter-html",
