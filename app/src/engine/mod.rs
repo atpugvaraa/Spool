@@ -51,6 +51,8 @@
 
 pub mod keymap;
 pub mod canvas;
+pub mod inspector_model;
 pub mod layers;
 pub mod menus;
 pub mod palette;
+pub mod source_edits;

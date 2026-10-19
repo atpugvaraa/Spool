@@ -903,7 +903,13 @@ fn utf16_and_char_indices_round_trip() {
 #[test]
 fn a_range_past_the_end_of_the_text_is_clamped_not_panicked() {
     assert_eq!(utf16_range_to_utf8("abc", 1..99), 1..3);
-    assert_eq!(utf16_range_to_utf8("abc", 99..2), 3..3);
+    // A REVERSED range, spelled as a struct rather than as `99..2` so that the
+    // deny-by-default `reversed_empty_ranges` lint does not read the literal as
+    // a mistake. It is not one: the point of the case is that a range whose end
+    // is before its start clamps to an empty range at the end of the text,
+    // rather than panicking or producing a backwards range.
+    let reversed = std::ops::Range { start: 99, end: 2 };
+    assert_eq!(utf16_range_to_utf8("abc", reversed), 3..3);
     assert_eq!(utf8_range_to_utf16("abc", 0..99), 0..3);
 }
 

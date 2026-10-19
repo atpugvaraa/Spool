@@ -100,9 +100,10 @@ fn load_requested_project(
 ) -> (
     Option<SharedString>,
     Option<crate::engine_project::EngineProject>,
+    Option<PathBuf>,
 ) {
     let Some(request) = request else {
-        return (None, None);
+        return (None, None, None);
     };
     let (root, opened) = match request {
         ProjectRequest::Project(path) => (
@@ -130,12 +131,17 @@ fn load_requested_project(
             // retired canvas. This is the document the engine frontend draws; the
             // old runtime keeps its copy for as long as both paths exist.
             let engine = loaded.engine.clone();
+            let root = loaded.root.clone();
             view.load_project(loaded);
-            (None, Some(engine))
+            (None, Some(engine), Some(root))
         }
         Err(error) => {
             eprintln!("spool_project_open failed root={root}: {error}");
-            (Some(format!("Could not open {root}: {error}").into()), None)
+            (
+                Some(format!("Could not open {root}: {error}").into()),
+                None,
+                None,
+            )
         }
     }
 }
@@ -251,6 +257,13 @@ fn shellexpand_home(path: &str) -> String {
 /// interaction state for exactly that reason — there is no second copy of a
 /// number, a scrub or a layer name anywhere in here.
 pub struct AppShell {
+    /// The directory the open project came from.
+    ///
+    /// Kept here because the save path needs it and the retired canvas's own
+    /// copy is private with no accessor. The save writes the ENGINE's document
+    /// back to these files, so this is the one thing the shell must still know
+    /// about the project on disk.
+    project_root: Option<PathBuf>,
     canvas: Entity<canvas::CanvasView>,
     layers: Entity<LayersView>,
     /// The editor over the figcraft engine. This is the one the application is
@@ -295,7 +308,7 @@ impl AppShell {
     pub fn new_with_project(requested: Option<PathBuf>, cx: &mut Context<Self>) -> Self {
         let canvas = cx.new(canvas::CanvasView::new_with_context);
         let request = project_request(requested, development_override());
-        let (message, engine) =
+        let (message, engine, root) =
             canvas.update(cx, |view, _| load_requested_project(request.as_ref(), view));
         let status = message.map(|message| (message, true));
         let layers = cx.new(|_| LayersView::new(canvas.downgrade()));
@@ -314,6 +327,15 @@ impl AppShell {
         engine_canvas.update(cx, |canvas, _| canvas.fit_on_next_paint());
         let session = engine_canvas.update(cx, |canvas, _| canvas.session_handle());
         let engine_layers = cx.new(|cx| crate::engine::layers::LayersPanel::new(session, cx));
+
+        // The Inspector is built before the engine canvas exists, so it is
+        // joined to it afterwards. It reads the engine's document and the
+        // engine's selection; without this it would show "No selection" for
+        // ever, because the retired canvas is no longer mounted and its
+        // selection is always empty.
+        inspector.update(cx, |inspector, cx| {
+            inspector.set_engine_canvas(engine_canvas.clone(), cx);
+        });
 
         // Held, not dropped: a GPUI subscription detaches its observer when it
         // goes away, and without it the chrome around the canvas would only
@@ -363,6 +385,7 @@ impl AppShell {
             }),
         ];
         Self {
+            project_root: root,
             canvas,
             layers,
             engine_canvas,
@@ -597,9 +620,10 @@ impl AppShell {
         };
         eprintln!("spool_project_create ok root={}", project.root().display());
         let request = ProjectRequest::Project(path.clone());
-        let (message, engine) = self
+        let (message, engine, root) = self
             .canvas
             .update(cx, |view, _| load_requested_project(Some(&request), view));
+        self.project_root = root;
         if let Some(message) = message {
             self.save_status = Some((message, true));
         }
@@ -870,7 +894,10 @@ impl AppShell {
     /// does nothing otherwise, and renaming forty layers into one string would
     /// not be a rename.
     fn rename_selection(&mut self, cx: &mut Context<Self>) {
-        let ids = self.canvas.read(cx).selection().ids().to_vec();
+        // The engine's selection, and the engine's identity. The retired
+        // canvas's object id is a runtime handle, not the engine's node id, so
+        // it cannot name a layer in the engine's document.
+        let ids = self.engine_canvas.read(cx).selection();
         let [id] = ids.as_slice() else {
             return;
         };
@@ -885,23 +912,56 @@ impl AppShell {
     /// Goes through the canvas so there is exactly one save path, and says what
     /// could not be written rather than implying everything persisted.
     fn save_project(&mut self, cx: &mut Context<Self>) {
-        let status = match self.canvas.update(cx, |canvas, _| canvas.save_project()) {
-            Ok(outcome) if outcome.written.is_empty() && outcome.unsupported.is_empty() => {
+        // The ENGINE's document is what is saved, because the engine is what the
+        // user has been editing. The retired canvas's document is not: nothing
+        // has been changing it since the swap, so saving it would write the
+        // project's state as it was BEFORE the session -- silently undoing the
+        // user's work on disk.
+        let Some(root) = self.project_root.clone() else {
+            self.save_status = Some(("No project open".into(), true));
+            cx.notify();
+            return;
+        };
+        let document = {
+            let canvas = self.engine_canvas.read(cx);
+            canvas.with_session(|session| session.doc().ok().cloned())
+        };
+        let Some(document) = document else {
+            self.save_status = Some(("Save failed: no open document".into(), true));
+            cx.notify();
+            return;
+        };
+        let status = match crate::engine::source_edits::save_engine_document(&root, &document) {
+            Ok(outcome) if outcome.written.is_empty()
+                && outcome.unsupported.is_empty()
+                && outcome.notes.is_empty() =>
+            {
                 "No changes to save".to_owned()
             }
-            Ok(outcome) if !outcome.unsupported.is_empty() => {
-                let names: Vec<&str> = outcome
-                    .unsupported
-                    .iter()
-                    .map(|edit| edit.node.as_str())
-                    .collect();
-                format!(
-                    "Saved {} file(s); not saved: {}",
-                    outcome.written.len(),
-                    names.join(", ")
-                )
+            Ok(outcome) => {
+                let mut parts = Vec::new();
+                if !outcome.written.is_empty() {
+                    parts.push(format!("Saved {} file(s)", outcome.written.len()));
+                }
+                if !outcome.unsupported.is_empty() {
+                    let names: Vec<&str> = outcome
+                        .unsupported
+                        .iter()
+                        .map(|edit| edit.node.as_str())
+                        .collect();
+                    parts.push(format!("not saved: {}", names.join(", ")));
+                }
+                // The notes are project-level facts the save wants the user to
+                // know -- that the metadata is version 2 and was left alone, for
+                // instance. They are not failures, so they are not counted as
+                // such.
+                parts.extend(outcome.notes.iter().cloned());
+                if parts.is_empty() {
+                    "No changes to save".to_owned()
+                } else {
+                    parts.join("; ")
+                }
             }
-            Ok(outcome) => format!("Saved {} file(s)", outcome.written.len()),
             Err(error) => format!("Save failed: {error}"),
         };
         let failed = status.starts_with("Save failed");

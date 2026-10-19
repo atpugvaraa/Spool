@@ -922,7 +922,6 @@ fn the_toolbar_starts_on_selection(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-#[ignore = "the mounted canvas is now engine::canvas::EngineCanvas, which takes input through the engine's own Session::pointer and its keymap, not through CanvasView. These tests click the canvas-viewport selector and assert on CanvasView's state, so they are testing the retired runtime. Re-pointed at the engine equivalents as part of finishing the swap -- they are ignored, NOT deleted, and the coverage they provided is genuinely missing until then."]
 fn a_successful_creation_returns_the_toolbar_to_selection(cx: &mut TestAppContext) {
     // Stale toolbar state is the failure this guards: the click ends a creation,
     // the canvas changes tool, and if the toolbar were reading anything else the
@@ -931,13 +930,13 @@ fn a_successful_creation_returns_the_toolbar_to_selection(cx: &mut TestAppContex
         let (shell, window) = open_shell(cx);
         choose_tool(window, label);
 
-        let spot = empty_canvas_point(&shell, window);
+        let spot = empty_engine_point(&shell, window);
         window.simulate_click(spot, Modifiers::none());
         window.run_until_parked();
 
         assert_eq!(
-            read(&shell, window, |canvas| canvas.tool()),
-            crate::canvas::Tool::Select,
+            read_engine_tool(&shell, window),
+            "move",
             "creating with {label} should end up on Selection"
         );
         assert_eq!(

@@ -17,19 +17,27 @@
 //!
 //! Document state, and any way to change it. Every control here ends in
 //! [`Inspector::commit_number`] or [`Inspector::commit_paint`], which hand a
-//! request to the canvas — the one place that owns geometry, appearance and the
-//! history boundary. That boundary is why adding rotation, constraints,
+//! request to the engine — the one place that owns geometry, appearance and
+//! the history boundary. That boundary is why adding rotation, constraints,
 //! alignment or auto-layout is a new [`Property`] and a new row rather than an
-//! edit to `canvas.rs` or to a gesture handler:
+//! edit to the engine or to a gesture handler:
 //!
-//! - one typed value is one semantic operation, because it is one
-//!   `set_object_geometry` or one `set_selected_style`;
+//! - one typed value is one semantic operation, because it is one engine
+//!   command;
 //! - one drag is one semantic operation, because [`Scrub`] holds an unrecorded
-//!   gesture and the canvas records it when the drag ends — this module never
+//!   gesture and the engine records it when the drag ends — this module never
 //!   sees the individual moves, so it cannot record one per frame;
 //! - a drag that ends where it started records nothing, and Escape abandons a
 //!   gesture rather than committing it, because both are already decisions the
-//!   canvas makes.
+//!   engine makes.
+//!
+//! # The document this panel reads
+//!
+//! The values come from the figcraft engine, through
+//! [`crate::engine::inspector_model`]: the panel reads the engine's
+//! [`Document`](figcraft_doc::Document) and writes through the engine's
+//! command surface (`node.set`, `object.rename`, …). Nothing here reads the
+//! retired runtime's document, and nothing here writes to it.
 //!
 //! # The three states of a property
 //!
@@ -49,7 +57,10 @@ use gpui::{
     div, prelude::*, px, rgb, AnyElement, Context, Div, Entity, FontWeight, IntoElement,
     MouseButton, Render, SharedString, Stateful, Window,
 };
+use serde_json::Value as JsonValue;
 
+use crate::engine::canvas::EngineCanvas;
+use crate::engine::inspector_model as model;
 use crate::{canvas, theme};
 
 /// The word for a property the selected objects disagree about.
@@ -197,8 +208,8 @@ impl<T: PartialEq> Value<T> {
     /// Whether the selection disagrees about this property.
     ///
     /// Taken by reference because `is_*` is a question about the value, not a
-    /// consuming transform of it. `Value` is `Copy`, so the borrow costs nothing and
-    /// the name stays the clearest one at the call site.
+    /// consuming transform of it. `Value` is `Copy`, so the borrow costs nothing
+    /// and the name stays the clearest one at the call site.
     pub fn is_mixed(&self) -> bool {
         matches!(self, Self::Mixed)
     }
@@ -275,8 +286,8 @@ impl Precision {
 ///
 /// Held in one place so that "pixels", "a proportion" and "a length with a
 /// floor" cannot each invent their own rounding, their own suffix, or their own
-/// idea of what a drag step is. The unit the user reads is `scale` away from the
-/// unit the document stores, which is the only reason opacity needs a spec at
+/// idea of what a drag step is. The unit the user reads is `scale` away from
+/// the unit the document stores, which is the only reason opacity needs a spec at
 /// all rather than a special case.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NumberSpec {
@@ -368,8 +379,8 @@ impl NumberSpec {
 /// The bare number, in the units the user reads, with no unit attached.
 ///
 /// This is what a field being typed holds. The unit is decoration the field adds
-/// when it is not being edited: a buffer that carried `%` would not parse, so the
-/// arrows would stop working the moment a value was typed.
+/// when it is not being edited: a buffer that carried `%` would not parse, so
+/// the arrows would stop working the moment a value was typed.
 fn bare_number(display: f32, spec: NumberSpec) -> String {
     let decimals = spec.precision.decimals();
     let text = format!("{display:.decimals$}");
@@ -395,7 +406,7 @@ pub fn format_number(value: f32, spec: NumberSpec) -> String {
 /// A number being typed into a field.
 ///
 /// A buffer, not a second copy of the property: the value becomes real only when
-/// Enter hands it to the canvas as one semantic operation, exactly as a layer
+/// Enter hands it to the engine as one semantic operation, exactly as a layer
 /// rename does. `select_all` is the whole of the convention and it is the
 /// convention every product in the corpus uses — the value the user sees
 /// arrives selected, so the first keystroke replaces it rather than appending
@@ -514,32 +525,32 @@ impl NumberEdit {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Scrub {
     property: Property,
-    object: canvas::ObjectId,
-    /// The gesture the canvas opened. It remembers where the box started, which
-    /// is the only way a drag can be re-derived from its first pixel.
-    gesture: canvas::GeometryScrub,
+    object: model::EngineObjectId,
+    /// The box the layer had when the drag started. It remembers where the box
+    /// was, which is the only way a drag can be re-derived from its first pixel.
+    before: model::Geometry,
     start_x: f32,
     start_value: f32,
 }
 
 impl Scrub {
-    /// Open a scrub against a gesture the canvas has already started.
+    /// Open a scrub against a gesture the engine has already started.
     ///
     /// The baseline is read from the gesture rather than from the widget, and
     /// the widget is not asked at all: by the time the pointer goes down it may
     /// already have moved into the field, so anything read here would be late.
     pub fn begin(
         property: Property,
-        object: canvas::ObjectId,
-        gesture: canvas::GeometryScrub,
+        object: model::EngineObjectId,
+        before: model::Geometry,
         start_x: f32,
     ) -> Self {
         Self {
             property,
             object,
-            gesture,
+            before,
             start_x,
-            start_value: property.read_geometry(gesture.before),
+            start_value: property.read_geometry(before),
         }
     }
 
@@ -549,10 +560,10 @@ impl Scrub {
         spec.snap(spec.clamp_display(spec.display(dragged)))
     }
 
-    /// The geometry this scrub is describing, given where the pointer is.
-    pub fn geometry_at(&self, screen_x: f32) -> canvas::Geometry {
+    /// The box this scrub is describing, given where the pointer is.
+    pub fn geometry_at(&self, screen_x: f32) -> model::Geometry {
         self.property.write(
-            self.gesture.before,
+            self.before,
             self.value_at(screen_x, self.property.spec()),
         )
     }
@@ -561,7 +572,7 @@ impl Scrub {
         self.property
     }
 
-    pub fn object(&self) -> canvas::ObjectId {
+    pub fn object(&self) -> model::EngineObjectId {
         self.object
     }
 }
@@ -575,7 +586,7 @@ impl Scrub {
 /// Not by where it is drawn and not by which section holds it. Adding rotation,
 /// a corner-radius pair, a constraint or an alignment is a new variant here plus
 /// a row that uses it: the read, the write, the spec and the element id all come
-/// from this one declaration, and none of them reach into `canvas.rs`.
+/// from this one declaration, and none of them reach into the engine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Property {
     X,
@@ -626,7 +637,7 @@ impl Property {
     /// Keyed by name and by object, never by position in a section, so adding a
     /// property between two others cannot leave one field's element state behind
     /// on another's control.
-    pub fn control_id(self, object: Option<canvas::ObjectId>) -> SharedString {
+    pub fn control_id(self, object: Option<model::EngineObjectId>) -> SharedString {
         SharedString::from(format!(
             "inspector-{}",
             match object {
@@ -639,6 +650,20 @@ impl Property {
     /// Whether this property lives in the object's box rather than in its paint.
     pub fn is_geometry(self) -> bool {
         matches!(self, Self::X | Self::Y | Self::Width | Self::Height)
+    }
+
+    /// The box property this is, when it is one.
+    ///
+    /// `None` for a property of the paint: those are written with a style edit
+    /// rather than with a key of the box.
+    pub fn box_property(self) -> Option<model::BoxProperty> {
+        match self {
+            Self::X => Some(model::BoxProperty::X),
+            Self::Y => Some(model::BoxProperty::Y),
+            Self::Width => Some(model::BoxProperty::Width),
+            Self::Height => Some(model::BoxProperty::Height),
+            Self::BorderRadius | Self::Opacity | Self::StrokeWidth | Self::FontSize => None,
+        }
     }
 
     /// Whether this property has a horizontal axis the arrow keys can move it
@@ -662,13 +687,15 @@ impl Property {
     ///
     /// `None` is a real answer, not missing data: it is how "nobody authored a
     /// font size" stays distinguishable from "the font size is zero".
-    pub fn read(self, object: &canvas::DesignObject) -> Option<f32> {
+    pub fn read(self, object: &model::DesignObject) -> Option<f32> {
         match self {
             Self::X => Some(object.position.x),
             Self::Y => Some(object.position.y),
             Self::Width => Some(object.size.width),
             Self::Height => Some(object.size.height),
-            Self::BorderRadius => Some(object.border_radius),
+            // `None` when the corners disagree: one radius field cannot show a
+            // radius the user never chose.
+            Self::BorderRadius => object.border_radius,
             Self::Opacity => Some(object.opacity),
             // A width with no stroke is not a width of zero. Keeping the two
             // apart is what lets the panel disable the field with a reason
@@ -685,7 +712,7 @@ impl Property {
     /// so a property added later would read zero rather than fail to compile —
     /// and a field showing `0` for a property it has never heard of looks like a
     /// real value. Naming them makes the compiler the thing that notices.
-    fn read_geometry(self, geometry: canvas::Geometry) -> f32 {
+    fn read_geometry(self, geometry: model::Geometry) -> f32 {
         match self {
             Self::X => geometry.position.x,
             Self::Y => geometry.position.y,
@@ -706,7 +733,7 @@ impl Property {
     /// box cannot be clicked again, so shrinking one to nothing would make it
     /// unrecoverable rather than small. The spec stops the user being offered
     /// the value; this is the document's own guarantee that it cannot happen.
-    pub fn write(self, geometry: canvas::Geometry, value: f32) -> canvas::Geometry {
+    pub fn write(self, geometry: model::Geometry, value: f32) -> model::Geometry {
         let mut next = geometry;
         match self {
             Self::X => next.position.x = value,
@@ -723,13 +750,13 @@ impl Property {
 
     /// The style edit this property commits as, if it is paint rather than
     /// geometry.
-    pub fn style_edit(self, value: f32) -> Option<canvas::StyleEdit> {
+    pub fn style_edit(self, value: f32) -> Option<model::StyleEdit> {
         Some(match self {
-            Self::BorderRadius => canvas::StyleEdit::BorderRadius(value),
-            Self::Opacity => canvas::StyleEdit::Opacity(value),
-            Self::StrokeWidth => canvas::StyleEdit::StrokeWidth(value),
-            Self::FontSize => canvas::StyleEdit::FontSize(value),
-            // A geometry property commits a `Geometry` command instead, so it has
+            Self::BorderRadius => model::StyleEdit::BorderRadius(value),
+            Self::Opacity => model::StyleEdit::Opacity(value),
+            Self::StrokeWidth => model::StyleEdit::StrokeWidth(value),
+            Self::FontSize => model::StyleEdit::FontSize(value),
+            // A geometry property commits a box command instead, so it has
             // no style edit. `None` is the real answer rather than a fallthrough:
             // naming the four is what makes a ninth variant a compile error here
             // instead of a property that quietly never commits.
@@ -763,7 +790,7 @@ fn floor_size(value: f32) -> f32 {
 /// for a selection change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Focus {
-    pub object: Option<canvas::ObjectId>,
+    pub object: Option<model::EngineObjectId>,
     pub property: Property,
 }
 
@@ -771,7 +798,7 @@ pub struct Focus {
 ///
 /// The single place a number becomes a three-state value, so a property cannot
 /// be shown with one selection rule in one row and another in the next.
-fn selected_value(selected: &[canvas::DesignObject], property: Property) -> Value<f32> {
+fn selected_value(selected: &[model::DesignObject], property: Property) -> Value<f32> {
     Value::across(selected.iter().map(|object| property.read(object)))
 }
 
@@ -806,11 +833,11 @@ impl StyleProperty {
     }
 
     /// The edit that applies, or removes, this paint.
-    pub fn edit(self, color: Option<canvas::Color>) -> canvas::StyleEdit {
+    pub fn edit(self, color: Option<model::Color>) -> model::StyleEdit {
         match self {
-            Self::Fill => canvas::StyleEdit::Fill(color),
-            Self::Stroke => canvas::StyleEdit::Stroke(color),
-            Self::TextColor => canvas::StyleEdit::TextColor(color),
+            Self::Fill => model::StyleEdit::Fill(color),
+            Self::Stroke => model::StyleEdit::Stroke(color),
+            Self::TextColor => model::StyleEdit::TextColor(color),
         }
     }
 }
@@ -827,21 +854,21 @@ pub struct Paint {
     /// Whether the paint is applied at all.
     pub present: Value<bool>,
     /// The colour it is applied with.
-    pub color: Value<canvas::Color>,
+    pub color: Value<model::Color>,
     /// The first colour the paint *is* applied with, even when the selection
     /// disagrees.
     ///
     /// Offered when switching the paint on for a selection that has none:
     /// "fill these with something" needs a colour, and this is the only one the
     /// selection actually has.
-    pub representative: Option<canvas::Color>,
+    pub representative: Option<model::Color>,
 }
 
 impl Paint {
     /// Read one paint across a selection.
     pub fn read(
-        selected: &[canvas::DesignObject],
-        read: impl Fn(&canvas::DesignObject) -> Option<canvas::Color>,
+        selected: &[model::DesignObject],
+        read: impl Fn(&model::DesignObject) -> Option<model::Color>,
     ) -> Self {
         let color = Value::across(selected.iter().map(&read));
         Self {
@@ -866,26 +893,53 @@ impl Paint {
     pub fn swatch(&self, fallback: u32) -> u32 {
         match self.color {
             Value::Set(color) => color.to_rgb(),
-            _ => self.representative.map_or(fallback, canvas::Color::to_rgb),
+            _ => self.representative.map_or(fallback, model::Color::to_rgb),
         }
     }
 }
 
-pub fn color_hex(color: canvas::Color) -> String {
-    format!("#{:06X}", color.to_rgb())
+pub fn color_hex(color: model::Color) -> String {
+    color.to_hex()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // The layer name
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Which layer a rename request names.
+///
+/// The engine's identity for a layer is its node id, so that is what a rename
+/// names. The retired runtime's ids are runtime handles — allocated in document
+/// order, never durable — so they cannot name a layer in the engine's document
+/// at all. A request in that form is answered by a report rather than by a
+/// rename of the wrong layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayerRef {
+    /// A layer in the engine's document.
+    Engine(model::EngineObjectId),
+    /// A layer the retired runtime named.
+    Retired(canvas::ObjectId),
+}
+
+impl From<model::EngineObjectId> for LayerRef {
+    fn from(id: model::EngineObjectId) -> Self {
+        Self::Engine(id)
+    }
+}
+
+impl From<canvas::ObjectId> for LayerRef {
+    fn from(id: canvas::ObjectId) -> Self {
+        Self::Retired(id)
+    }
+}
+
 /// A layer name being edited.
 ///
 /// A buffer, not a second name store: the name only becomes real when Enter
-/// hands it to the canvas as one semantic operation. Escape and an empty name
+/// hands it to the engine as one semantic operation. Escape and an empty name
 /// abandon it, leaving the document untouched.
 struct RenameSession {
-    id: canvas::ObjectId,
+    id: model::EngineObjectId,
     buffer: String,
     select_all: bool,
 }
@@ -907,7 +961,7 @@ impl RenameSession {
     /// An empty buffer is the right one when the user clicked the name: the
     /// caret is already where the text goes, and `select_all` still means the
     /// first keystroke replaces rather than appends.
-    fn opening(id: canvas::ObjectId) -> Self {
+    fn opening(id: model::EngineObjectId) -> Self {
         Self {
             id,
             buffer: String::new(),
@@ -916,7 +970,7 @@ impl RenameSession {
     }
 
     /// Open a rename on a name that already exists.
-    fn replacing(id: canvas::ObjectId, buffer: String) -> Self {
+    fn replacing(id: model::EngineObjectId, buffer: String) -> Self {
         Self {
             id,
             buffer,
@@ -997,9 +1051,14 @@ const PALETTE: [(&str, u32); 9] = [
 /// Owns interaction state — which section is collapsed, which field the keyboard
 /// is pointed at, what is being typed, what is being dragged — and owns no
 /// document state at all. Every edit leaves through [`Inspector::commit_number`]
-/// or [`Inspector::commit_paint`], which hand it to the canvas.
+/// or [`Inspector::commit_paint`], which hand it to the engine.
 pub struct Inspector {
-    canvas: Entity<canvas::CanvasView>,
+    /// The engine canvas: the document this panel reads and writes.
+    ///
+    /// `None` until the shell attaches it: the shell builds the Inspector
+    /// before it builds the engine canvas, so the two are joined afterwards by
+    /// [`Inspector::set_engine_canvas`].
+    engine: Option<Entity<EngineCanvas>>,
     tab: usize,
     sections: Sections,
     /// The property the arrow keys move, once a field has been touched.
@@ -1017,18 +1076,31 @@ pub struct Inspector {
     palette: Option<StyleProperty>,
     /// Repaints that must outlive the constructor.
     ///
-    /// The Inspector is a view of the document: a canvas edit has to repaint it
-    /// or a field shows a value the canvas has already moved past. Held, not
+    /// The Inspector is a view of the document: an engine edit has to repaint it
+    /// or a field shows a value the engine has already moved past. Held, not
     /// dropped, because a GPUI subscription detaches its observer when it goes.
     #[allow(dead_code)]
     observations: Vec<gpui::Subscription>,
 }
 
 impl Inspector {
-    pub fn new(canvas: Entity<canvas::CanvasView>, cx: &mut Context<Self>) -> Self {
-        let observations = vec![cx.observe(&canvas, |_, _, cx| cx.notify())];
+    /// The Inspector, before the engine canvas is attached.
+    ///
+    /// The retired runtime's canvas is not read: the panel reads the engine's
+    /// document and writes through the engine's commands, so the retired
+    /// runtime's document is not a thing this panel looks at. It is observed
+    /// all the same, because a panel that never repaints shows a value the
+    /// document has already moved past, and until the shell attaches the engine
+    /// canvas the retired canvas is the only thing that says "something
+    /// changed".
+    ///
+    /// The parameter is here because the shell builds the Inspector before it
+    /// builds the engine canvas, and the two are joined by
+    /// [`Inspector::set_engine_canvas`].
+    pub fn new(retired: Entity<canvas::CanvasView>, cx: &mut Context<Self>) -> Self {
+        let observations = vec![cx.observe(&retired, |_, _, cx| cx.notify())];
         Self {
-            canvas,
+            engine: None,
             tab: 0,
             sections: Sections::new(),
             focus: None,
@@ -1040,6 +1112,23 @@ impl Inspector {
         }
     }
 
+    /// Attach the engine canvas the Inspector reads and writes through.
+    ///
+    /// The engine canvas owns the session both panels share, so attaching it is
+    /// what makes this panel a view of the engine's document rather than of
+    /// anything else. The Inspector observes it, so an edit made on the canvas
+    /// repaints the panel and the panel shows what is selected.
+    ///
+    /// The shell owns the wiring and calls this once it has built the engine
+    /// canvas, which it builds after the Inspector.
+    #[allow(dead_code)]
+    pub fn set_engine_canvas(&mut self, engine: Entity<EngineCanvas>, cx: &mut Context<Self>) {
+        let observation = cx.observe(&engine, |_, _, cx| cx.notify());
+        self.observations.push(observation);
+        self.engine = Some(engine);
+        cx.notify();
+    }
+
     /// Open a rename on a layer another surface asked about.
     ///
     /// The panel states the request and the surface that owns the editing model
@@ -1047,23 +1136,39 @@ impl Inspector {
     /// commit, and the same Escape behaviour. The existing name arrives
     /// selected, because a rename that appends to the old name is a different
     /// command from renaming.
-    pub fn open_rename(&mut self, id: canvas::ObjectId, cx: &mut Context<Self>) {
-        let name = self
-            .canvas
-            .read(cx)
-            .document_objects()
-            .iter()
-            .find(|object| object.id == id)
-            .map(|object| object.name.clone())
-            .unwrap_or_default();
+    pub fn open_rename(&mut self, id: impl Into<LayerRef>, cx: &mut Context<Self>) {
+        let id = match id.into() {
+            LayerRef::Engine(id) => id,
+            LayerRef::Retired(id) => {
+                // The retired runtime's ids are runtime handles, not the
+                // engine's identity, so they cannot name a layer in the
+                // engine's document. Reported rather than guessed at: renaming
+                // the wrong layer is worse than not renaming one.
+                eprintln!("spool_inspector_rename_refused reason=retired_runtime_id id={id:?}");
+                return;
+            }
+        };
+        let Some(name) = self.name_of(id, cx) else {
+            return;
+        };
         self.rename = Some(RenameSession::replacing(id, name));
     }
 
     /// Which layer is being renamed, if any.
     ///
-    /// Presentation only: the Layers panel shows the row without owning an
+    /// Presentation only: a layers panel shows the row without owning an
     /// editing model of its own.
+    ///
+    /// The retired runtime's own ids are not the engine's identity, so a rename
+    /// in the engine's document has no retired id to report: the engine's
+    /// answer is [`Inspector::renaming_node`].
     pub fn renaming(&self) -> Option<canvas::ObjectId> {
+        None
+    }
+
+    /// Which layer the engine is renaming, if any.
+    #[allow(dead_code)]
+    pub fn renaming_node(&self) -> Option<model::EngineObjectId> {
         self.rename.as_ref().map(|session| session.id)
     }
 
@@ -1092,11 +1197,11 @@ impl Inspector {
             return true;
         }
         if let Some(scrub) = self.scrub.take() {
-            // Abandoning restores the runtime and records nothing: the same
-            // promise the canvas keeps for a canvas drag.
-            self.canvas
-                .update(cx, |canvas, _| canvas.cancel_geometry_scrub(scrub.gesture));
-            self.repaint(cx);
+            // Abandoning restores the engine's document and records nothing:
+            // the same promise the engine keeps for a canvas drag.
+            let _ = scrub;
+            self.cancel_gesture(cx);
+            cx.notify();
             return true;
         }
         false
@@ -1175,9 +1280,8 @@ impl Inspector {
         if let RenameEffect::Commit(name) = effect {
             let name = name.trim().to_owned();
             if !name.is_empty() {
-                self.canvas
-                    .update(cx, |canvas, _| canvas.rename_object(id, name));
-                self.repaint(cx);
+                let (command, params) = model::rename_command(id, &name);
+                self.run(&command, params, cx);
             }
         }
         cx.notify();
@@ -1209,12 +1313,125 @@ impl Inspector {
             return false;
         };
         let spec = focus.property.spec();
-        let Some(current) = self.canvas.read(cx).object_geometry(object) else {
+        let Some(current) = self.geometry_of(object, cx) else {
             return false;
         };
         let display = spec.display(focus.property.read_geometry(current)) + delta;
         self.commit_number(focus, display, cx);
         true
+    }
+
+    // ── The engine, read ─────────────────────────────────────────────────────
+
+    /// The layers the engine has selected, with the properties the panel shows.
+    fn selected(&self, cx: &mut Context<Self>) -> Vec<model::DesignObject> {
+        let Some(engine) = self.engine.as_ref() else {
+            return Vec::new();
+        };
+        engine.read(cx).with_session(|session| {
+            let Ok(doc) = session.doc() else {
+                return Vec::new();
+            };
+            model::selected_objects(doc, &session.selection())
+        })
+    }
+
+    /// The layers the engine has selected, by identity.
+    fn selection(&self, cx: &mut Context<Self>) -> Vec<model::EngineObjectId> {
+        let Some(engine) = self.engine.as_ref() else {
+            return Vec::new();
+        };
+        engine.read(cx).selection()
+    }
+
+    /// The box of one layer, in the frame the layer is in.
+    fn geometry_of(
+        &self,
+        id: model::EngineObjectId,
+        cx: &mut Context<Self>,
+    ) -> Option<model::Geometry> {
+        let engine = self.engine.as_ref()?;
+        engine.read(cx).with_session(|session| {
+            let doc = session.doc().ok()?;
+            model::geometry(doc, id)
+        })
+    }
+
+    /// The name one layer has in the engine's document.
+    fn name_of(
+        &self,
+        id: model::EngineObjectId,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let engine = self.engine.as_ref()?;
+        engine.read(cx).with_session(|session| {
+            let doc = session.doc().ok()?;
+            doc.node(id).map(|node| node.name.clone())
+        })
+    }
+
+    // ── The engine, written ──────────────────────────────────────────────────
+
+    /// Run one engine command.
+    ///
+    /// The engine's commands are the operation surface: the panel, the toolbar,
+    /// the keymap, the command palette, the CLI and a future agent all dispatch
+    /// command ids, so an edit made by a click and an edit made by a shortcut
+    /// go through the same code and produce the same history.
+    fn run(&mut self, id: &str, params: JsonValue, cx: &mut Context<Self>) -> bool {
+        let Some(engine) = self.engine.clone() else {
+            return false;
+        };
+        engine.update(cx, |canvas, cx| canvas.run_engine_command(id, params, cx))
+    }
+
+    /// Write one property of one layer's box.
+    fn commit_box(
+        &mut self,
+        property: model::BoxProperty,
+        value: f32,
+        object: model::EngineObjectId,
+        cx: &mut Context<Self>,
+    ) {
+        let (command, params) = model::box_command(property, value, object);
+        self.run(&command, params, cx);
+    }
+
+    /// Open a gesture: the engine holds one undo step open for it.
+    ///
+    /// The engine's own tools do this for a drag on the canvas, and the history
+    /// reads the same either way: one drag, one step.
+    fn begin_gesture(&mut self, label: &str, cx: &mut Context<Self>) -> bool {
+        let Some(engine) = self.engine.clone() else {
+            return false;
+        };
+        engine.update(cx, |canvas, cx| {
+            canvas.with_session_mut(cx, |session| session.begin_interaction(label).is_ok())
+        })
+    }
+
+    /// Close a gesture as one undo step.
+    fn commit_gesture(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.engine.clone() else {
+            return;
+        };
+        engine.update(cx, |canvas, cx| {
+            canvas.with_session_mut(cx, |session| {
+                session.commit_interaction().is_ok()
+            })
+        });
+    }
+
+    /// Abandon a gesture, restoring the document and recording nothing.
+    fn cancel_gesture(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.engine.clone() else {
+            return;
+        };
+        engine.update(cx, |canvas, cx| {
+            canvas.with_session_mut(cx, |session| {
+                session.cancel_interaction().is_ok()
+            })
+        });
     }
 
     // ── The one way a number reaches the document ──────────────────────────
@@ -1229,21 +1446,18 @@ impl Inspector {
     fn commit_number(&mut self, focus: Focus, display: f32, cx: &mut Context<Self>) {
         let spec = focus.property.spec();
         let stored = spec.stored(spec.clamp_display(display));
-        if focus.property.is_geometry() {
+        if let Some(property) = focus.property.box_property() {
             let Some(object) = focus.object else {
                 return;
             };
-            let Some(before) = self.canvas.read(cx).object_geometry(object) else {
+            let Some(before) = self.geometry_of(object, cx) else {
                 return;
             };
             let next = focus.property.write(before, stored);
-            self.canvas
-                .update(cx, |canvas, _| canvas.set_object_geometry(object, next));
-            self.repaint(cx);
+            let value = focus.property.read_geometry(next);
+            self.commit_box(property, value, object, cx);
         } else if let Some(edit) = focus.property.style_edit(stored) {
-            self.canvas
-                .update(cx, |canvas, cx| canvas.set_selected_style(edit, cx));
-            self.repaint(cx);
+            self.commit_style(edit, cx);
         }
     }
 
@@ -1269,28 +1483,20 @@ impl Inspector {
     /// The one exit for paint, so a preset chip, a colour trigger and a
     /// segmented choice all produce the same single history entry rather than
     /// each deciding for itself what "one edit" means.
-    fn commit_style(&mut self, edit: canvas::StyleEdit, cx: &mut Context<Self>) {
-        self.canvas
-            .update(cx, |canvas, cx| canvas.set_selected_style(edit, cx));
-        self.repaint(cx);
+    fn commit_style(&mut self, edit: model::StyleEdit, cx: &mut Context<Self>) {
+        let ids = self.selection(cx);
+        let (command, params) = model::style_command(&edit, &ids);
+        self.run(&command, params, cx);
     }
 
     /// Commit a paint, which is a style change with the colour already decided.
     fn commit_paint(
         &mut self,
         property: StyleProperty,
-        color: Option<canvas::Color>,
+        color: Option<model::Color>,
         cx: &mut Context<Self>,
     ) {
         self.commit_style(property.edit(color), cx);
-    }
-
-    /// Ask both sides of the editor to redraw.
-    ///
-    /// The canvas and the Inspector are two views of one document, so a change
-    /// made through either has to show in both.
-    fn repaint(&mut self, cx: &mut Context<Self>) {
-        self.canvas.update(cx, |_, cx| cx.notify());
     }
 
     // ── Scrubbing ───────────────────────────────────────────────────────────
@@ -1304,14 +1510,19 @@ impl Inspector {
         let Some(object) = focus.object else {
             return;
         };
-        let Some(gesture) = self
-            .canvas
-            .update(cx, |canvas, _| canvas.begin_geometry_scrub(object))
-        else {
+        let Some(property) = focus.property.box_property() else {
             return;
         };
+        let Some(before) = self.geometry_of(object, cx) else {
+            return;
+        };
+        // The engine holds the gesture open, so the whole drag is one undo step
+        // when it ends and none at all if it is abandoned.
+        if !self.begin_gesture(model::gesture_label(property), cx) {
+            return;
+        }
         self.focus = Some(focus);
-        self.scrub = Some(Scrub::begin(focus.property, object, gesture, screen_x));
+        self.scrub = Some(Scrub::begin(focus.property, object, before, screen_x));
         cx.notify();
     }
 
@@ -1319,24 +1530,24 @@ impl Inspector {
         let Some(scrub) = self.scrub else {
             return;
         };
+        let Some(property) = scrub.property().box_property() else {
+            return;
+        };
         // Recomputed from where the gesture started, never accumulated, so the
         // field and the document cannot drift apart over a long drag.
         let next = scrub.geometry_at(screen_x);
-        self.canvas
-            .update(cx, |canvas, _| canvas.scrub_geometry(&scrub.gesture, next));
-        self.repaint(cx);
+        let value = scrub.property().read_geometry(next);
+        self.commit_box(property, value, scrub.object(), cx);
     }
 
     fn end_scrub(&mut self, cx: &mut Context<Self>) {
-        let Some(scrub) = self.scrub.take() else {
+        if self.scrub.take().is_none() {
             return;
-        };
+        }
         // One semantic operation for the whole drag, or none at all if it landed
-        // where it started — the canvas decides which, exactly as it does for a
+        // where it started — the engine decides which, exactly as it does for a
         // drag that began on the canvas itself.
-        self.canvas
-            .update(cx, |canvas, _| canvas.commit_geometry_scrub(scrub.gesture));
-        self.repaint(cx);
+        self.commit_gesture(cx);
     }
 
     // ── Opening a field ─────────────────────────────────────────────────────
@@ -1348,7 +1559,7 @@ impl Inspector {
         // different things to be doing, and the Escape ladder above them is
         // simpler when at most one of them can be true.
         self.cancel_in_flight(cx);
-        let selected = self.canvas.read(cx).selected_objects();
+        let selected = self.selected(cx);
         let text = match selected_value(&selected, focus.property) {
             Value::Set(value) => format_number(value, focus.property.spec()),
             // `Mixed` and `Unset` both open empty. A field the user cannot read
@@ -1366,8 +1577,8 @@ impl Inspector {
     /// the canvas replaces the selection — and a field left editing an object
     /// that is no longer selected would commit a number into the wrong place, or
     /// into nothing at all.
-    fn reconcile(&mut self, selected: &[canvas::DesignObject]) {
-        let gone = |object: Option<canvas::ObjectId>| match object {
+    fn reconcile(&mut self, selected: &[model::DesignObject]) {
+        let gone = |object: Option<model::EngineObjectId>| match object {
             Some(object) => !selected.iter().any(|other| other.id == object),
             // A field with no object is a paint field, and paint applies to
             // whatever is selected — so a changed selection never invalidates it.
@@ -1406,7 +1617,7 @@ impl Render for Inspector {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::diagnostics::count("inspector_build", 1);
         let start = crate::diagnostics::start();
-        let selected = self.canvas.read(cx).selected_objects();
+        let selected = self.selected(cx);
         crate::diagnostics::record("inspector_projection", start);
         crate::diagnostics::count("inspector_objects_copied", selected.len() as u64);
         self.reconcile(&selected);
@@ -1510,7 +1721,7 @@ impl Inspector {
 
     // ── Composition ─────────────────────────────────────────────────────────
 
-    fn design_body(&self, selected: &[canvas::DesignObject], cx: &mut Context<Self>) -> AnyElement {
+    fn design_body(&self, selected: &[model::DesignObject], cx: &mut Context<Self>) -> AnyElement {
         match selected {
             [] => section_body()
                 .child(
@@ -1603,7 +1814,7 @@ impl Inspector {
         }
     }
 
-    fn layer_header(&self, object: &canvas::DesignObject, cx: &mut Context<Self>) -> Div {
+    fn layer_header(&self, object: &model::DesignObject, cx: &mut Context<Self>) -> Div {
         column().child(
             div()
                 .flex()
@@ -1630,7 +1841,7 @@ impl Inspector {
                     div()
                         .text_xs()
                         .text_color(rgb(theme::TEXT_MUTED))
-                        .child(object.object_type.label()),
+                        .child(object.kind.clone()),
                 ),
         )
     }
@@ -1638,10 +1849,10 @@ impl Inspector {
     /// The object's name, or the rename buffer while one is open.
     ///
     /// Clicking the name opens a rename; the typed text is a buffer in this
-    /// view and becomes a real name only when Enter hands it to the canvas as
+    /// view and becomes a real name only when Enter hands it to the engine as
     /// one semantic operation. Escape and an empty name abandon it, leaving the
     /// document untouched.
-    fn object_name(&self, object: &canvas::DesignObject, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn object_name(&self, object: &model::DesignObject, cx: &mut Context<Self>) -> Stateful<Div> {
         let renaming = self
             .rename
             .as_ref()
@@ -1667,6 +1878,9 @@ impl Inspector {
             name.cursor_pointer()
         };
         name.id(SharedString::from(format!("rename-{}", object.id.0)))
+            // A test looks the name up by the engine's node id, so a test can
+            // say which layer the panel is showing. A no-op in a release build.
+            .debug_selector(|| format!("rename-{}", object.id.0))
             .on_click(cx.listener(move |this, _, _, cx| {
                 if already_open {
                     return;
@@ -1678,7 +1892,7 @@ impl Inspector {
 
     // ── Sections ────────────────────────────────────────────────────────────
 
-    fn position_section(&self, selected: &[canvas::DesignObject], cx: &mut Context<Self>) -> Div {
+    fn position_section(&self, selected: &[model::DesignObject], cx: &mut Context<Self>) -> Div {
         let object = selected.first().map(|object| object.id);
         let count = selected.len();
         let body = section_body()
@@ -1731,9 +1945,9 @@ impl Inspector {
             .child(unsupported_pair("Align", "Wrap", unsupported))
     }
 
-    fn appearance_fields(&self, selected: &[canvas::DesignObject], cx: &mut Context<Self>) -> Div {
+    fn appearance_fields(&self, selected: &[model::DesignObject], cx: &mut Context<Self>) -> Div {
         let count = selected.len();
-        let fill = Paint::read(selected, |object| object.fill.map(|fill| fill.color));
+        let fill = Paint::read(selected, |object| object.fill);
         let stroke = Paint::read(selected, |object| object.stroke.map(|stroke| stroke.color));
         section_body()
             .child(self.paint_block(StyleProperty::Fill, fill, theme::SURFACE_RAISED, cx))
@@ -1764,7 +1978,7 @@ impl Inspector {
             ))
     }
 
-    fn typography_fields(&self, selected: &[canvas::DesignObject], cx: &mut Context<Self>) -> Div {
+    fn typography_fields(&self, selected: &[model::DesignObject], cx: &mut Context<Self>) -> Div {
         let color = Paint::read(selected, |object| object.text_color);
         section_body()
             .child(self.paint_block(StyleProperty::TextColor, color, theme::TEXT, cx))
@@ -1791,7 +2005,7 @@ impl Inspector {
     fn number_field(
         &self,
         property: Property,
-        object: Option<canvas::ObjectId>,
+        object: Option<model::EngineObjectId>,
         value: Value<f32>,
         count: usize,
         cx: &mut Context<Self>,
@@ -1836,6 +2050,10 @@ impl Inspector {
 
         field
             .id(property.control_id(object))
+            // A test looks a field up by the engine's node id and the property,
+            // so a test can say which layer's field it is looking at. A no-op in
+            // a release build.
+            .debug_selector(|| property.control_id(object).to_string())
             // A single click points the arrow keys at the field. Typing is a
             // double click, because a click is also how a drag starts, and a
             // control that opened an editor at the end of every scrub would make
@@ -1992,7 +2210,7 @@ impl Inspector {
         fallback: u32,
         cx: &mut Context<Self>,
     ) -> Div {
-        let color = canvas::Color::from_rgb(paint.swatch(fallback));
+        let color = model::Color::from_rgb(paint.swatch(fallback));
         let selected = match paint.present {
             Value::Set(true) => Some(0),
             Value::Set(false) => Some(1),
@@ -2079,7 +2297,7 @@ impl Inspector {
             let mut row = div().flex().gap_1();
             for (name, value) in chunk {
                 let name = *name;
-                let color = canvas::Color::from_rgb(*value);
+                let color = model::Color::from_rgb(*value);
                 row = row.child(
                     div()
                         .id(SharedString::from(format!("style-color-{name}")))
@@ -2396,20 +2614,23 @@ fn ai_body() -> AnyElement {
 mod tests {
     use super::*;
     use gpui::{point, size};
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
-    fn geometry(x: f32, y: f32, width: f32, height: f32) -> canvas::Geometry {
-        canvas::Geometry {
+    /// The engine's identity for the layer the tests use.
+    fn layer() -> model::EngineObjectId {
+        model::EngineObjectId(1)
+    }
+
+    fn geometry(x: f32, y: f32, width: f32, height: f32) -> model::Geometry {
+        model::Geometry {
             position: point(x, y),
             size: size(width, height),
         }
     }
 
-    fn scrub_of(property: Property, before: canvas::Geometry) -> Scrub {
-        let gesture = canvas::GeometryScrub {
-            id: canvas::ObjectId::LANDING,
-            before,
-        };
-        Scrub::begin(property, canvas::ObjectId::LANDING, gesture, 100.0)
+    fn scrub_of(property: Property, before: model::Geometry) -> Scrub {
+        Scrub::begin(property, layer(), before, 100.0)
     }
 
     fn object(
@@ -2417,26 +2638,23 @@ mod tests {
         stroke: Option<(u32, f32)>,
         text_color: Option<u32>,
         font_size: Option<f32>,
-    ) -> canvas::DesignObject {
-        canvas::DesignObject {
-            id: canvas::ObjectId::LANDING,
-            spool_id: crate::source_document::NodeId::new("test-node").unwrap(),
+    ) -> model::DesignObject {
+        model::DesignObject {
+            id: layer(),
             name: "Shape".to_string(),
+            kind: "Rectangle".to_string(),
             position: point(0.0, 0.0),
             size: size(20.0, 20.0),
-            object_type: canvas::ObjectType::Rectangle,
             text_content: None,
-            text_color: text_color.map(canvas::Color::from_rgb),
+            text_color: text_color.map(model::Color::from_rgb),
             font_size,
-            border_radius: 0.0,
-            opacity: 1.0,
-            fill: fill.map(|color| canvas::Fill {
-                color: canvas::Color::from_rgb(color),
-            }),
-            stroke: stroke.map(|(color, width)| canvas::Stroke {
-                color: canvas::Color::from_rgb(color),
+            fill: fill.map(model::Color::from_rgb),
+            stroke: stroke.map(|(color, width)| model::Stroke {
+                color: model::Color::from_rgb(color),
                 width,
             }),
+            border_radius: Some(0.0),
+            opacity: 1.0,
         }
     }
 
@@ -2685,15 +2903,15 @@ mod tests {
         }
         assert_eq!(
             Property::BorderRadius.style_edit(4.0),
-            Some(canvas::StyleEdit::BorderRadius(4.0))
+            Some(model::StyleEdit::BorderRadius(4.0))
         );
         assert_eq!(
             Property::Opacity.style_edit(0.5),
-            Some(canvas::StyleEdit::Opacity(0.5))
+            Some(model::StyleEdit::Opacity(0.5))
         );
         assert_eq!(
             Property::FontSize.style_edit(16.0),
-            Some(canvas::StyleEdit::FontSize(16.0))
+            Some(model::StyleEdit::FontSize(16.0))
         );
         assert!(Property::X.is_geometry() && !Property::Opacity.is_geometry());
         assert!(
@@ -2704,10 +2922,27 @@ mod tests {
     }
 
     #[test]
+    fn a_geometry_property_names_the_engine_key_it_is_written_with() {
+        assert_eq!(
+            Property::X.box_property(),
+            Some(model::BoxProperty::X),
+            "X is a property of the box"
+        );
+        assert_eq!(Property::Width.box_property(), Some(model::BoxProperty::Width));
+        assert_eq!(
+            Property::Opacity.box_property(),
+            None,
+            "opacity is not a property of the box"
+        );
+        assert_eq!(model::BoxProperty::X.key(), "x");
+        assert_eq!(model::BoxProperty::Height.key(), "height");
+    }
+
+    #[test]
     fn control_ids_are_stable_and_do_not_collide() {
-        let x = Property::X.control_id(Some(canvas::ObjectId::LANDING));
-        let y = Property::Y.control_id(Some(canvas::ObjectId::LANDING));
-        let other_object = Property::X.control_id(Some(canvas::ObjectId::EDITOR));
+        let x = Property::X.control_id(Some(layer()));
+        let y = Property::Y.control_id(Some(layer()));
+        let other_object = Property::X.control_id(Some(model::EngineObjectId(2)));
         let selection = Property::X.control_id(None);
 
         assert_ne!(x, y, "two properties cannot share one control");
@@ -2721,7 +2956,7 @@ mod tests {
         );
         assert_eq!(
             x,
-            Property::X.control_id(Some(canvas::ObjectId::LANDING)),
+            Property::X.control_id(Some(layer())),
             "an id derived from the name is the same next frame, which is what keeps element state attached to its own field"
         );
     }
@@ -2730,7 +2965,7 @@ mod tests {
 
     fn focus() -> Focus {
         Focus {
-            object: Some(canvas::ObjectId::LANDING),
+            object: Some(layer()),
             property: Property::X,
         }
     }
@@ -2848,8 +3083,8 @@ mod tests {
 
     // ── Paint ───────────────────────────────────────────────────────────────
 
-    fn fill_of(object: &canvas::DesignObject) -> Option<canvas::Color> {
-        object.fill.map(|fill| fill.color)
+    fn fill_of(object: &model::DesignObject) -> Option<model::Color> {
+        object.fill
     }
 
     #[test]
@@ -2863,11 +3098,11 @@ mod tests {
         assert_eq!(paint.present, Value::Set(true));
         assert_eq!(
             paint.color,
-            Value::Set(canvas::Color::from_rgb(theme::PAPER))
+            Value::Set(model::Color::from_rgb(theme::PAPER))
         );
         assert_eq!(
             paint.label(),
-            color_hex(canvas::Color::from_rgb(theme::PAPER))
+            color_hex(model::Color::from_rgb(theme::PAPER))
         );
 
         // Absent everywhere: agreement that it is off.
@@ -2893,7 +3128,7 @@ mod tests {
         assert_eq!(paint.label(), MIXED);
         assert_eq!(
             paint.representative,
-            Some(canvas::Color::from_rgb(theme::PAPER)),
+            Some(model::Color::from_rgb(theme::PAPER)),
             "switching the paint on needs a colour, and this is the only one the selection has"
         );
     }
@@ -2911,7 +3146,7 @@ mod tests {
         assert_eq!(paint.color, Value::Mixed);
         assert_eq!(
             paint.representative,
-            Some(canvas::Color::from_rgb(theme::PAPER)),
+            Some(model::Color::from_rgb(theme::PAPER)),
             "and the toggle offers one of them to fill with"
         );
     }
@@ -2964,7 +3199,7 @@ mod tests {
 
     #[test]
     fn a_rename_opens_with_the_old_name_selected_so_the_first_key_replaces_it() {
-        let mut session = RenameSession::replacing(canvas::ObjectId::LANDING, "Headline".into());
+        let mut session = RenameSession::replacing(layer(), "Headline".into());
         assert_eq!(session.apply_key("H"), RenameEffect::Continue);
         assert_eq!(session.buffer, "H", "the old name is replaced, not kept");
         for key in ["e", "a", "d"] {
@@ -2979,7 +3214,7 @@ mod tests {
 
     #[test]
     fn typing_after_the_first_character_appends() {
-        let mut session = RenameSession::replacing(canvas::ObjectId::LANDING, "Headline".into());
+        let mut session = RenameSession::replacing(layer(), "Headline".into());
         session.apply_key("H");
         session.apply_key("i");
         assert_eq!(session.buffer, "Hi", "only the first key replaced");
@@ -2987,7 +3222,7 @@ mod tests {
 
     #[test]
     fn escape_abandons_a_rename_without_committing_anything() {
-        let mut session = RenameSession::replacing(canvas::ObjectId::LANDING, "Headline".into());
+        let mut session = RenameSession::replacing(layer(), "Headline".into());
         session.apply_key("X");
         assert_eq!(session.buffer, "X");
         assert_eq!(
@@ -3000,7 +3235,7 @@ mod tests {
 
     #[test]
     fn enter_commits_even_an_empty_name_because_trimming_is_the_callers_job() {
-        let mut session = RenameSession::replacing(canvas::ObjectId::LANDING, "Headline".into());
+        let mut session = RenameSession::replacing(layer(), "Headline".into());
         session.apply_key("backspace");
         assert_eq!(
             session.apply_key("enter"),
@@ -3013,7 +3248,7 @@ mod tests {
     fn a_modifier_combination_is_swallowed_rather_than_typed_into_the_name() {
         // Typing `f` must not also switch to the frame tool, and `cmd-d` must not
         // land in a layer name as the letters "cmd-d".
-        let mut session = RenameSession::replacing(canvas::ObjectId::LANDING, String::new());
+        let mut session = RenameSession::replacing(layer(), String::new());
         for key in ["cmd-d", "cmd-shift-z", "left", "tab"] {
             assert_eq!(session.apply_key(key), RenameEffect::Continue);
         }
@@ -3022,10 +3257,199 @@ mod tests {
 
     #[test]
     fn a_name_opened_by_clicking_starts_empty_but_still_replaces_first() {
-        let mut session = RenameSession::opening(canvas::ObjectId::LANDING);
+        let mut session = RenameSession::opening(layer());
         assert_eq!(session.buffer, "");
         session.apply_key("B");
         session.apply_key("o");
         assert_eq!(session.buffer, "Bo");
+    }
+
+    // ── Which layer a request names ─────────────────────────────────────────
+
+    #[test]
+    fn the_engines_node_id_names_a_layer_and_the_retired_runtimes_does_not() {
+        let engine: LayerRef = model::EngineObjectId(7).into();
+        assert_eq!(engine, LayerRef::Engine(model::EngineObjectId(7)));
+        let retired: LayerRef = canvas::ObjectId::LANDING.into();
+        assert_eq!(retired, LayerRef::Retired(canvas::ObjectId::LANDING));
+        assert_ne!(
+            engine, retired,
+            "the two id spaces are not the same id, and pretending they are would rename the wrong layer"
+        );
+    }
+
+    // ── The panel and the engine, in a window ───────────────────────────────
+
+    /// A session over a document with one rectangle on it, selected.
+    fn session_with_a_selected_rectangle() -> (Rc<RefCell<figcraft_engine::Session>>, u64) {
+        let mut doc = figcraft_doc::Document::new("test");
+        let page = doc.add_page("Page 1");
+        let id = doc
+            .create(
+                page,
+                figcraft_doc::NodeKind::Rectangle,
+                "Hero",
+                10.0,
+                20.0,
+                30.0,
+                40.0,
+            )
+            .expect("a rectangle");
+        let session = Rc::new(RefCell::new(figcraft_engine::Session::with_document(doc)));
+        session
+            .borrow_mut()
+            .execute("select.set", &serde_json::json!({ "ids": [id.0] }))
+            .expect("the layer is selected");
+        (session, id.0)
+    }
+
+    /// A root view that shows the Inspector on its own.
+    ///
+    /// The panel is normally a part of the shell; a test that wants to see what
+    /// it draws needs somewhere to draw it.
+    struct Panel(Entity<Inspector>);
+
+    impl Render for Panel {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.0.clone()
+        }
+    }
+
+    /// Open a window with the Inspector in it, over a session with one
+    /// selected rectangle.
+    fn open_panel(
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        Entity<Panel>,
+        &mut gpui::VisualTestContext,
+        Rc<RefCell<figcraft_engine::Session>>,
+        u64,
+    ) {
+        let (session, id) = session_with_a_selected_rectangle();
+        let (root, window) = cx.add_window_view(|_, cx| {
+            let engine = cx.new(|cx| EngineCanvas::from_handle(Rc::clone(&session), cx));
+            let retired = cx.new(canvas::CanvasView::new_with_context);
+            let inspector = cx.new(|cx| Inspector::new(retired, cx));
+            inspector.update(cx, |inspector, cx| inspector.set_engine_canvas(engine, cx));
+            Panel(inspector)
+        });
+        (root, window, session, id)
+    }
+
+    #[gpui::test]
+    fn the_panel_shows_the_layer_the_engine_has_selected(cx: &mut gpui::TestAppContext) {
+        // The end-to-end claim: the panel reads the *engine's* selection. The
+        // element ids carry the engine's node id, so a row that is laid out is a
+        // row for the engine's layer and not for something the retired runtime
+        // happened to have selected.
+        let (root, window, _session, id) = open_panel(cx);
+        window.draw(
+            point(px(0.0), px(0.0)),
+            size(px(300.0), px(900.0)),
+            |_, _| root.clone().into_any_element(),
+        );
+        window.run_until_parked();
+
+        // The selectors are `&'static str`, so the ids are leaked rather than
+        // borrowed: a test that cannot name the element it is looking for
+        // cannot say whether it is there.
+        let name: &'static str = Box::leak(format!("rename-{id}").into_boxed_str());
+        let x: &'static str = Box::leak(format!("inspector-{id}-x").into_boxed_str());
+        assert!(
+            window.debug_bounds(name).is_some(),
+            "the panel should show the layer the engine has selected"
+        );
+        assert!(
+            window.debug_bounds(x).is_some(),
+            "and the position fields of that layer"
+        );
+    }
+
+    #[gpui::test]
+    fn the_panel_reads_the_engines_values(cx: &mut gpui::TestAppContext) {
+        // The values are the engine's: the rectangle sits at 10,20 and is 30
+        // wide, and the panel says so.
+        let (root, window, _session, id) = open_panel(cx);
+        window.draw(
+            point(px(0.0), px(0.0)),
+            size(px(300.0), px(900.0)),
+            |_, _| root.clone().into_any_element(),
+        );
+        window.run_until_parked();
+
+        let inspector = window.update(|_, cx| root.read_with(cx, |panel, _| panel.0.clone()));
+        let selected = window.update(|_, cx| {
+            inspector.update(cx, |inspector, cx| inspector.selected(cx))
+        });
+        assert_eq!(selected.len(), 1, "one layer is selected");
+        let object = &selected[0];
+        assert_eq!(object.id, model::EngineObjectId(id));
+        assert_eq!(object.name, "Hero");
+        assert_eq!(object.position.x, 10.0);
+        assert_eq!(object.position.y, 20.0);
+        assert_eq!(object.size.width, 30.0);
+        assert_eq!(object.size.height, 40.0);
+    }
+
+    #[gpui::test]
+    fn a_number_the_panel_commits_reaches_the_engines_document(cx: &mut gpui::TestAppContext) {
+        // The write path, end to end: the panel's own commit, the engine's
+        // command, and the engine's document.
+        let (root, window, session, id) = open_panel(cx);
+        window.draw(
+            point(px(0.0), px(0.0)),
+            size(px(300.0), px(900.0)),
+            |_, _| root.clone().into_any_element(),
+        );
+        window.run_until_parked();
+
+        let inspector = window.update(|_, cx| root.read_with(cx, |panel, _| panel.0.clone()));
+        window.update(|_, cx| {
+            inspector.update(cx, |inspector, cx| {
+                inspector.commit_number(
+                    Focus {
+                        object: Some(model::EngineObjectId(id)),
+                        property: Property::X,
+                    },
+                    55.0,
+                    cx,
+                )
+            })
+        });
+
+        let session = session.borrow();
+        let doc = session.doc().expect("a document");
+        let node = doc.node(model::EngineObjectId(id)).expect("the layer");
+        assert_eq!(
+            doc.frame_relative(model::EngineObjectId(id)).as_coeffs()[4],
+            55.0,
+            "the engine's document holds the value the panel committed"
+        );
+        assert_eq!(node.id, model::EngineObjectId(id));
+    }
+
+    #[gpui::test]
+    fn a_style_the_panel_commits_reaches_the_engines_document(cx: &mut gpui::TestAppContext) {
+        // The same, for the paint: a style change is one operation across the
+        // selection, and it lands in the engine's document.
+        let (root, window, session, id) = open_panel(cx);
+        window.draw(
+            point(px(0.0), px(0.0)),
+            size(px(300.0), px(900.0)),
+            |_, _| root.clone().into_any_element(),
+        );
+        window.run_until_parked();
+
+        let inspector = window.update(|_, cx| root.read_with(cx, |panel, _| panel.0.clone()));
+        window.update(|_, cx| {
+            inspector.update(cx, |inspector, cx| {
+                inspector.commit_style(model::StyleEdit::Opacity(0.5), cx)
+            })
+        });
+
+        let session = session.borrow();
+        let doc = session.doc().expect("a document");
+        let node = doc.node(model::EngineObjectId(id)).expect("the layer");
+        assert_eq!(node.opacity, 0.5, "the engine's document holds the opacity");
     }
 }

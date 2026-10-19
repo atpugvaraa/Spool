@@ -73,7 +73,9 @@ use std::path::{Path, PathBuf};
 
 use crate::project_bundle::{BundleError, ProjectBundle};
 use crate::source_binding::{self, is_markup, ByteRange, SourceIndex};
-use crate::source_document::{NodeId, PersistentDocument, StructuralNode};
+use crate::source_document::{
+    LamineStructure, ModelError, NodeId, PersistentDocument, StructuralNode,
+};
 use crate::style::Stylesheet;
 
 // # MUTATION HARNESS
@@ -204,6 +206,14 @@ pub struct SaveOutcome {
     pub written: Vec<PathBuf>,
     /// Edits deliberately not written.
     pub unsupported: Vec<UnsupportedEdit>,
+    /// What the save could not do at all, beyond the per-node edits.
+    ///
+    /// A project-level fact — a metadata format this writer does not produce,
+    /// a source that did not compile — is not about a node, so it does not
+    /// belong in [`Self::unsupported`]. It is still said out loud: a save that
+    /// quietly did less than it was asked to is the failure mode this whole
+    /// module exists to prevent.
+    pub notes: Vec<String>,
 }
 
 /// A save that failed part-way through.
@@ -328,6 +338,92 @@ struct CssWrite {
     value: String,
 }
 
+/// The format the project's metadata is in.
+///
+/// `lamine.yaml` has two formats. Version 1 is the six-fields-per-node
+/// contract the editor has always spoken, and it is the one this module
+/// writes. Version 2 is defined by `spool-source` and is where the Owner B
+/// values live: constraints, sizing, masks, locks, dev status, grids, guides,
+/// exports, interactions, components, variable bindings and plugin data.
+///
+/// A version 2 file is **read** here and never re-encoded. Writing a version 1
+/// file over it would lose every one of those values, so a save leaves the
+/// metadata alone instead — and says so, rather than quietly doing less than
+/// it was asked to.
+///
+/// Merging a structural change into a version 2 manifest — rather than
+/// re-encoding it — is real work, and belongs in its own change. Until it
+/// lands, a structural edit to a version 2 project is reported instead of
+/// applied, because applying it would leave the metadata naming an element
+/// that is no longer in the source, and the project would not open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MetadataFormat {
+    /// The editor's own contract, and the one this module writes.
+    VersionOne,
+    /// The `spool-source` schema, with the Owner B values.
+    VersionTwo,
+}
+
+impl MetadataFormat {
+    /// The format the project's metadata is in.
+    ///
+    /// Read from the file's own version line, so the answer is the project's
+    /// and not this editor's guess at it. A file in neither format is refused
+    /// with the reason the version 1 reader has always given.
+    fn of(root: &Path) -> Result<Self, BundleError> {
+        let path = root.join(crate::project_bundle::METADATA_FILE);
+        let text = std::fs::read_to_string(&path).map_err(|source| BundleError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        match version_of(&text) {
+            Some(1) => Ok(Self::VersionOne),
+            Some(2) => Ok(Self::VersionTwo),
+            _ => Err(BundleError::MalformedMetadata {
+                path,
+                source: ModelError::InvalidYaml("expected version: 1 and nodes:".into()),
+            }),
+        }
+    }
+}
+
+/// The version a metadata file declares, if it declares one.
+fn version_of(text: &str) -> Option<u32> {
+    text.lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("version:"))
+        .and_then(|value| value.trim().parse().ok())
+}
+
+/// The structure as it stands on disk, in whichever format the metadata is in.
+///
+/// A version 1 file is read by the editor's own reader. A version 2 file is
+/// read by the crate that defines it and projected onto the editor's
+/// structure — the same projection the open path uses — so a save can compare
+/// a version 2 project against the document it holds without pretending the
+/// file is something it is not.
+fn structure_on_disk(root: &Path, format: MetadataFormat) -> Result<LamineStructure, BundleError> {
+    match format {
+        MetadataFormat::VersionOne => ProjectBundle::load_structure(root),
+        MetadataFormat::VersionTwo => {
+            let path = root.join(crate::project_bundle::METADATA_FILE);
+            let text = std::fs::read_to_string(&path).map_err(|source| BundleError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            let manifest =
+                spool_source::manifest::Manifest::from_yaml(&text).map_err(|source| {
+                    BundleError::MalformedMetadata {
+                        path: path.clone(),
+                        source: ModelError::InvalidYaml(source.to_string()),
+                    }
+                })?;
+            crate::engine_project::structure_from_manifest(&manifest)
+                .map_err(|source| BundleError::MalformedMetadata { path, source })
+        }
+    }
+}
+
 /// Apply edits to the project on disk and persist metadata.
 ///
 /// Returns what was written and what was not, so a caller never has to guess
@@ -341,11 +437,17 @@ pub fn save_project(
     document: &PersistentDocument,
     edits: &[SourceEdit],
 ) -> Result<SaveOutcome, SaveError> {
+    // The metadata's format, read before anything is decided. It decides
+    // whether the structure can be written at all, and which edits are safe to
+    // apply: an edit that changes the structure cannot be applied to a
+    // project whose metadata this writer does not rewrite.
+    let format = MetadataFormat::of(root)?;
+
     // Phase 1 — resolve every edit against the bytes on disk right now.
     let mut files = AuthoredFiles::from_disk(root, document);
     let mut plan = SavePlan::default();
     for edit in edits {
-        plan.resolve(&mut files, document, edit);
+        plan.resolve(&mut files, document, edit, format);
     }
 
     // Phase 2 — render. A file's new contents come from the very bytes its
@@ -399,8 +501,22 @@ pub fn save_project(
     let metadata_path = root.join(crate::project_bundle::METADATA_FILE);
     let mut updated = document.clone();
     updated.sources.clear();
-    let on_disk = ProjectBundle::load_structure(root)?;
+    let on_disk = structure_on_disk(root, format)?;
+    let mut notes: Vec<String> = Vec::new();
     let metadata = if on_disk == updated.structure {
+        None
+    } else if format == MetadataFormat::VersionTwo {
+        // The structure changed and the metadata is a format this writer does
+        // not produce. The authored source is still written below — that is
+        // what the author sees and what the editor drew — but the metadata is
+        // left exactly as it is rather than replaced by a smaller encoding of
+        // the same project, which would lose every constraint, lock, mask and
+        // variable binding it carried.
+        notes.push(
+            "the project's metadata is version 2, which this editor reads but does not \
+             rewrite, so it was left as it is; a structural change to it is not saved"
+                .to_owned(),
+        );
         None
     } else {
         let bundle = ProjectBundle::from_document(root, updated)?;
@@ -439,6 +555,7 @@ pub fn save_project(
     let mut outcome = SaveOutcome {
         written: Vec::new(),
         unsupported: plan.unsupported,
+        notes,
     };
     // Authored files first, then metadata, with the partial outcome carried out
     // of a failure: everything in `outcome.written` at the moment of the error is
@@ -477,6 +594,7 @@ impl SavePlan {
         files: &mut AuthoredFiles,
         document: &PersistentDocument,
         edit: &SourceEdit,
+        format: MetadataFormat,
     ) {
         let (node_id, kind) = match edit {
             SourceEdit::Text { node, .. } => (node, "text"),
@@ -485,6 +603,28 @@ impl SavePlan {
             SourceEdit::Create { node, .. } => (node, "create"),
             SourceEdit::Remove { node, .. } => (node, "remove"),
         };
+        // A change to the structure cannot be applied to a project whose
+        // metadata this writer does not rewrite. The element would leave the
+        // source (or arrive in it) while the metadata kept naming the old
+        // structure, and the project would not open. Reported, not applied.
+        if format == MetadataFormat::VersionTwo
+            && matches!(edit, SourceEdit::Remove { .. } | SourceEdit::Create { .. })
+        {
+            let reason = match edit {
+                SourceEdit::Remove { .. } => {
+                    "the project's metadata is version 2, which this editor reads but does \
+                     not rewrite, so taking this node out of the source would leave the \
+                     metadata naming an element that is no longer there"
+                }
+                _ => {
+                    "the project's metadata is version 2, which this editor reads but does \
+                     not rewrite, so authoring this element would leave the metadata not \
+                     describing it"
+                }
+            };
+            self.report(node_id, kind, reason.into());
+            return;
+        }
         // A removal is answered before the document is consulted, because the node
         // it names is gone from the document — that is what removing one means.
         // Asking the structure first would report every delete as an unknown node.
