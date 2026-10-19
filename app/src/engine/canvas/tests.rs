@@ -1290,3 +1290,70 @@ fn a_deep_click_on_empty_canvas_selects_nothing_either() {
         None
     );
 }
+
+/// The engine's pixels and the overlay must land on the same pixel.
+///
+/// The frame's top-left is a page point, and so is everything the overlay
+/// draws. If the frame is blitted at a different point on screen than the
+/// overlay would put that same page point, the selection handles float away
+/// from the thing they belong to.
+#[test]
+fn the_frame_is_blitted_where_the_overlay_draws_it() {
+    let mut view = ViewState::default();
+    view.zoom = 1.5;
+    view.cx = 280.0;
+    view.cy = 230.0;
+    view.vw = 900.0;
+    view.vh = 800.0;
+    // The canvas element does not start at the window's top-left: it sits
+    // beside a sidebar and below a toolbar, so this origin is never zero.
+    let viewport = Viewport {
+        origin: point(215.0, 90.0),
+        size: (900.0, 800.0),
+    };
+
+    // The page point the frame's top-left stands for.
+    let (page_x, page_y) = view.origin();
+
+    // Where the overlay puts that page point: absolute window coordinates.
+    let overlay = super::page_to_screen(&view, viewport, page_x, page_y);
+
+    // The frame, rendered at the view's own scale, starting at that page
+    // point.
+    let frame = crate::canvas_render::CanvasFrame {
+        image: None,
+        size: crate::canvas_render::DeviceSize::new(1350, 1200),
+        view: figcraft_render::View {
+            origin: view.origin(),
+            scale: view.zoom,
+            width: 1350,
+            height: 1200,
+        },
+        origin_px: (
+            (page_x * view.zoom).round() as i64,
+            (page_y * view.zoom).round() as i64,
+        ),
+        scale: view.zoom,
+        ratio: 1.0,
+        work: figcraft_render::Work::Full,
+        damage: Default::default(),
+    };
+    let blit = super::blit_bounds(&frame, view.origin(), view.zoom, viewport.origin);
+
+    assert_eq!(
+        (overlay.x, overlay.y),
+        (f32::from(blit.origin.x), f32::from(blit.origin.y)),
+        "the engine's pixels and the overlay must land on the same pixel"
+    );
+
+    // And the frame must be drawn at the SIZE the view says that content is.
+    // The frame is 1350 device pixels wide at a scale of 1.5, so it covers 900
+    // page units, which at the view's zoom is 1350 logical points. If the
+    // blit were scaled by the ratio as well, the content would be twice the
+    // size the overlay drew it.
+    assert_eq!(
+        (f32::from(blit.size.width), f32::from(blit.size.height)),
+        (1350.0, 1200.0),
+        "the frame must be drawn at the size the view says"
+    );
+}

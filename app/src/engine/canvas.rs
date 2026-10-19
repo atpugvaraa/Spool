@@ -1363,10 +1363,30 @@ fn truncate(text: &str, max: usize) -> String {
 /// origin is absolute in page space, so the placement has to come from the frame rather than from
 /// the viewport: [`CanvasFrame::origin_in_view`] measures from the viewport origin the request was
 /// made for, and [`CanvasFrame::logical_size`] divides out the ratio it was rendered at.
-fn blit_bounds(f: &CanvasFrame, viewport_origin: (f64, f64), zoom: f64) -> Bounds<Pixels> {
-    let (x, y) = f.origin_in_view(viewport_origin, zoom);
+fn blit_bounds(
+    f: &CanvasFrame,
+    view_origin: (f64, f64),
+    zoom: f64,
+    viewport_origin: GPoint<f32>,
+) -> Bounds<Pixels> {
+    let (x, y) = f.origin_in_view(view_origin, zoom);
     let (w, h) = f.logical_size();
-    Bounds::new(point(px(x), px(y)), size(px(w), px(h)))
+    // THE VIEWPORT'S ORIGIN, or the image lands in the wrong place.
+    //
+    // `origin_in_view` measures from the VIEWPORT's top-left, and the overlay
+    // draws in WINDOW coordinates: `page_to_screen` adds the viewport's origin
+    // to every point. `paint_image` is given the element's bounds, which are
+    // window coordinates too, and intersects the destination with them -- so a
+    // destination in viewport-relative coordinates is a different place
+    // entirely, and the engine's pixels end up somewhere the selection is not.
+    //
+    // This was not visible while the canvas element sat at the window's
+    // top-left, and it broke the moment it did not: the canvas sits beside a
+    // sidebar and below a toolbar, so the viewport's origin is never zero.
+    Bounds::new(
+        point(px(viewport_origin.x + x), px(viewport_origin.y + y)),
+        size(px(w), px(h)),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2269,7 +2289,7 @@ impl EngineCanvas {
 
         ov.fill(bounds, background);
         if let Some(f) = frame.as_ref() {
-            let place = blit_bounds(f, ov.view.origin(), ov.view.zoom);
+            let place = blit_bounds(f, ov.view.origin(), ov.view.zoom, ov.viewport.origin);
             if let Some(image) = f.image.clone() {
                 let _ =
                     ov.window
