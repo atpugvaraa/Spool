@@ -46,6 +46,7 @@ nodes:
     key: spool-frame-anchor
     name: Anchor
     kind: frame
+    parent: 1
     children:
       - 4
       - 5
