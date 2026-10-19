@@ -287,6 +287,20 @@ pub fn bindings(platform: Platform) -> Vec<KeyBinding> {
         .flat_map(|(spec, b)| {
             gpui_keystrokes(spec)
                 .into_iter()
+                // ESCAPE IS THE SHELL'S LADDER, NOT A BINDING.
+                //
+                // figcraft binds Escape to `select.none`, and installing that
+                // alongside Spool's ladder means the selection is cleared by the
+                // binding before the ladder gets to look at it -- so the ladder
+                // would skip the selection rung and give up the tool on the
+                // FIRST Escape, which is the opposite of the documented order
+                // (panel, inspector, gesture, text, selection, tool).
+                //
+                // So Escape is not installed as a binding. The ladder owns it,
+                // reads the engine's state to decide which rung answers, and
+                // calls back into the engine for the ones that are the engine's
+                // business. `select.none` is still reachable as a command.
+                .filter(|chord| !chord.ends_with("escape"))
                 .filter_map(|chord| {
                     KeyBinding::load(
                         &chord,
@@ -426,13 +440,19 @@ mod tests {
     fn expected_count() -> usize {
         // Counted in GPUI chords, not in figcraft specs: `Delete` is one spec
         // and two chords, because figcraft means Backspace or forward-delete by
-        // it and GPUI has two key names for those.
+        // it and GPUI has two key names for those. Escape is not counted,
+        // because the shell's ladder owns it and it is not installed.
         KEYS.iter()
             .filter(|b| b.context != Context::Text)
             .map(|b| {
                 b.keys(Platform::Mac)
                     .iter()
-                    .map(|spec| gpui_keystrokes(spec).len())
+                    .map(|spec| {
+                        gpui_keystrokes(spec)
+                            .into_iter()
+                            .filter(|chord| !chord.ends_with("escape"))
+                            .count()
+                    })
                     .sum::<usize>()
             })
             .sum()
@@ -453,7 +473,9 @@ mod tests {
     fn bindings_have_the_expected_count() {
         // 165 chords before `Delete` was expanded to Backspace and forward
         // delete; the three Delete chords in the table account for the three.
-        assert_eq!(expected_count(), 168);
+        // Escape is not installed -- the shell's ladder owns it -- so it is
+        // not counted: 167.
+        assert_eq!(expected_count(), 167);
         for platform in PLATFORMS {
             let built = bindings(platform);
             assert_eq!(built.len(), expected_count(), "{platform:?}");

@@ -234,6 +234,48 @@ fn create_engine_rectangle(
     window.run_until_parked();
 }
 
+/// A point on the engine's page that is not on any node.
+///
+/// The engine's own geometry: the page's bounds, in screen space, and a corner
+/// of it. A click there is a click on empty page, which is what the creation
+/// tests need.
+fn empty_engine_point(
+    shell: &Entity<AppShell>,
+    window: &mut VisualTestContext,
+) -> gpui::Point<gpui::Pixels> {
+    window.update(|_, cx| {
+        shell.read_with(cx, |shell, _| {
+            let canvas = shell.engine_canvas().read(cx);
+            let session = canvas.session_handle();
+            let session = session.borrow();
+            let Ok(doc) = session.doc() else {
+                panic!("the engine should have a document");
+            };
+            let page = doc.current_page.expect("the engine's page");
+            let bounds = doc.world_bounds(page).expect("the page should have bounds");
+            let at = crate::engine::canvas::page_to_screen(
+                &canvas.view(),
+                canvas.viewport(),
+                bounds.x0 + 8.0,
+                bounds.y0 + 8.0,
+            );
+            gpui::Point::new(px(at.x), px(at.y))
+        })
+    })
+}
+
+/// Whether the engine is editing text.
+fn engine_is_editing_text(
+    shell: &Entity<AppShell>,
+    window: &mut VisualTestContext,
+) -> bool {
+    window.update(|_, cx| {
+        shell.read_with(cx, |shell, _| {
+            shell.engine_canvas().read(cx).is_editing_text()
+        })
+    })
+}
+
 /// The engine's selection.
 fn engine_selection(
     shell: &Entity<AppShell>,
@@ -890,7 +932,6 @@ fn the_text_handover_leaves_the_toolbar_on_selection(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-#[ignore = "the mounted canvas is now engine::canvas::EngineCanvas, which takes input through the engine's own Session::pointer and its keymap, not through CanvasView. These tests click the canvas-viewport selector and assert on CanvasView's state, so they are testing the retired runtime. Re-pointed at the engine equivalents as part of finishing the swap -- they are ignored, NOT deleted, and the coverage they provided is genuinely missing until then."]
 fn escape_walks_back_through_the_rungs_to_the_tool(cx: &mut TestAppContext) {
     // Escape answers the topmost thing with something to give up, in order. With
     // an object selected the selection rung answers first and the tool stays put;
@@ -903,20 +944,21 @@ fn escape_walks_back_through_the_rungs_to_the_tool(cx: &mut TestAppContext) {
     // toolbar button is not a focus target, so the canvas keeps the focus its
     // click gave it and the key still has somewhere to arrive.
     let (shell, window) = open_shell(cx);
-    click_object(&shell, window, 0, Modifiers::none());
+    create_engine_rectangle(&shell, window, 40.0, 40.0);
+    click_engine_node(&shell, window, 1, Modifiers::none());
     choose_tool(window, "Rectangle");
 
     assert!(
-        holds_focus(&shell, window),
+        engine_canvas_holds_focus(&shell, window),
         "picking a tool from the toolbar must not take focus away from the canvas"
     );
     assert_eq!(
-        read(&shell, window, |canvas| canvas.tool()),
-        crate::canvas::Tool::Rectangle,
+        read_engine_tool(&shell, window),
+        "rectangle",
         "choosing the tool should change it"
     );
     assert_eq!(
-        read(&shell, window, |canvas| canvas.selection().ids().len()),
+        engine_selection(&shell, window).len(),
         1,
         "and leave the selection from the click alone"
     );
@@ -924,21 +966,21 @@ fn escape_walks_back_through_the_rungs_to_the_tool(cx: &mut TestAppContext) {
     window.simulate_keystrokes("escape");
     window.run_until_parked();
     assert_eq!(
-        read(&shell, window, |canvas| canvas.selection().ids().len()),
+        engine_selection(&shell, window).len(),
         0,
         "the first Escape should give up the selection"
     );
     assert_eq!(
-        read(&shell, window, |canvas| canvas.tool()),
-        crate::canvas::Tool::Rectangle,
+        read_engine_tool(&shell, window),
+        "rectangle",
         "and stop there, because the tool rung is below the selection rung"
     );
 
     window.simulate_keystrokes("escape");
     window.run_until_parked();
     assert_eq!(
-        read(&shell, window, |canvas| canvas.tool()),
-        crate::canvas::Tool::Select,
+        read_engine_tool(&shell, window),
+        "move",
         "the second Escape should give up the tool"
     );
     assert_eq!(

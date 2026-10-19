@@ -1624,6 +1624,15 @@ impl EngineCanvas {
         self.focus.is_focused(window)
     }
 
+    /// The engine's own escape: cancel whatever the engine is in the middle of.
+    ///
+    /// A gesture in flight, an open text session, or neither. The engine knows
+    /// which, so the shell does not have to guess and cannot cancel the wrong
+    /// thing.
+    pub fn escape(&mut self, cx: &mut gpui::Context<Self>) -> bool {
+        self.with_session_mut(cx, |session| session.escape().is_ok())
+    }
+
     /// Move the camera by a screen-space amount.
     ///
     /// The engine's own scroll, so the camera is the session's `ViewState` and
@@ -1938,19 +1947,20 @@ impl EngineCanvas {
             return;
         }
         let mut session = self.session.borrow_mut();
-        let mut used = session
-            .tool_key(name, m.shift, m.alt, m.cmd)
-            .unwrap_or(false);
-        if !used && name == "Escape" {
-            used = session.escape().is_ok();
-        }
+        let used = session.tool_key(name, m.shift, m.alt, m.cmd).unwrap_or(false);
         drop(session);
         if used {
             cx.notify();
+        } else {
+            // Not the engine's key. Let it travel to the shell, which answers the
+            // editor-wide chords. Without this the canvas is a dead end for
+            // every key it does not itself use.
+            cx.propagate();
         }
     }
 
-    fn is_editing_text(&self) -> bool {
+    /// Whether the engine is editing text right now.
+    pub fn is_editing_text(&self) -> bool {
         self.session
             .borrow()
             .ds()
@@ -1975,6 +1985,21 @@ impl EngineCanvas {
                 }
                 _ => {}
             }
+        }
+        // ESCAPE BELONGS TO THE SHELL'S LADDER, not to the engine canvas.
+        //
+        // The ladder is Spool's documented behaviour -- panel, then inspector,
+        // then gesture, then text, then selection, then tool -- and it reads the
+        // engine's state to decide which rung answers. If the engine canvas
+        // ate Escape, the ladder would never run: a key event only reaches the
+        // nodes on the path from the focused node up to the root, and a handler
+        // that does not propagate stops it there.
+        //
+        // So Escape is passed up, and the ladder calls back into the engine for
+        // the rungs that are the engine's business.
+        if event.keystroke.key == "escape" {
+            cx.propagate();
+            return;
         }
         self.handle_key(&event.keystroke, cx);
     }

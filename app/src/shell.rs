@@ -446,15 +446,30 @@ impl AppShell {
         // name being typed, or a drag in flight — is read as one rung. The
         // panel walks its own rungs internally, in the same order, so the two
         // cannot disagree about which of its two states is on top.
+        //
+        // The rungs are read from the ENGINE, because the engine is what holds
+        // the document, the selection, the tool and the text session now. Read
+        // from the retired runtime the ladder would answer about a document
+        // nobody is editing: it would never see the selection, so it would
+        // skip the selection rung and the ordering it exists to protect would
+        // be gone.
+        let engine_canvas = self.engine_canvas.read(cx);
+        let (gesture, text_editing, has_selection, tool_is_held) = (
+            engine_canvas.busy(),
+            engine_canvas.is_editing_text(),
+            !engine_canvas.selection().is_empty(),
+            engine_canvas.active_tool() != "move",
+        );
+        drop(engine_canvas);
         let state = commands::EscapeState {
             panel: self.ai_open || self.share_open || self.export_open || self.zoom_open,
             inspector: self
                 .inspector
                 .update(cx, |inspector, _| inspector.is_busy()),
-            gesture: self.canvas.read(cx).is_manipulating(),
-            text_editing: self.canvas.read(cx).is_text_editing(),
-            selection: !self.canvas.read(cx).selection().is_empty(),
-            tool: self.canvas.read(cx).tool() != canvas::Tool::Select,
+            gesture,
+            text_editing,
+            selection: has_selection,
+            tool: tool_is_held,
         };
         match state.next() {
             Some(commands::Rung::Panel) => {
@@ -468,15 +483,18 @@ impl AppShell {
             Some(commands::Rung::Inspector) => self
                 .inspector
                 .update(cx, |inspector, cx| inspector.cancel_in_flight(cx)),
-            Some(commands::Rung::Gesture) => self
-                .canvas
-                .update(cx, |canvas, cx| canvas.cancel_manipulation(cx)),
-            Some(commands::Rung::TextEditing) => self
-                .canvas
-                .update(cx, |canvas, cx| canvas.cancel_text_edit(cx)),
+            // The engine's own escape: it knows whether a gesture is in flight
+            // and whether a text session is open, and it cancels whichever is
+            // actually there. The retired runtime's two separate calls cannot
+            // be used, because neither of them knows about the engine's state.
+            Some(commands::Rung::Gesture) | Some(commands::Rung::TextEditing) => {
+                self.engine_canvas.update(cx, |canvas, cx| {
+                    canvas.escape(cx);
+                });
+                true
+            }
             Some(commands::Rung::Selection) => {
-                self.canvas
-                    .update(cx, |canvas, cx| canvas.clear_selection(cx));
+                self.run_engine_command("select.none", serde_json::json!({}), cx);
                 true
             }
             Some(commands::Rung::Tool) => {
