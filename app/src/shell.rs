@@ -2,7 +2,9 @@ use gpui::{
     div, point, prelude::*, px, rgb, App, Context, Entity, Modifiers, Render, SharedString,
     Subscription, Window,
 };
+use std::cell::Cell;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use crate::{canvas, commands, inspector, layers::LayersView, project_open, theme};
 
@@ -76,8 +78,10 @@ fn development_override() -> Option<PathBuf> {
 fn load_requested_project(
     request: Option<&ProjectRequest>,
     view: &mut canvas::CanvasView,
-) -> Option<SharedString> {
-    let request = request?;
+) -> (Option<SharedString>, Option<crate::engine_project::EngineProject>) {
+    let Some(request) = request else {
+        return (None, None);
+    };
     let (root, opened) = match request {
         ProjectRequest::Project(path) => (
             path.display().to_string(),
@@ -100,12 +104,19 @@ fn load_requested_project(
                 loaded.unrendered,
                 loaded.unstyled,
             );
+            // The engine's own document, taken before `loaded` is moved into the
+            // retired canvas. This is the document the engine frontend draws; the
+            // old runtime keeps its copy for as long as both paths exist.
+            let engine = loaded.engine.clone();
             view.load_project(loaded);
-            None
+            (None, Some(engine))
         }
         Err(error) => {
             eprintln!("spool_project_open failed root={root}: {error}");
-            Some(format!("Could not open {root}: {error}").into())
+            (
+                Some(format!("Could not open {root}: {error}").into()),
+                None,
+            )
         }
     }
 }
@@ -223,6 +234,12 @@ fn shellexpand_home(path: &str) -> String {
 pub struct AppShell {
     canvas: Entity<canvas::CanvasView>,
     layers: Entity<LayersView>,
+    /// The editor over the figcraft engine. This is the one the application is
+    /// migrating to; `canvas` above is the retired hand-written runtime and is
+    /// still mounted only until the panels behind it are ported.
+    engine_canvas: Entity<crate::engine::canvas::EngineCanvas>,
+    /// The engine's layers panel, sharing the one session with `engine_canvas`.
+    engine_layers: Entity<crate::engine::layers::LayersPanel>,
     inspector: Entity<inspector::Inspector>,
     selected_page: usize,
     ai_open: bool,
@@ -259,27 +276,81 @@ impl AppShell {
     pub fn new_with_project(requested: Option<PathBuf>, cx: &mut Context<Self>) -> Self {
         let canvas = cx.new(canvas::CanvasView::new_with_context);
         let request = project_request(requested, development_override());
-        let status = canvas.update(cx, |view, _| {
-            load_requested_project(request.as_ref(), view).map(|message| (message, true))
-        });
+        let (message, engine) =
+            canvas.update(cx, |view, _| load_requested_project(request.as_ref(), view));
+        let status = message.map(|message| (message, true));
         let layers = cx.new(|_| LayersView::new(canvas.downgrade()));
         let inspector = cx.new(|cx| inspector::Inspector::new(canvas.clone(), cx));
+
+        // The engine frontend. ONE session is built here and shared: the canvas
+        // owns it, and the layers panel takes the same `Rc<RefCell<Session>>`.
+        // Two sessions would be two documents that disagree, which is the one
+        // thing this architecture exists to prevent.
+        let unresolved = engine
+            .as_ref()
+            .map_or_else(Vec::new, |engine| engine.unresolved.clone());
+        let document = engine.map_or_else(Default::default, |engine| engine.document);
+        let session = figcraft_engine::Session::with_document(document);
+        let engine_canvas = cx.new(|cx| crate::engine::canvas::EngineCanvas::new(session, cx));
+        // Frame the content, deferred to the first paint that knows the canvas's
+        // size. Without this the camera sits at the default origin looking at
+        // empty space and a correctly compiled project opens to a black canvas.
+        engine_canvas.update(cx, |canvas, _| canvas.fit_on_next_paint());
+        let session = engine_canvas.update(cx, |canvas, _| canvas.session_handle());
+        let engine_layers = cx.new(|cx| crate::engine::layers::LayersPanel::new(session, cx));
+
         // Held, not dropped: a GPUI subscription detaches its observer when it
         // goes away, and without it the chrome around the canvas would only
         // repaint when the shell itself changed.
         //
-        // The same notification is how a refused edit reaches the status line:
-        // the canvas keeps the reason, and this moves it here, so the latest
-        // save, open, or refusal is the one message on screen.
-        let observations = vec![cx.observe(&canvas, |shell, canvas, cx| {
-            if let Some(message) = canvas.update(cx, |canvas, _| canvas.take_refusal()) {
-                shell.save_status = Some((message.into(), true));
-            }
-            cx.notify();
-        })];
+        // The engine panels have no observer of their own — two entities sharing
+        // one `Rc<RefCell<Session>>` cannot see each other's borrows — so this is
+        // the only place cross-panel invalidation happens.
+        //
+        // Each panel notifies the other ONLY when the document revision actually
+        // moved. Notifying unconditionally is a livelock, not a redundancy: in
+        // GPUI a notification IS an observation, so two entities that observe
+        // each other and always notify wake each other forever and the window
+        // never appears. That is not a theoretical concern — it is what the
+        // first version of this did, and `sample` showed the whole main thread
+        // inside shell.rs recursing through invoke_observer -> notify.
+        //
+        // `seen` is shared by both observers so the pair cannot disagree about
+        // what the last propagated revision was; two separate cells would let a
+        // lost update leave the panels a revision apart with nothing to wake
+        // them again.
+        let seen: Rc<Cell<u64>> = Rc::new(Cell::new(u64::MAX));
+        let observations = vec![
+            cx.observe(&canvas, |shell, canvas, cx| {
+                if let Some(message) = canvas.update(cx, |canvas, _| canvas.take_refusal()) {
+                    shell.save_status = Some((message.into(), true));
+                }
+                cx.notify();
+            }),
+            cx.observe(&engine_canvas, {
+                let seen = Rc::clone(&seen);
+                move |shell, canvas, cx| {
+                    let revision = canvas.update(cx, |canvas, _| canvas.document_revision());
+                    if seen.replace(revision) != revision {
+                        shell.engine_layers.update(cx, |_, cx| cx.notify());
+                    }
+                }
+            }),
+            cx.observe(&engine_layers, {
+                let seen = Rc::clone(&seen);
+                move |shell, layers, cx| {
+                    let revision = layers.update(cx, |layers, _| layers.document_revision());
+                    if seen.replace(revision) != revision {
+                        shell.engine_canvas.update(cx, |_, cx| cx.notify());
+                    }
+                }
+            }),
+        ];
         Self {
             canvas,
             layers,
+            engine_canvas,
+            engine_layers,
             inspector,
             observations,
             selected_page: 0,
@@ -483,12 +554,43 @@ impl AppShell {
         };
         eprintln!("spool_project_create ok root={}", project.root().display());
         let request = ProjectRequest::Project(path.clone());
-        let status = self.canvas.update(cx, |view, _| {
-            load_requested_project(Some(&request), view).map(|message| (message, true))
-        });
-        if let Some(status) = status {
-            self.save_status = Some(status);
+        let (message, engine) = self
+            .canvas
+            .update(cx, |view, _| load_requested_project(Some(&request), view));
+        if let Some(message) = message {
+            self.save_status = Some((message, true));
         }
+        if let Some(engine) = engine {
+            self.load_engine_document(engine.document, cx);
+        }
+    }
+
+    /// Put a freshly opened document into the session both engine panels share.
+    ///
+    /// The panels hold an `Rc<RefCell<Session>>`, not a `Weak` to an entity, so a
+    /// new document is installed by replacing the session's document in place.
+    /// Swapping the whole `Session` instead would leave the layers panel holding
+    /// the old one, and the two would disagree about what is open.
+    fn load_engine_document(
+        &mut self,
+        document: figcraft_doc::Document,
+        cx: &mut Context<Self>,
+    ) {
+        let session = self
+            .engine_canvas
+            .update(cx, |canvas, _| canvas.session_handle());
+        {
+            let mut session = session.borrow_mut();
+            session.docs.clear();
+            session.docs
+                .push(figcraft_engine::DocState::new(document, None));
+            session.active = 0;
+        }
+        self.engine_canvas.update(cx, |canvas, cx| {
+            canvas.fit_on_next_paint();
+            cx.notify();
+        });
+        self.engine_layers.update(cx, |_, cx| cx.notify());
     }
 
     /// The one place a keystroke the whole editor answers to is handled.
@@ -1101,10 +1203,10 @@ impl AppShell {
             );
         }
 
-        let tree = self
-            .layers
-            .clone()
-            .cached(self.layers.read(cx).cached_style());
+        // Not `.cached(..)`: the retired `LayersView` was wrapped in a styled
+        // element, and the engine panel paints its own rows. Caching it inside a
+        // `cached_style` element has nothing to cache.
+        let tree = self.engine_layers.clone();
 
         div()
             .flex()
@@ -1259,7 +1361,7 @@ impl AppShell {
             .relative()
             .overflow_hidden()
             .bg(rgb(theme::CANVAS))
-            .child(self.canvas.clone());
+            .child(self.engine_canvas.clone());
 
         if let Some((message, failed)) = &self.save_status {
             content = content.child(

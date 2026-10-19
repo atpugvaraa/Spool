@@ -1413,6 +1413,20 @@ pub fn wheel_pixels(delta: ScrollDelta) -> (f32, f32) {
 /// None of this belongs in the document or the session. Selection, tool, hover, camera and the text
 /// edit all live in the engine and are read from there.
 pub struct CanvasState {
+    /// The camera has not been framed onto a newly loaded document.
+    ///
+    /// It cannot be framed at load time: the camera's fit needs the canvas's own
+    /// pixel size, and that is not known until the element has been laid out. So
+    /// the request is recorded here and honoured on the first paint that has a
+    /// non-empty viewport. Fitting earlier submits a request with a zero-size
+    /// viewport, which the render thread refuses, and the refusal used to be
+    /// swallowed -- so the project opened to a permanently black canvas.
+    pub pending_fit: bool,
+    /// A first render request has been logged, so the launch log says once.
+    pub reported_first_submit: bool,
+    /// The worker thread refused a frame. Sticky, because the cause does not clear
+    /// on its own and a retried request would only hide it again.
+    pub render_failed: bool,
     /// A button went down on the canvas and has not come up: keep sending moves even if the
     /// pointer has left the element.
     pub dragging: bool,
@@ -1441,6 +1455,9 @@ pub struct CanvasState {
 impl Default for CanvasState {
     fn default() -> Self {
         Self {
+            pending_fit: false,
+            reported_first_submit: false,
+            render_failed: false,
             dragging: false,
             last_pointer: None,
             hovering: false,
@@ -1510,6 +1527,22 @@ impl EngineCanvas {
     /// The session, for panels that want to read or act through it directly.
     pub fn session_handle(&self) -> Rc<RefCell<Session>> {
         Rc::clone(&self.session)
+    }
+
+    /// The engine's own count of edits to the open document.
+    ///
+    /// The layers panel shares this session, so this is a number both panels
+    /// agree on without either of them telling the other anything. It exists so
+    /// the shell can invalidate across panels ONLY when the document actually
+    /// changed: two entities that observe each other and notify unconditionally
+    /// wake each other forever, because in GPUI every notification is itself an
+    /// observation. Comparing this is what breaks that cycle.
+    pub fn document_revision(&self) -> u64 {
+        let session = self.session.borrow();
+        session
+            .docs
+            .get(session.active)
+            .map_or(0, |doc| doc.revision)
     }
 
     /// Run `f` with the session. The borrow cannot outlive the call.
@@ -1604,6 +1637,16 @@ impl EngineCanvas {
     }
 
     // --- what panels drive --------------------------------------------------
+
+    /// Ask for the camera to be framed on the next paint that has a size.
+    ///
+    /// This is the correct way to frame a freshly loaded document, and
+    /// [`Self::zoom_to_fit`] is not: a fit computes the camera from the canvas's
+    /// pixel size, which before the first layout is zero, and a render submitted
+    /// with a zero-size viewport is refused by the render thread.
+    pub fn fit_on_next_paint(&mut self) {
+        self.state.pending_fit = true;
+    }
 
     /// Frame the page.
     pub fn zoom_to_fit(&mut self, cx: &mut gpui::Context<Self>) {
@@ -1700,12 +1743,34 @@ impl EngineCanvas {
             )
         };
         let (doc, page, origin, zoom, options) = request;
-        if self
+        match self
             .renderer
             .render_canvas(doc, page, origin, zoom, self.viewport.size, ratio, options)
-            .is_ok()
         {
-            self.state.awaiting = self.renderer.generation() + 1;
+            Ok(_) => {
+                self.state.awaiting = self.renderer.generation() + 1;
+                // Once, on the first submission that the render thread accepted.
+                // A canvas that renders nothing and a canvas that was never asked
+                // to render anything look identical from the outside, so this says
+                // which one happened.
+                if !self.state.reported_first_submit {
+                    self.state.reported_first_submit = true;
+                    eprintln!(
+                        "SPOOL_RENDER_SUBMITTED page={:?} origin={:?} zoom={} viewport={:?}",
+                        page,
+                        origin,
+                        zoom,
+                        self.viewport.size,
+                    );
+                }
+            }
+            Err(error) => {
+                // Previously swallowed. A render that fails on the worker thread
+                // leaves a black canvas with no symptom anywhere, which is
+                // indistinguishable from an empty page.
+                eprintln!("SPOOL_RENDER_FAILED {error:?}");
+                self.state.render_failed = true;
+            }
         }
     }
 
@@ -2042,6 +2107,26 @@ impl EngineCanvas {
         hitbox: Option<Hitbox>,
     ) {
         self.viewport = Viewport::new(bounds);
+
+        // Honour a deferred fit, now that there is a viewport to fit into. The
+        // size check is what makes this safe to run on every paint: before the
+        // element has been laid out the viewport is empty, and fitting against it
+        // is exactly the failure this defers past.
+        if self.state.pending_fit
+            && self.viewport.size.0 > 0.0
+            && self.viewport.size.1 > 0.0
+        {
+            self.state.pending_fit = false;
+            let page = self.session.borrow().page().ok();
+            if let Some(page) = page {
+                if let Ok(ds) = self.session.borrow_mut().ds_mut() {
+                    if let Some(bounds) = ds.doc.world_bounds(page) {
+                        ds.view.fit(bounds, 4.0);
+                    }
+                }
+            }
+        }
+
         self.request_render(ratio);
         let frame = self.renderer.frame();
         let snapshot = self.snapshot();
@@ -3334,6 +3419,11 @@ impl Render for EngineCanvas {
             .id("engine-canvas")
             .debug_selector(|| "engine-canvas".to_string())
             .relative()
+            // `size_full` as well as `flex_1`: the canvas paint closure is handed
+            // the element's bounds, and an empty bounds is refused by the render
+            // thread as NoUsableScale. `flex_1` alone did not give it a size in
+            // the shell's column, so the project loaded and never drew.
+            .size_full()
             .flex_1()
             .overflow_hidden()
             .bg(rgb(theme::CANVAS))
@@ -3348,7 +3438,8 @@ impl Render for EngineCanvas {
             .on_mouse_exit(cx.listener(Self::on_mouse_exit))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .on_pinch(cx.listener(Self::on_pinch))
-            .child(canvas(
+            .child(
+                canvas(
                 move |bounds, window, cx| {
                     let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
                     hitbox_pre.replace(Some(hitbox.clone()));
@@ -3376,7 +3467,22 @@ impl Render for EngineCanvas {
                         this.paint(window, cx, bounds, ratio, hitbox);
                     });
                 },
-            ))
+            )
+                // GPUI's `Canvas` element lays itself out from its OWN style
+                // (`request_layout` builds `Style::default()` and refines it with
+                // whatever is set here). It is childless, so with no size set it
+                // collapses to zero height -- and a zero-height viewport is
+                // refused by the render thread as NoUsableScale, which used to be
+                // swallowed, so a project that compiled correctly opened to a
+                // black canvas with no error anywhere.
+                //
+                // Sizing the wrapping div does not help: an explicit height on the
+                // parent was tried and the bounds stayed `918px x 0px`, because
+                // the bounds handed to the closure are this element's, not the
+                // parent's.
+                .absolute()
+                .size_full(),
+            )
     }
 }
 

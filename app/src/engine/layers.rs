@@ -1234,6 +1234,19 @@ impl LayersPanel {
         Rc::clone(&self.session)
     }
 
+    /// The engine's own count of edits to the open document.
+    ///
+    /// Read from the shared session, so it agrees with
+    /// [`crate::engine::canvas::EngineCanvas::document_revision`] by
+    /// construction rather than by the two panels agreeing to stay in step.
+    pub fn document_revision(&self) -> u64 {
+        let session = self.session.borrow();
+        session
+            .docs
+            .get(session.active)
+            .map_or(0, |doc| doc.revision)
+    }
+
     /// Replace the session handle, e.g. when a project is opened.
     pub fn set_session(&mut self, session: Rc<RefCell<Session>>, cx: &mut Context<Self>) {
         self.session = session;
