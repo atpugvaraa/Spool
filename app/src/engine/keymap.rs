@@ -132,6 +132,42 @@ pub fn keystroke(spec: &str) -> Option<String> {
     Some(out)
 }
 
+/// The GPUI chords one of figcraft's key specs stands for.
+///
+/// Usually one. But figcraft's own table treats `Delete` as *Backspace or
+/// Delete* -- its doc comment says so, and every product in its corpus binds
+/// both -- while GPUI has two separate key names for them. Mapping `Delete` to
+/// only one of them would leave half the chord dead: the key would work on a
+/// Mac's forward-delete key and do nothing on the backspace key next to it.
+///
+/// So a spec that names several keys expands to one binding each. A spec that
+/// names one stays one.
+pub fn gpui_keystrokes(spec: &str) -> Vec<String> {
+    let (mods, key) = match keymap::parse(spec) {
+        Some(parts) => parts,
+        None => return Vec::new(),
+    };
+    let mut prefix = String::new();
+    if mods.ctrl {
+        prefix.push_str("ctrl-");
+    }
+    if mods.alt {
+        prefix.push_str("alt-");
+    }
+    if mods.cmd {
+        prefix.push_str("cmd-");
+    }
+    if mods.shift {
+        prefix.push_str("shift-");
+    }
+    match key {
+        // Backspace and forward-delete are the same verb in figcraft, and in
+        // every product it was copied from.
+        "Delete" => vec![format!("{prefix}delete"), format!("{prefix}backspace")],
+        other => gpui_key(other).map(|key| vec![format!("{prefix}{key}")]).unwrap_or_default(),
+    }
+}
+
 /// figcraft's canonical key name as GPUI names it, or `None` when GPUI has no name for it.
 ///
 /// A single character comes back lower-cased: [`gpui::Keystroke::parse`] reads an upper-case
@@ -178,7 +214,10 @@ pub fn figcraft_key(key: &str) -> Cow<'static, str> {
         "enter" => Cow::Borrowed("Enter"),
         "escape" => Cow::Borrowed("Escape"),
         "tab" => Cow::Borrowed("Tab"),
-        "delete" => Cow::Borrowed("Delete"),
+        // figcraft's `Delete` is Backspace or forward-delete, so both GPUI names
+        // resolve to it. Without this, the backspace binding installed for
+        // `edit.delete` would resolve to nothing and the key would be dead.
+        "delete" | "backspace" => Cow::Borrowed("Delete"),
         "pageup" => Cow::Borrowed("PageUp"),
         "pagedown" => Cow::Borrowed("PageDown"),
         "left" => Cow::Borrowed("ArrowLeft"),
@@ -245,16 +284,21 @@ pub fn bindings(platform: Platform) -> Vec<KeyBinding> {
     KEYS.iter()
         .filter(|b| b.context != Context::Text)
         .flat_map(|b| b.keys(platform).iter().map(move |spec| (*spec, b)))
-        .filter_map(|(spec, b)| {
-            KeyBinding::load(
-                &keystroke(spec)?,
-                Box::new(RunCommand::new(b.id, Value::Object(Default::default()))),
-                None,
-                false,
-                None,
-                &DummyKeyboardMapper,
-            )
-            .ok()
+        .flat_map(|(spec, b)| {
+            gpui_keystrokes(spec)
+                .into_iter()
+                .filter_map(|chord| {
+                    KeyBinding::load(
+                        &chord,
+                        Box::new(RunCommand::new(b.id, Value::Object(Default::default()))),
+                        None,
+                        false,
+                        None,
+                        &DummyKeyboardMapper,
+                    )
+                    .ok()
+                })
+                .collect::<Vec<_>>()
         })
         .collect()
 }
@@ -380,9 +424,17 @@ mod tests {
     /// Chords in the canvas-side table, as GPUI would install them. Pinned so a change upstream
     /// that silently drops or duplicates a row is visible here.
     fn expected_count() -> usize {
+        // Counted in GPUI chords, not in figcraft specs: `Delete` is one spec
+        // and two chords, because figcraft means Backspace or forward-delete by
+        // it and GPUI has two key names for those.
         KEYS.iter()
             .filter(|b| b.context != Context::Text)
-            .map(|b| b.keys(Platform::Mac).len())
+            .map(|b| {
+                b.keys(Platform::Mac)
+                    .iter()
+                    .map(|spec| gpui_keystrokes(spec).len())
+                    .sum::<usize>()
+            })
             .sum()
     }
 
@@ -399,7 +451,9 @@ mod tests {
 
     #[test]
     fn bindings_have_the_expected_count() {
-        assert_eq!(expected_count(), 165);
+        // 165 chords before `Delete` was expanded to Backspace and forward
+        // delete; the three Delete chords in the table account for the three.
+        assert_eq!(expected_count(), 168);
         for platform in PLATFORMS {
             let built = bindings(platform);
             assert_eq!(built.len(), expected_count(), "{platform:?}");

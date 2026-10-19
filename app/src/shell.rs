@@ -1,5 +1,5 @@
 use gpui::{
-    div, point, prelude::*, px, rgb, App, Context, Entity, Modifiers, Render, SharedString,
+    div, prelude::*, px, rgb, App, Context, Entity, Modifiers, Render, SharedString,
     Subscription, Window,
 };
 use std::cell::Cell;
@@ -513,8 +513,16 @@ impl AppShell {
             commands::Direction::Up => (0.0, -1.0),
             commands::Direction::Down => (0.0, 1.0),
         };
-        let step = if coarse { 10.0 } else { 1.0 };
-        let moved = self.edit_canvas(cx, |canvas, _| canvas.nudge_selection(dx * step, dy * step));
+        // The engine's nudge takes UNITS, not pixels: it multiplies them by its
+        // own small/big preference, so the step size is the engine's decision
+        // and not a second copy of it here.
+        let moved = self.engine_canvas.update(cx, |canvas, cx| {
+            canvas.run_engine_command(
+                "transform.nudge",
+                serde_json::json!({ "dx": dx, "dy": dy, "big": coarse }),
+                cx,
+            )
+        });
         if moved {
             return true;
         }
@@ -522,8 +530,8 @@ impl AppShell {
         // because panning is navigation rather than an edit and does not need
         // the fine granularity a nudge does.
         let pan_step = if coarse { 400.0 } else { 40.0 };
-        self.canvas.update(cx, |canvas, _| {
-            canvas.pan_by(point(dx * pan_step, dy * pan_step))
+        self.engine_canvas.update(cx, |canvas, cx| {
+            canvas.pan_by(dx * pan_step, dy * pan_step, cx);
         });
         cx.notify();
         true
@@ -716,6 +724,12 @@ impl AppShell {
         self.engine_canvas.read(cx).active_tool()
     }
 
+    /// The engine canvas entity, for the window-level interaction tests.
+    #[cfg(test)]
+    pub fn engine_canvas(&self) -> &Entity<crate::engine::canvas::EngineCanvas> {
+        &self.engine_canvas
+    }
+
     /// Whether the engine's tool in effect is `tool`, for the tests.
     #[cfg(test)]
     pub fn test_engine_tool_is_highlighted(&self, tool: &str, cx: &App) -> bool {
@@ -750,51 +764,63 @@ impl AppShell {
     fn run_command(&mut self, command: commands::Command, cx: &mut Context<Self>) {
         match command {
             commands::Command::Undo => {
-                self.canvas.update(cx, |canvas, cx| canvas.undo(cx));
+                self.engine_canvas.update(cx, |canvas, cx| {
+                    canvas.undo(cx);
+                });
             }
             commands::Command::Redo => {
-                self.canvas.update(cx, |canvas, cx| canvas.redo(cx));
+                self.engine_canvas.update(cx, |canvas, cx| {
+                    canvas.redo(cx);
+                });
             }
             commands::Command::Save => self.save_project(cx),
             commands::Command::Delete => {
-                self.canvas
-                    .update(cx, |canvas, cx| canvas.delete_selection(cx));
+                self.run_engine_command("edit.delete", serde_json::json!({}), cx);
             }
             commands::Command::Duplicate => {
-                self.canvas
-                    .update(cx, |canvas, cx| canvas.duplicate_selection(cx));
+                self.run_engine_command("edit.duplicate", serde_json::json!({}), cx);
             }
             commands::Command::SelectAll => {
-                self.canvas.update(cx, |canvas, cx| canvas.select_all(cx));
+                self.run_engine_command("select.all", serde_json::json!({}), cx);
             }
             commands::Command::Rename => self.rename_selection(cx),
             commands::Command::Tool(tool) => {
-                self.canvas.update(cx, |canvas, _| canvas.set_tool(tool));
-                cx.notify();
+                self.select_engine_tool(engine_tool_name(tool), cx);
             }
             commands::Command::Nudge { direction, coarse } => {
                 self.arrow_key(direction, coarse, cx);
             }
             commands::Command::Traverse(step) => {
-                self.canvas
-                    .update(cx, |canvas, cx| canvas.traverse(step, cx));
+                // The engine's selection ladder: next/previous sibling, into the
+                // children, out to the parent. One command per rung, so the
+                // ladder is the engine's and not a second list here.
+                let id = match step {
+                    canvas::Traversal::Sibling(next) => {
+                        if next {
+                            "select.next"
+                        } else {
+                            "select.previous"
+                        }
+                    }
+                    canvas::Traversal::Descend => "select.children",
+                    canvas::Traversal::Ascend => "select.parent",
+                };
+                self.run_engine_command(id, serde_json::json!({}), cx);
             }
             commands::Command::ZoomIn => {
-                self.canvas.update(cx, |canvas, _| canvas.zoom_in());
+                self.run_engine_command("view.zoomIn", serde_json::json!({}), cx);
             }
             commands::Command::ZoomOut => {
-                self.canvas.update(cx, |canvas, _| canvas.zoom_out());
+                self.run_engine_command("view.zoomOut", serde_json::json!({}), cx);
             }
             commands::Command::ZoomToFit => {
-                self.canvas.update(cx, |canvas, _| canvas.fit_canvas());
+                self.run_engine_command("view.zoomFit", serde_json::json!({}), cx);
             }
             commands::Command::ZoomToSelection => {
-                self.canvas
-                    .update(cx, |canvas, _| canvas.zoom_to_selection());
+                self.run_engine_command("view.zoomSelection", serde_json::json!({}), cx);
             }
             commands::Command::ZoomToActualSize => {
-                self.canvas
-                    .update(cx, |canvas, _| canvas.zoom_to_actual_size());
+                self.run_engine_command("view.zoom100", serde_json::json!({}), cx);
             }
         }
         // A camera command moves no document state, so the chrome around the
@@ -802,6 +828,17 @@ impl AppShell {
         if command.is_camera() {
             cx.notify();
         }
+    }
+
+    /// Run one engine command against the session both panels share.
+    ///
+    /// The engine's commands are the operation surface. A shortcut, a menu
+    /// item, the command palette, the CLI and a future agent all dispatch
+    /// command ids, so an edit made by a key and an edit made by a click are
+    /// the same edit and land in the same history.
+    fn run_engine_command(&mut self, id: &str, params: serde_json::Value, cx: &mut Context<Self>) {
+        self.engine_canvas
+            .update(cx, |canvas, cx| canvas.run_engine_command(id, params, cx));
     }
 
     /// Open a rename on the selection — `Enter` or `F2`.

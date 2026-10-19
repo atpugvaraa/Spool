@@ -1624,6 +1624,18 @@ impl EngineCanvas {
         self.focus.is_focused(window)
     }
 
+    /// Move the camera by a screen-space amount.
+    ///
+    /// The engine's own scroll, so the camera is the session's `ViewState` and
+    /// not a second copy that could disagree with it.
+    pub fn pan_by(&mut self, dx: f32, dy: f32, cx: &mut gpui::Context<Self>) {
+        self.with_session_mut(cx, |session| {
+            if let Ok(ds) = session.ds_mut() {
+                ds.view.scroll(f64::from(dx), f64::from(dy), false);
+            }
+        });
+    }
+
     /// Run `f` with the session. The borrow cannot outlive the call.
     pub fn with_session<R>(&self, f: impl FnOnce(&Session) -> R) -> R {
         f(&self.session.borrow())

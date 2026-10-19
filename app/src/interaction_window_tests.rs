@@ -127,6 +127,154 @@ fn click_object(
     window.run_until_parked();
 }
 
+/// The engine's document nodes, in the order the engine holds them.
+///
+/// The engine is what the user edits now, so a test that wants to click
+/// something has to ask the engine where that something is.
+fn engine_nodes(
+    shell: &Entity<AppShell>,
+    window: &mut VisualTestContext,
+) -> Vec<figcraft_doc::NodeId> {
+    window.update(|_, cx| {
+        shell.read_with(cx, |shell, _| {
+            let canvas = shell.engine_canvas().read(cx);
+            canvas.with_session(|session| {
+                let Ok(doc) = session.doc() else {
+                    return Vec::new();
+                };
+                doc.nodes().map(|node| node.id).collect()
+            })
+        })
+    })
+}
+
+/// The screen point at the centre of an engine node.
+///
+/// The engine's own geometry: `node_quad` for the node's corners and
+/// `page_to_screen` for where they land on screen. Nothing here re-derives the
+/// camera.
+fn engine_node_centre(
+    shell: &Entity<AppShell>,
+    window: &mut VisualTestContext,
+    id: figcraft_doc::NodeId,
+) -> gpui::Point<gpui::Pixels> {
+    window.update(|_, cx| {
+        shell.read_with(cx, |shell, _| {
+            let canvas = shell.engine_canvas().read(cx);
+            let session = canvas.session_handle();
+            let session = session.borrow();
+            let Ok(doc) = session.doc() else {
+                panic!("the engine should have a document");
+            };
+            let quad = crate::engine::canvas::node_quad(&doc, id)
+                .unwrap_or_else(|| panic!("node {id:?} should have a quad"));
+            let centre = quad
+                .iter()
+                .fold((0.0, 0.0), |(x, y), point| (x + point.x, y + point.y));
+            let centre = (centre.0 / 4.0, centre.1 / 4.0);
+            let at = crate::engine::canvas::page_to_screen(
+                &canvas.view(),
+                canvas.viewport(),
+                centre.0,
+                centre.1,
+            );
+            gpui::Point::new(px(at.x), px(at.y))
+        })
+    })
+}
+
+/// Click an engine node, by its index in the engine's own node list.
+fn click_engine_node(
+    shell: &Entity<AppShell>,
+    window: &mut VisualTestContext,
+    index: usize,
+    modifiers: Modifiers,
+) {
+    let nodes = engine_nodes(shell, window);
+    let id = *nodes
+        .get(index)
+        .unwrap_or_else(|| panic!("the engine document should have a node at index {index}"));
+    let target = engine_node_centre(shell, window, id);
+    window.simulate_click(target, modifiers);
+    window.run_until_parked();
+}
+
+/// Put one rectangle in the engine's document, and frame the page.
+///
+/// The engine's own command, not a hand-built node: a test that assembles a
+/// document by hand would be testing a document the editor never sees. The
+/// page is then framed, because a click has to land somewhere on screen.
+fn create_engine_rectangle(
+    shell: &Entity<AppShell>,
+    window: &mut VisualTestContext,
+    x: f64,
+    y: f64,
+) {
+    window.update(|_, cx| {
+        shell.update(cx, |shell, cx| {
+            shell
+                .engine_canvas()
+                .update(cx, |canvas, cx| {
+                    canvas.run_engine_command(
+                        "node.create",
+                        serde_json::json!({
+                            "type": "rectangle",
+                            "x": x,
+                            "y": y,
+                            "width": 200.0,
+                            "height": 120.0,
+                            "name": "Rect"
+                        }),
+                        cx,
+                    );
+                    canvas.zoom_to_fit(cx);
+                });
+        });
+    });
+    window.run_until_parked();
+}
+
+/// The engine's selection.
+fn engine_selection(
+    shell: &Entity<AppShell>,
+    window: &mut VisualTestContext,
+) -> Vec<figcraft_doc::NodeId> {
+    window.update(|_, cx| {
+        shell.read_with(cx, |shell, _| shell.engine_canvas().read(cx).selection())
+    })
+}
+
+/// Whether the ENGINE canvas holds the keyboard focus.
+///
+/// The retired canvas's focus is a different question now: the canvas the user
+/// clicks is the engine's, and a shortcut only reaches the engine if the
+/// engine's canvas is the focused element.
+fn engine_canvas_holds_focus(
+    shell: &Entity<AppShell>,
+    window: &mut VisualTestContext,
+) -> bool {
+    window.update(|window, cx| {
+        shell.read_with(cx, |shell, _| {
+            shell.engine_canvas().read(cx).has_focus(window)
+        })
+    })
+}
+
+/// How many undo steps the engine's history holds.
+fn engine_undo_len(shell: &Entity<AppShell>, window: &mut VisualTestContext) -> usize {
+    window.update(|_, cx| {
+        shell.read_with(cx, |shell, _| {
+            let canvas = shell.engine_canvas().read(cx);
+            let session = canvas.session_handle();
+            let session = session.borrow();
+            session
+                .ds()
+                .map(|ds| ds.history.undo.len())
+                .unwrap_or(0)
+        })
+    })
+}
+
 /// A shell in a real window, already rendered, ready to receive events.
 ///
 /// Takes the context and returns the shell plus a reborrowable handle, because
@@ -149,7 +297,6 @@ fn open_shell(cx: &mut TestAppContext) -> (Entity<AppShell>, &mut VisualTestCont
 }
 
 #[gpui::test]
-#[ignore = "the mounted canvas is now engine::canvas::EngineCanvas, which takes input through the engine's own Session::pointer and its keymap, not through CanvasView. These tests click the canvas-viewport selector and assert on CanvasView's state, so they are testing the retired runtime. Re-pointed at the engine equivalents as part of finishing the swap -- they are ignored, NOT deleted, and the coverage they provided is genuinely missing until then."]
 fn the_shell_renders_and_lays_out_a_window(cx: &mut TestAppContext) {
     // The smallest possible proof that this facility works for Spool at all, and
     // the reason the tests below can be believed: if the real shell could not be
@@ -157,17 +304,16 @@ fn the_shell_renders_and_lays_out_a_window(cx: &mut TestAppContext) {
     // measuring nothing at all.
     let (shell, window) = open_shell(cx);
     assert!(
-        window.debug_bounds("canvas-viewport").is_some(),
-        "the canvas viewport must be laid out for a click to have anywhere to land"
+        window.debug_bounds("engine-canvas").is_some(),
+        "the engine canvas must be laid out for a click to have anywhere to land"
     );
     assert!(
-        read(&shell, window, |canvas| canvas.document_objects().len()) > 0,
-        "the starter scene should be present"
+        !engine_nodes(&shell, window).is_empty(),
+        "the engine document should be present"
     );
 }
 
 #[gpui::test]
-#[ignore = "the mounted canvas is now engine::canvas::EngineCanvas, which takes input through the engine's own Session::pointer and its keymap, not through CanvasView. These tests click the canvas-viewport selector and assert on CanvasView's state, so they are testing the retired runtime. Re-pointed at the engine equivalents as part of finishing the swap -- they are ignored, NOT deleted, and the coverage they provided is genuinely missing until then."]
 fn clicking_a_canvas_object_gives_the_canvas_keyboard_focus(cx: &mut TestAppContext) {
     // This is the whole reason editor shortcuts were dead on the canvas. GPUI
     // dispatches a key event only to the nodes on the path from the focused node
@@ -182,14 +328,15 @@ fn clicking_a_canvas_object_gives_the_canvas_keyboard_focus(cx: &mut TestAppCont
         "the canvas starts without keyboard focus"
     );
 
-    click_object(&shell, window, 0, Modifiers::none());
+    create_engine_rectangle(&shell, window, 40.0, 40.0);
+    click_engine_node(&shell, window, 1, Modifiers::none());
 
     assert!(
-        holds_focus(&shell, window),
+        engine_canvas_holds_focus(&shell, window),
         "a pointer interaction on the canvas must leave it holding keyboard focus"
     );
     assert_eq!(
-        read(&shell, window, |canvas| canvas.selection().ids().len()),
+        engine_selection(&shell, window).len(),
         1,
         "and the object under the pointer should be selected"
     );
@@ -203,63 +350,72 @@ fn clicking_a_canvas_object_gives_the_canvas_keyboard_focus(cx: &mut TestAppCont
 fn a_pressed_key_deletes_the_clicked_object(cx: &mut TestAppContext, key: &str) {
     // The full chain, driven by real events and nothing stubbed at the seams:
     //
-    //   click -> canvas takes focus -> the key event is dispatched to the shell's
-    //   on_key_down -> Command::Delete -> the same semantic deletion Layers uses
-    //   -> one history entry
+    //   click -> the engine canvas takes focus -> the key is dispatched to the
+    //   engine's keymap binding -> edit.delete -> the engine's session -> one
+    //   history entry
+    //
+    // Every step of that is the engine's. The old version of this test drove
+    // the retired runtime's own key handling, so it proved the retired runtime
+    // worked, not the editor.
     let (shell, window) = open_shell(cx);
-    let before = read(&shell, window, |canvas| canvas.document_objects().len());
+    create_engine_rectangle(&shell, window, 40.0, 40.0);
+    let before = engine_nodes(&shell, window).len();
 
-    click_object(&shell, window, 0, Modifiers::none());
+    click_engine_node(&shell, window, 1, Modifiers::none());
     assert!(
-        holds_focus(&shell, window),
-        "{key}: without focus this key would go nowhere, which is the bug"
+        engine_selection(&shell, window).len() == 1,
+        "{key}: the click should have selected something to delete"
     );
+
+    // The history BEFORE the key press, so the assertion is about what the
+    // deletion adds rather than about the total. Creating the rectangle is
+    // itself a history entry, so the total is never one.
+    let history_before = engine_undo_len(&shell, window);
 
     window.simulate_keystrokes(key);
     window.run_until_parked();
 
     assert_eq!(
-        read(&shell, window, |canvas| canvas.document_objects().len()),
+        engine_nodes(&shell, window).len(),
         before - 1,
         "{key} must remove the selected object"
     );
     assert_eq!(
-        read(&shell, window, |canvas| canvas.test_history().undo_len()),
-        1,
+        engine_undo_len(&shell, window),
+        history_before + 1,
         "{key} must record exactly one history entry"
     );
     assert_eq!(
-        read(&shell, window, |canvas| canvas.selection().ids().len()),
+        engine_selection(&shell, window).len(),
         0,
         "{key} must leave nothing selected"
     );
 }
 
 #[gpui::test]
-#[ignore = "the mounted canvas is now engine::canvas::EngineCanvas, which takes input through the engine's own Session::pointer and its keymap, not through CanvasView. These tests click the canvas-viewport selector and assert on CanvasView's state, so they are testing the retired runtime. Re-pointed at the engine equivalents as part of finishing the swap -- they are ignored, NOT deleted, and the coverage they provided is genuinely missing until then."]
 fn delete_key_removes_the_clicked_object(cx: &mut TestAppContext) {
     a_pressed_key_deletes_the_clicked_object(cx, "delete");
 }
 
 #[gpui::test]
-#[ignore = "the mounted canvas is now engine::canvas::EngineCanvas, which takes input through the engine's own Session::pointer and its keymap, not through CanvasView. These tests click the canvas-viewport selector and assert on CanvasView's state, so they are testing the retired runtime. Re-pointed at the engine equivalents as part of finishing the swap -- they are ignored, NOT deleted, and the coverage they provided is genuinely missing until then."]
 fn backspace_removes_the_clicked_object(cx: &mut TestAppContext) {
     a_pressed_key_deletes_the_clicked_object(cx, "backspace");
 }
 
 #[gpui::test]
-#[ignore = "the mounted canvas is now engine::canvas::EngineCanvas, which takes input through the engine's own Session::pointer and its keymap, not through CanvasView. These tests click the canvas-viewport selector and assert on CanvasView's state, so they are testing the retired runtime. Re-pointed at the engine equivalents as part of finishing the swap -- they are ignored, NOT deleted, and the coverage they provided is genuinely missing until then."]
 fn deleting_several_selected_objects_is_one_history_entry(cx: &mut TestAppContext) {
     // Shift-click multi-selection, because a deletion that looped per object
     // would pass every single-object test above while writing N history entries.
     let (shell, window) = open_shell(cx);
-    let before = read(&shell, window, |canvas| canvas.document_objects().len());
-    assert!(before >= 2, "this test needs two objects to select");
+    create_engine_rectangle(&shell, window, 40.0, 40.0);
+    create_engine_rectangle(&shell, window, 300.0, 40.0);
+    let before = engine_nodes(&shell, window).len();
+    let history_before = engine_undo_len(&shell, window);
 
-    click_object(&shell, window, 0, Modifiers::none());
-    click_object(&shell, window, 1, Modifiers::shift());
+    click_engine_node(&shell, window, 1, Modifiers::none());
+    click_engine_node(&shell, window, 2, Modifiers::shift());
     assert_eq!(
-        read(&shell, window, |canvas| canvas.selection().ids().len()),
+        engine_selection(&shell, window).len(),
         2,
         "shift-click should add to the selection"
     );
@@ -268,9 +424,14 @@ fn deleting_several_selected_objects_is_one_history_entry(cx: &mut TestAppContex
     window.run_until_parked();
 
     assert_eq!(
-        read(&shell, window, |canvas| canvas.document_objects().len()),
+        engine_nodes(&shell, window).len(),
         before - 2,
         "both selected objects should be gone"
+    );
+    assert_eq!(
+        engine_undo_len(&shell, window),
+        history_before + 1,
+        "deleting two objects at once is ONE history entry, not two"
     );
     assert_eq!(
         read(&shell, window, |canvas| canvas.test_history().undo_len()),
@@ -280,44 +441,40 @@ fn deleting_several_selected_objects_is_one_history_entry(cx: &mut TestAppContex
 }
 
 #[gpui::test]
-#[ignore = "the mounted canvas is now engine::canvas::EngineCanvas, which takes input through the engine's own Session::pointer and its keymap, not through CanvasView. These tests click the canvas-viewport selector and assert on CanvasView's state, so they are testing the retired runtime. Re-pointed at the engine equivalents as part of finishing the swap -- they are ignored, NOT deleted, and the coverage they provided is genuinely missing until then."]
 fn undo_and_redo_restore_and_reapply_a_keyboard_deletion(cx: &mut TestAppContext) {
     // Undo and redo are key-driven too, so they travel the same dispatch path and
     // are only as reachable as Delete was. Asserting Delete without these would
     // leave half the history contract unproven on the canvas.
     let (shell, window) = open_shell(cx);
-    let before = read(&shell, window, |canvas| canvas.document_objects().len());
-    let identity = read(&shell, window, |canvas| {
-        canvas.document_objects()[0].spool_id.clone()
-    });
+    create_engine_rectangle(&shell, window, 40.0, 40.0);
+    let before = engine_nodes(&shell, window).len();
+    // The engine's node id IS the identity: the engine's document was compiled
+    // from the manifest, and the manifest's node id is the engine's NodeId.
+    // So undo bringing back the same id is the same object coming back, not a
+    // look-alike.
+    let identity = engine_nodes(&shell, window)[1];
 
-    click_object(&shell, window, 0, Modifiers::none());
+    click_engine_node(&shell, window, 1, Modifiers::none());
     window.simulate_keystrokes("delete");
     window.run_until_parked();
-    assert_eq!(
-        read(&shell, window, |canvas| canvas.document_objects().len()),
-        before - 1
-    );
+    assert_eq!(engine_nodes(&shell, window).len(), before - 1);
 
     window.simulate_keystrokes(UNDO);
     window.run_until_parked();
     assert_eq!(
-        read(&shell, window, |canvas| canvas.document_objects().len()),
+        engine_nodes(&shell, window).len(),
         before,
         "undo must put the object back"
     );
     assert!(
-        read(&shell, window, |canvas| canvas
-            .document_objects()
-            .iter()
-            .any(|object| object.spool_id == identity)),
-        "and bring back the same authored identity, not a new object"
+        engine_nodes(&shell, window).contains(&identity),
+        "and bring back the same node, not a new one"
     );
 
     window.simulate_keystrokes(REDO);
     window.run_until_parked();
     assert_eq!(
-        read(&shell, window, |canvas| canvas.document_objects().len()),
+        engine_nodes(&shell, window).len(),
         before - 1,
         "redo must delete it again"
     );
@@ -1169,3 +1326,4 @@ fn a_refused_rename_is_reported_in_the_status_line(cx: &mut TestAppContext) {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
