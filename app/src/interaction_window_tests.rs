@@ -251,15 +251,53 @@ fn empty_engine_point(
             let Ok(doc) = session.doc() else {
                 panic!("the engine should have a document");
             };
-            let page = doc.current_page.expect("the engine's page");
-            let bounds = doc.world_bounds(page).expect("the page should have bounds");
+            let _ = doc;
+            // The page's own origin. The view's centre is the page's origin by
+            // default, so this is the middle of the canvas -- and on an empty
+            // page it is empty space, which is what a creation test needs.
             let at = crate::engine::canvas::page_to_screen(
                 &canvas.view(),
                 canvas.viewport(),
-                bounds.x0 + 8.0,
-                bounds.y0 + 8.0,
+                0.0,
+                0.0,
             );
             gpui::Point::new(px(at.x), px(at.y))
+        })
+    })
+}
+
+/// The characters of a text node in the engine's document.
+fn engine_text_of(
+    shell: &Entity<AppShell>,
+    window: &mut VisualTestContext,
+    id: figcraft_doc::NodeId,
+) -> Option<String> {
+    window.update(|_, cx| {
+        shell.read_with(cx, |shell, _| {
+            let canvas = shell.engine_canvas().read(cx);
+            canvas.with_session(|session| {
+                let doc = session.doc().ok()?;
+                let node = doc.node(id)?;
+                node.kind.text().map(|text| text.characters.clone())
+            })
+        })
+    })
+}
+
+/// The characters of the last text node in the engine's document.
+fn engine_last_text(
+    shell: &Entity<AppShell>,
+    window: &mut VisualTestContext,
+) -> Option<String> {
+    window.update(|_, cx| {
+        shell.read_with(cx, |shell, _| {
+            let canvas = shell.engine_canvas().read(cx);
+            canvas.with_session(|session| {
+                let doc = session.doc().ok()?;
+                doc.nodes()
+                    .filter_map(|node| node.kind.text().map(|text| text.characters.clone()))
+                    .last()
+            })
         })
     })
 }
@@ -651,7 +689,6 @@ fn last_text(shell: &Entity<AppShell>, window: &mut VisualTestContext) -> Option
 }
 
 #[gpui::test]
-#[ignore = "the mounted canvas is now engine::canvas::EngineCanvas, which takes input through the engine's own Session::pointer and its keymap, not through CanvasView. These tests click the canvas-viewport selector and assert on CanvasView's state, so they are testing the retired runtime. Re-pointed at the engine equivalents as part of finishing the swap -- they are ignored, NOT deleted, and the coverage they provided is genuinely missing until then."]
 fn a_text_tool_click_opens_a_session_and_hands_the_tool_back(cx: &mut TestAppContext) {
     // The handover, end to end. Both halves matter and they are adjacent: if the
     // tool changed before the pointer-up handler ran, the handler would not
@@ -660,36 +697,40 @@ fn a_text_tool_click_opens_a_session_and_hands_the_tool_back(cx: &mut TestAppCon
     // edit and the session would close again the instant it opened.
     let (shell, window) = open_shell(cx);
     choose_tool(window, "Text");
-    let before = read(&shell, window, |canvas| canvas.document_objects().len());
-    let undo_before = read(&shell, window, |canvas| canvas.test_history().undo_len());
+    let before = engine_nodes(&shell, window).len();
+    let undo_before = engine_undo_len(&shell, window);
 
-    let spot = empty_canvas_point(&shell, window);
+    let spot = empty_engine_point(&shell, window);
     window.simulate_click(spot, Modifiers::none());
     window.run_until_parked();
 
     assert_eq!(
-        read(&shell, window, |canvas| canvas.document_objects().len()),
+        engine_nodes(&shell, window).len(),
         before + 1,
         "a Text-tool click should create a text object"
     );
     assert_eq!(
-        read(&shell, window, |canvas| canvas.selection().ids().len()),
+        engine_selection(&shell, window).len(),
         1,
         "and select it"
     );
     assert!(
-        read(&shell, window, |canvas| canvas.is_text_editing()),
+        engine_is_editing_text(&shell, window),
         "and open a session on it, so the caret can be typed into"
     );
     assert_eq!(
-        read(&shell, window, |canvas| canvas.tool()),
-        crate::canvas::Tool::Select,
+        read_engine_tool(&shell, window),
+        "move",
         "the creation is over, so the tool goes back to Selection"
     );
+    // NOT a history entry yet, and that is the engine's semantics rather than
+    // a gap: a text object created by an open session is part of that session,
+    // and the engine deletes it if the session is left empty. The creation is
+    // committed -- as ONE entry -- when the session ends.
     assert_eq!(
-        read(&shell, window, |canvas| canvas.test_history().undo_len()),
-        undo_before + 1,
-        "and the whole thing is one history entry"
+        engine_undo_len(&shell, window),
+        undo_before,
+        "the text session is still open, so the creation is not committed yet"
     );
 }
 
