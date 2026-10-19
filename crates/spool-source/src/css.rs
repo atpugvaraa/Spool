@@ -723,6 +723,118 @@ impl RankedValue {
     }
 }
 
+/// The winners of a cascade across several stylesheets.
+///
+/// One implementation of the cross-stylesheet ranking, used by everything that
+/// has to know which sheet decided a value: the reader, which compiles the
+/// project, and the editor's writer, which has to find the authored span that
+/// produced the value the editor is drawing.
+///
+/// A project has more than one stylesheet, and a declaration in one of them
+/// may or may not be the one that decides what an element looks like. Deciding
+/// that is a *ranking*, and a ranking that exists twice is two answers to one
+/// question: the reader resolves the value an element is drawn with, and the
+/// writer has to find the authored span that produced it. If the two
+/// disagreed, a save would rewrite a declaration that had already lost, and the
+/// file on disk would end up naming a different owner for the value than the
+/// editor had been drawing. Nothing about the result would look wrong.
+///
+/// # The order
+///
+/// Three criteria, in the order a browser applies them:
+///
+/// 1. **selector specificity** — an `#id` beats a `.class` beats a type,
+/// 2. **which stylesheet the document links the declaration from**, and
+/// 3. **author order inside that stylesheet**.
+///
+/// Link order is the *last* tie-break rather than an override. Ranking on link
+/// order alone lets a later `.theme` beat an earlier `#hero`, which is a value
+/// the author never asked for and which nothing about the result would reveal
+/// as wrong.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Cascade {
+    by_property: BTreeMap<String, CascadeWinner>,
+}
+
+/// One declaration that won a property, and the numbers that ranked it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CascadeWinner {
+    /// The specificity of the rule the winning declaration was authored under.
+    pub specificity: u32,
+    /// The index of the stylesheet the declaration came from.
+    ///
+    /// The stylesheet's place in the document's link order, which is the second
+    /// tie-break.
+    pub sheet: usize,
+    /// The author order of the winning declaration inside that stylesheet.
+    pub order: usize,
+    /// The value, with `var()` references substituted.
+    pub value: String,
+}
+
+impl Cascade {
+    /// Consider one declaration for one property.
+    ///
+    /// `sheet` is the stylesheet's index in the document's link order, and
+    /// `resolved` is what [`Stylesheet::resolve_ranked`] reported for it. The
+    /// declaration is kept if it outranks the incumbent.
+    ///
+    /// A tie cannot happen across sheets: `order` is unique within a sheet and
+    /// `sheet` separates them, so exactly one declaration wins each property.
+    pub fn consider(&mut self, property: &str, sheet: usize, resolved: &RankedValue) {
+        let candidate = CascadeWinner {
+            specificity: resolved.specificity,
+            sheet,
+            order: resolved.order,
+            value: resolved.value.clone(),
+        };
+        match self.by_property.get(property) {
+            Some(current) if current.rank() >= candidate.rank() => {}
+            _ => {
+                self.by_property.insert(property.to_owned(), candidate);
+            }
+        }
+    }
+
+    /// Which stylesheet owns `property`, by its index in the cascade.
+    ///
+    /// `None` when no sheet declared it.
+    pub fn sheet_of(&self, property: &str) -> Option<usize> {
+        self.by_property.get(property).map(|winner| winner.sheet)
+    }
+
+    /// The value that won `property`.
+    pub fn value_of(&self, property: &str) -> Option<&str> {
+        self.by_property
+            .get(property)
+            .map(|winner| winner.value.as_str())
+    }
+
+    /// Every property that was won, and the winner.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &CascadeWinner)> {
+        self.by_property
+            .iter()
+            .map(|(property, winner)| (property.as_str(), winner))
+    }
+
+    /// How many properties were won.
+    pub fn len(&self) -> usize {
+        self.by_property.len()
+    }
+
+    /// Whether nothing was won.
+    pub fn is_empty(&self) -> bool {
+        self.by_property.is_empty()
+    }
+}
+
+impl CascadeWinner {
+    /// The comparable rank, for deciding whether this beats the incumbent.
+    fn rank(&self) -> (u32, usize, usize) {
+        (self.specificity, self.sheet, self.order)
+    }
+}
+
 /// The computed longhands a matching `!important` declaration names.
 ///
 /// A report, not a result: see [`Stylesheet::important_properties`].
@@ -1089,7 +1201,12 @@ mod tests {
 
     /// The authored bytes the cascade says won `property`, sliced back out of
     /// the stylesheet it was parsed from.
-    fn winning_text<'a>(source: &'a str, sheet: &Stylesheet, selector: (&str, &[&str], Option<&str>), property: &str) -> &'a str {
+    fn winning_text<'a>(
+        source: &'a str,
+        sheet: &Stylesheet,
+        selector: (&str, &[&str], Option<&str>),
+        property: &str,
+    ) -> &'a str {
         let (tag, classes, id) = selector;
         let range = sheet
             .declaration_value_range(tag, &owned(classes), id, property)
@@ -1271,7 +1388,10 @@ mod tests {
             .declaration_value_range("a", &owned(&["cta"]), None, "color")
             .expect("color wins");
         assert_eq!(&source[color.clone()], "#ffffff");
-        assert!(color.start > range.end, "the later declaration starts after it");
+        assert!(
+            color.start > range.end,
+            "the later declaration starts after it"
+        );
     }
 
     #[test]
@@ -1311,11 +1431,7 @@ mod tests {
                         "the span and the value must be the same authored bytes"
                     );
                 }
-                for classes in [
-                    owned(&["a\u{00E9}", "b"]),
-                    owned(&["a"]),
-                    Vec::new(),
-                ] {
+                for classes in [owned(&["a\u{00E9}", "b"]), owned(&["a"]), Vec::new()] {
                     let resolved = sheet.resolve("div", &classes, Some("\u{1F600}"));
                     for (_, entry) in resolved.iter() {
                         assert!(
@@ -1474,7 +1590,10 @@ mod tests {
         );
         // Equal specificity falls back to author order.
         let tie = "a { color: #ff0000; }\na { color: #0000ff; }\n";
-        assert_eq!(resolved_for(tie, "a", &[], None).value("color"), Some("#0000ff"));
+        assert_eq!(
+            resolved_for(tie, "a", &[], None).value("color"),
+            Some("#0000ff")
+        );
     }
 
     #[test]
@@ -1537,7 +1656,10 @@ mod tests {
     fn a_combinator_selector_is_out_of_scope_and_skipped() {
         // `.card .cta` needs a descendant combinator, which this cascade does
         // not implement. It must not be treated as if it were `.cta`.
-        for source in [".card .cta { color: #ff0000; }", ".card>.cta { color: #ff0000; }"] {
+        for source in [
+            ".card .cta { color: #ff0000; }",
+            ".card>.cta { color: #ff0000; }",
+        ] {
             assert!(
                 resolved_for(source, "a", &["cta"], None).is_empty(),
                 "{source} must not silently apply to the child"
@@ -1803,7 +1925,9 @@ mod tests {
         let cyclic = ":root { --a: var(--b); --b: var(--a); }\n.x { color: var(--a); }";
         let resolved = Stylesheet::parse(cyclic).resolve("div", &owned(&["x"]), None);
         assert!(
-            resolved.value("color").is_some_and(|value| value.starts_with("var(")),
+            resolved
+                .value("color")
+                .is_some_and(|value| value.starts_with("var(")),
             "an unresolvable chain is left visibly wrong, not invented"
         );
 
@@ -1839,7 +1963,10 @@ mod tests {
     fn the_final_declaration_without_a_semicolon_is_still_read() {
         let source = ".cta { color: #ffffff }";
         let sheet = Stylesheet::parse(source);
-        assert_eq!(sheet.resolve("a", &owned(&["cta"]), None).value("color"), Some("#ffffff"));
+        assert_eq!(
+            sheet.resolve("a", &owned(&["cta"]), None).value("color"),
+            Some("#ffffff")
+        );
         assert_eq!(
             winning_text(source, &sheet, ("a", &["cta"], None), "color"),
             "#ffffff"

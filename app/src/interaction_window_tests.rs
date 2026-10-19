@@ -32,7 +32,6 @@ use std::sync::OnceLock;
 
 use gpui::{point, px, size, Entity, IntoElement, Modifiers, TestAppContext, VisualTestContext};
 
-use crate::canvas::CanvasView;
 use crate::shell::AppShell;
 
 /// The size the real app opens at.
@@ -57,53 +56,11 @@ fn redraw(shell: &Entity<AppShell>, window: &mut VisualTestContext) {
     window.run_until_parked();
 }
 
-/// Read one value out of the canvas, from outside its module.
-fn read<R>(
-    shell: &Entity<AppShell>,
-    window: &mut VisualTestContext,
-    f: impl Fn(&CanvasView) -> R,
-) -> R {
-    window.update(|_, cx| shell.read_with(cx, |shell, _| f(shell.canvas().read(cx))))
-}
-
 /// The engine's tool in effect.
 ///
-/// The toolbar drives the engine, so the toolbar's answer is the engine's. The
-/// retired canvas keeps its own tool state and is not what the user is editing.
+/// The toolbar drives the engine, so the toolbar's answer is the engine's.
 fn read_engine_tool(shell: &Entity<AppShell>, window: &mut VisualTestContext) -> &'static str {
     window.update(|_, cx| shell.read_with(cx, |shell, _| shell.test_engine_tool(cx)))
-}
-
-/// Whether the canvas holds keyboard focus right now.
-///
-/// Separate from `read` because it needs the `Window`, which only exists inside
-/// `VisualTestContext::update`.
-fn holds_focus(shell: &Entity<AppShell>, window: &mut VisualTestContext) -> bool {
-    window.update(|window, cx| {
-        shell.read_with(cx, |shell, _| {
-            shell.canvas().read(cx).holds_keyboard_focus(window)
-        })
-    })
-}
-
-/// A window-coordinate point that lands on the middle of an object.
-///
-/// Derived from the camera rather than written down. A hard-coded coordinate
-/// stops pointing at its object the moment the layout, zoom, or starter scene
-/// changes, and the test then goes on passing while clicking empty canvas —
-/// which is the worst way for a test like this to fail.
-fn centre_of(
-    shell: &Entity<AppShell>,
-    window: &mut VisualTestContext,
-    index: usize,
-) -> gpui::Point<gpui::Pixels> {
-    let origin = window
-        .debug_bounds("canvas-viewport")
-        .expect("the canvas viewport should have been laid out")
-        .origin;
-    let local = read(shell, window, |canvas| canvas.object_screen_center(index))
-        .unwrap_or_else(|| panic!("the starter scene should have an object at index {index}"));
-    origin + gpui::Point::new(px(local.x), px(local.y))
 }
 
 /// Keystroke spelling note, since it is easy to get wrong.
@@ -114,18 +71,6 @@ fn centre_of(
 /// bindings in `main.rs` use hyphens for the same reason.
 const UNDO: &str = "cmd-z";
 const REDO: &str = "cmd-shift-z";
-
-/// Click the middle of an object, then let the app settle.
-fn click_object(
-    shell: &Entity<AppShell>,
-    window: &mut VisualTestContext,
-    index: usize,
-    modifiers: Modifiers,
-) {
-    let target = centre_of(shell, window, index);
-    window.simulate_click(target, modifiers);
-    window.run_until_parked();
-}
 
 /// The engine's document nodes, in the order the engine holds them.
 ///
@@ -212,23 +157,21 @@ fn create_engine_rectangle(
 ) {
     window.update(|_, cx| {
         shell.update(cx, |shell, cx| {
-            shell
-                .engine_canvas()
-                .update(cx, |canvas, cx| {
-                    canvas.run_engine_command(
-                        "node.create",
-                        serde_json::json!({
-                            "type": "rectangle",
-                            "x": x,
-                            "y": y,
-                            "width": 200.0,
-                            "height": 120.0,
-                            "name": "Rect"
-                        }),
-                        cx,
-                    );
-                    canvas.zoom_to_fit(cx);
-                });
+            shell.engine_canvas().update(cx, |canvas, cx| {
+                canvas.run_engine_command(
+                    "node.create",
+                    serde_json::json!({
+                        "type": "rectangle",
+                        "x": x,
+                        "y": y,
+                        "width": 200.0,
+                        "height": 120.0,
+                        "name": "Rect"
+                    }),
+                    cx,
+                );
+                canvas.zoom_to_fit(cx);
+            });
         });
     });
     window.run_until_parked();
@@ -255,40 +198,15 @@ fn empty_engine_point(
             // The page's own origin. The view's centre is the page's origin by
             // default, so this is the middle of the canvas -- and on an empty
             // page it is empty space, which is what a creation test needs.
-            let at = crate::engine::canvas::page_to_screen(
-                &canvas.view(),
-                canvas.viewport(),
-                0.0,
-                0.0,
-            );
+            let at =
+                crate::engine::canvas::page_to_screen(&canvas.view(), canvas.viewport(), 0.0, 0.0);
             gpui::Point::new(px(at.x), px(at.y))
         })
     })
 }
 
-/// The characters of a text node in the engine's document.
-fn engine_text_of(
-    shell: &Entity<AppShell>,
-    window: &mut VisualTestContext,
-    id: figcraft_doc::NodeId,
-) -> Option<String> {
-    window.update(|_, cx| {
-        shell.read_with(cx, |shell, _| {
-            let canvas = shell.engine_canvas().read(cx);
-            canvas.with_session(|session| {
-                let doc = session.doc().ok()?;
-                let node = doc.node(id)?;
-                node.kind.text().map(|text| text.characters.clone())
-            })
-        })
-    })
-}
-
 /// The characters of the last text node in the engine's document.
-fn engine_last_text(
-    shell: &Entity<AppShell>,
-    window: &mut VisualTestContext,
-) -> Option<String> {
+fn engine_last_text(shell: &Entity<AppShell>, window: &mut VisualTestContext) -> Option<String> {
     window.update(|_, cx| {
         shell.read_with(cx, |shell, _| {
             let canvas = shell.engine_canvas().read(cx);
@@ -302,11 +220,25 @@ fn engine_last_text(
     })
 }
 
+/// The characters of every text node in the engine's document.
+fn engine_texts(shell: &Entity<AppShell>, window: &mut VisualTestContext) -> Vec<String> {
+    window.update(|_, cx| {
+        shell.read_with(cx, |shell, _| {
+            let canvas = shell.engine_canvas().read(cx);
+            canvas.with_session(|session| {
+                let Ok(doc) = session.doc() else {
+                    return Vec::new();
+                };
+                doc.nodes()
+                    .filter_map(|node| node.kind.text().map(|text| text.characters.clone()))
+                    .collect()
+            })
+        })
+    })
+}
+
 /// Whether the engine is editing text.
-fn engine_is_editing_text(
-    shell: &Entity<AppShell>,
-    window: &mut VisualTestContext,
-) -> bool {
+fn engine_is_editing_text(shell: &Entity<AppShell>, window: &mut VisualTestContext) -> bool {
     window.update(|_, cx| {
         shell.read_with(cx, |shell, _| {
             shell.engine_canvas().read(cx).is_editing_text()
@@ -319,9 +251,8 @@ fn engine_selection(
     shell: &Entity<AppShell>,
     window: &mut VisualTestContext,
 ) -> Vec<figcraft_doc::NodeId> {
-    window.update(|_, cx| {
-        shell.read_with(cx, |shell, _| shell.engine_canvas().read(cx).selection())
-    })
+    window
+        .update(|_, cx| shell.read_with(cx, |shell, _| shell.engine_canvas().read(cx).selection()))
 }
 
 /// Whether the ENGINE canvas holds the keyboard focus.
@@ -329,10 +260,7 @@ fn engine_selection(
 /// The retired canvas's focus is a different question now: the canvas the user
 /// clicks is the engine's, and a shortcut only reaches the engine if the
 /// engine's canvas is the focused element.
-fn engine_canvas_holds_focus(
-    shell: &Entity<AppShell>,
-    window: &mut VisualTestContext,
-) -> bool {
+fn engine_canvas_holds_focus(shell: &Entity<AppShell>, window: &mut VisualTestContext) -> bool {
     window.update(|window, cx| {
         shell.read_with(cx, |shell, _| {
             shell.engine_canvas().read(cx).has_focus(window)
@@ -347,10 +275,7 @@ fn engine_undo_len(shell: &Entity<AppShell>, window: &mut VisualTestContext) -> 
             let canvas = shell.engine_canvas().read(cx);
             let session = canvas.session_handle();
             let session = session.borrow();
-            session
-                .ds()
-                .map(|ds| ds.history.undo.len())
-                .unwrap_or(0)
+            session.ds().map(|ds| ds.history.undo.len()).unwrap_or(0)
         })
     })
 }
@@ -404,7 +329,7 @@ fn clicking_a_canvas_object_gives_the_canvas_keyboard_focus(cx: &mut TestAppCont
     let (shell, window) = open_shell(cx);
 
     assert!(
-        !holds_focus(&shell, window),
+        !engine_canvas_holds_focus(&shell, window),
         "the canvas starts without keyboard focus"
     );
 
@@ -562,72 +487,14 @@ fn undo_and_redo_restore_and_reapply_a_keyboard_deletion(cx: &mut TestAppContext
 // selected, and the session it opens has to survive the tool changing
 // immediately afterwards.
 
-/// A point on empty canvas, far enough from everything that a click lands on no
-/// object.
-///
-/// Found by scanning the viewport in screen space, not by writing a coordinate
-/// down and not by scanning the world: a fixed point stops being empty the first
-/// time the starter scene changes, and a world-space scan happily returns points
-/// that are nowhere on screen, so the click lands on the shell instead of the
-/// canvas. Screen space is the only frame in which "somewhere empty on the canvas"
-/// is a question with an answer.
-fn empty_canvas_point(
-    shell: &Entity<AppShell>,
-    window: &mut VisualTestContext,
-) -> gpui::Point<gpui::Pixels> {
-    let bounds = window
-        .debug_bounds("canvas-viewport")
-        .expect("the canvas viewport should have been laid out");
-    let width = bounds.size.width;
-    let height = bounds.size.height;
-
-    let found = read(shell, window, |canvas| {
-        let objects: Vec<(gpui::Point<f32>, gpui::Size<f32>)> = canvas
-            .document_objects()
-            .iter()
-            .map(|object| {
-                (
-                    canvas.world_to_canvas_screen(object.position),
-                    gpui::size(object.size.width, object.size.height),
-                )
-            })
-            .collect();
-        let step = 25.0_f32;
-        let (limit_x, limit_y) = (f32::from(width), f32::from(height));
-        let mut x = step;
-        while x < limit_x - step {
-            let mut y = step;
-            while y < limit_y - step {
-                let candidate = gpui::point(x, y);
-                // A margin, so the click cannot land on an edge.
-                let clear = objects.iter().all(|(origin, extent)| {
-                    !(candidate.x > origin.x - 20.0
-                        && candidate.x < origin.x + extent.width + 20.0
-                        && candidate.y > origin.y - 20.0
-                        && candidate.y < origin.y + extent.height + 20.0)
-                });
-                if clear {
-                    return Some(candidate);
-                }
-                y += step;
-            }
-            x += step;
-        }
-        None
-    })
-    .expect("the scene should leave some empty canvas");
-    bounds.origin + gpui::Point::new(px(found.x), px(found.y))
-}
-
 /// Every tool the toolbar renders, with the label a test can click by.
 ///
 /// The selector strings are built once and deliberately leaked: `debug_bounds`
 /// takes a `&'static str`, and a handful of short strings held for the life of
 /// the test process is a smaller cost than threading a lifetime through every
 /// helper that has to name a button.
-fn toolbar_tools() -> &'static [(&'static str, crate::canvas::Tool, &'static str)] {
-    static TOOLS: OnceLock<Vec<(&'static str, crate::canvas::Tool, &'static str)>> =
-        OnceLock::new();
+fn toolbar_tools() -> &'static [(&'static str, crate::tools::Tool, &'static str)] {
+    static TOOLS: OnceLock<Vec<(&'static str, crate::tools::Tool, &'static str)>> = OnceLock::new();
     TOOLS.get_or_init(|| {
         crate::shell::TOOLS
             .iter()
@@ -678,16 +545,6 @@ fn flush_frame(window: &mut VisualTestContext, at: &gpui::Point<gpui::Pixels>) {
     window.run_until_parked();
 }
 
-/// The text of the most recently created object, if it is a Text.
-fn last_text(shell: &Entity<AppShell>, window: &mut VisualTestContext) -> Option<String> {
-    read(shell, window, |canvas| {
-        canvas
-            .document_objects()
-            .last()
-            .and_then(|object| object.text_content.clone())
-    })
-}
-
 #[gpui::test]
 fn a_text_tool_click_opens_a_session_and_hands_the_tool_back(cx: &mut TestAppContext) {
     // The handover, end to end. Both halves matter and they are adjacent: if the
@@ -709,11 +566,7 @@ fn a_text_tool_click_opens_a_session_and_hands_the_tool_back(cx: &mut TestAppCon
         before + 1,
         "a Text-tool click should create a text object"
     );
-    assert_eq!(
-        engine_selection(&shell, window).len(),
-        1,
-        "and select it"
-    );
+    assert_eq!(engine_selection(&shell, window).len(), 1, "and select it");
     assert!(
         engine_is_editing_text(&shell, window),
         "and open a session on it, so the caret can be typed into"
@@ -735,59 +588,42 @@ fn a_text_tool_click_opens_a_session_and_hands_the_tool_back(cx: &mut TestAppCon
 }
 
 #[gpui::test]
-#[ignore = "the mounted canvas is now engine::canvas::EngineCanvas, which takes input through the engine's own Session::pointer and its keymap, not through CanvasView. These tests click the canvas-viewport selector and assert on CanvasView's state, so they are testing the retired runtime. Re-pointed at the engine equivalents as part of finishing the swap -- they are ignored, NOT deleted, and the coverage they provided is genuinely missing until then."]
+#[ignore = "the engine's text session writes into the node as you type, so the first half of this test -- that typing edits the session and not the document -- has no counterpart; and GPUI's test harness delivers every keystroke twice (the key event, and the character input the window synthesises from it), so the typed text comes out doubled and asserting either form would assert a defect rather than a behaviour. Kept, NOT deleted: the coverage it provided is genuinely missing until the canvas consumes a character exactly once."]
 fn typing_after_a_text_click_is_committed_when_the_session_ends(cx: &mut TestAppContext) {
-    // Typing does not write to the object: it edits the session's buffer, and the
-    // object changes when the session ends. Both halves are asserted, because
-    // only checking the object would pass with a session that silently threw
-    // every keystroke away, and only checking the session would pass with text
-    // that never reached the document.
-    //
-    // The caret lands at the end of the placeholder text a new Text object is
-    // created with, so typed characters append to it.
+    // Typing reaches the object, and ending the session is what commits it to
+    // the history.
     let (shell, window) = open_shell(cx);
     choose_tool(window, "Text");
 
-    let spot = empty_canvas_point(&shell, window);
+    let spot = empty_engine_point(&shell, window);
     window.simulate_click(spot, Modifiers::none());
     window.run_until_parked();
     flush_frame(window, &spot);
 
-    let undo_before_typing = read(&shell, window, |canvas| canvas.test_history().undo_len());
+    let undo_before_typing = engine_undo_len(&shell, window);
     window.simulate_input("Hello");
     window.run_until_parked();
-    assert_eq!(
-        last_text(&shell, window).as_deref(),
-        Some("Type something"),
-        "typing edits the open session, not the document yet"
-    );
-    assert_eq!(
-        read(&shell, window, |canvas| canvas.test_history().undo_len()),
-        undo_before_typing,
-        "and records nothing while the session is open"
+    assert!(
+        engine_last_text(&shell, window).is_some(),
+        "typing reaches the object the session opened"
     );
 
-    // Click an existing object, which ends the session.
-    click_object(&shell, window, 0, Modifiers::none());
+    // Click another object, which ends the session.
+    click_engine_node(&shell, window, 0, Modifiers::none());
 
     assert!(
-        !read(&shell, window, |canvas| canvas.is_text_editing()),
+        !engine_is_editing_text(&shell, window),
         "clicking away should end the session"
     );
     assert_eq!(
-        last_text(&shell, window).as_deref(),
-        Some("Type somethingHello"),
-        "and the typed text should have been committed to the object"
-    );
-    assert_eq!(
-        read(&shell, window, |canvas| canvas.test_history().undo_len()),
+        engine_undo_len(&shell, window),
         undo_before_typing + 1,
         "committing the session is its own history entry"
     );
 }
 
 #[gpui::test]
-#[ignore = "the mounted canvas is now engine::canvas::EngineCanvas, which takes input through the engine's own Session::pointer and its keymap, not through CanvasView. These tests click the canvas-viewport selector and assert on CanvasView's state, so they are testing the retired runtime. Re-pointed at the engine equivalents as part of finishing the swap -- they are ignored, NOT deleted, and the coverage they provided is genuinely missing until then."]
+#[ignore = "the engine's text session writes into the node as you type, so there is nothing for Escape to discard: the engine's cancel gives up the caret, not the characters, and this test's assertion -- that what was typed is thrown away -- has no counterpart. Kept, NOT deleted: the coverage it provided is genuinely missing until the engine's text session can be cancelled."]
 fn escape_discards_a_text_session_and_leaves_the_object_alone(cx: &mut TestAppContext) {
     // The other end of the session: Escape is a cancel, not a commit. Asserted
     // through the real event path so that the rung that answers it — the text
@@ -795,28 +631,23 @@ fn escape_discards_a_text_session_and_leaves_the_object_alone(cx: &mut TestAppCo
     let (shell, window) = open_shell(cx);
     choose_tool(window, "Text");
 
-    let spot = empty_canvas_point(&shell, window);
+    let spot = empty_engine_point(&shell, window);
     window.simulate_click(spot, Modifiers::none());
     window.run_until_parked();
     flush_frame(window, &spot);
     window.simulate_input("Hello");
     window.run_until_parked();
 
-    let undo_before = read(&shell, window, |canvas| canvas.test_history().undo_len());
+    let undo_before = engine_undo_len(&shell, window);
     window.simulate_keystrokes("escape");
     window.run_until_parked();
 
     assert!(
-        !read(&shell, window, |canvas| canvas.is_text_editing()),
+        !engine_is_editing_text(&shell, window),
         "Escape should end the session"
     );
     assert_eq!(
-        last_text(&shell, window).as_deref(),
-        Some("Type something"),
-        "and discard what was typed rather than commit it"
-    );
-    assert_eq!(
-        read(&shell, window, |canvas| canvas.test_history().undo_len()),
+        engine_undo_len(&shell, window),
         undo_before,
         "a discarded session is not a history entry"
     );
@@ -948,7 +779,6 @@ fn a_successful_creation_returns_the_toolbar_to_selection(cx: &mut TestAppContex
 }
 
 #[gpui::test]
-#[ignore = "the mounted canvas is now engine::canvas::EngineCanvas, which takes input through the engine's own Session::pointer and its keymap, not through CanvasView. These tests click the canvas-viewport selector and assert on CanvasView's state, so they are testing the retired runtime. Re-pointed at the engine equivalents as part of finishing the swap -- they are ignored, NOT deleted, and the coverage they provided is genuinely missing until then."]
 fn the_text_handover_leaves_the_toolbar_on_selection(cx: &mut TestAppContext) {
     // The Text case is separate because it changes tool by a different route:
     // the session opens first and the tool changes after, so the toolbar could
@@ -956,12 +786,12 @@ fn the_text_handover_leaves_the_toolbar_on_selection(cx: &mut TestAppContext) {
     let (shell, window) = open_shell(cx);
     choose_tool(window, "Text");
 
-    let spot = empty_canvas_point(&shell, window);
+    let spot = empty_engine_point(&shell, window);
     window.simulate_click(spot, Modifiers::none());
     window.run_until_parked();
 
     assert!(
-        read(&shell, window, |canvas| canvas.is_text_editing()),
+        engine_is_editing_text(&shell, window),
         "precondition: a session is open"
     );
     assert_eq!(
@@ -1073,19 +903,29 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The identities of the objects the canvas is holding.
-fn identities(shell: &Entity<AppShell>, window: &mut VisualTestContext) -> Vec<String> {
-    read(shell, window, |canvas| {
-        canvas
-            .document_objects()
-            .iter()
-            .map(|object| object.spool_id.as_str().to_owned())
-            .collect()
+/// The identities of the nodes the engine is holding.
+///
+/// The engine's node id is the manifest's numeric id, so it is the one
+/// identity that survives a save and a reopen.
+fn identities(shell: &Entity<AppShell>, window: &mut VisualTestContext) -> Vec<u64> {
+    window.update(|_, cx| {
+        shell.read_with(cx, |shell, _| {
+            let canvas = shell.engine_canvas().read(cx);
+            canvas.with_session(|session| {
+                let Ok(doc) = session.doc() else {
+                    return Vec::new();
+                };
+                doc.nodes()
+                    .filter(|node| !matches!(node.kind, figcraft_doc::NodeKind::Page { .. }))
+                    .map(|node| node.id.0)
+                    .collect()
+            })
+        })
     })
 }
 
 #[gpui::test]
-#[ignore = "the mounted canvas is now engine::canvas::EngineCanvas, which takes input through the engine's own Session::pointer and its keymap, not through CanvasView. These tests click the canvas-viewport selector and assert on CanvasView's state, so they are testing the retired runtime. Re-pointed at the engine equivalents as part of finishing the swap -- they are ignored, NOT deleted, and the coverage they provided is genuinely missing until then."]
+#[ignore = "the engine's save path reports a node the manifest does not describe as unsupported -- \"not in lamine.yaml, so it has no source binding and nowhere to be authored\" -- so an object the editor created cannot be put in the source, and the create -> save -> delete -> save -> reopen chain this test is about cannot be run end to end. The fixture also compiles to zero-sized nodes under the engine (the authored CSS gives the frame no width or height), so there is nothing to click. Kept, NOT deleted: the coverage it provided is genuinely missing until the engine can author a created object."]
 fn a_keyboard_deletion_survives_a_save_and_a_reopen(cx: &mut TestAppContext) {
     // The chain, all of it through real events and real files:
     //
@@ -1111,12 +951,12 @@ fn a_keyboard_deletion_survives_a_save_and_a_reopen(cx: &mut TestAppContext) {
     // "the thing I just made is already selected" is both simpler and closer to
     // what a person would actually do.
     choose_tool(window, "Rectangle");
-    let spot = empty_canvas_point(&shell, window);
+    let spot = empty_engine_point(&shell, window);
     window.simulate_click(spot, Modifiers::none());
     window.run_until_parked();
 
     let created = identities(&shell, window);
-    let created_id = created.last().expect("a created object").clone();
+    let created_id = *created.last().expect("a created object");
     assert_eq!(
         created.len(),
         original.len() + 1,
@@ -1127,7 +967,7 @@ fn a_keyboard_deletion_survives_a_save_and_a_reopen(cx: &mut TestAppContext) {
         "and it should be a new one, not one of the fixture's"
     );
     assert_eq!(
-        read(&shell, window, |canvas| canvas.selection().ids().len()),
+        engine_selection(&shell, window).len(),
         1,
         "the created object should be selected and ready for Delete"
     );
@@ -1166,32 +1006,20 @@ fn a_keyboard_deletion_survives_a_save_and_a_reopen(cx: &mut TestAppContext) {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// A window-coordinate point on the object with this authored identity.
+/// A window-coordinate point on the node with this identity.
 ///
 /// Objects overlap — a frame covers the objects inside it — so "click index 0" is
 /// not a reliable way to say which object a click means. Naming the identity is.
 fn object_centre(
     shell: &Entity<AppShell>,
     window: &mut VisualTestContext,
-    spool_id: &str,
+    id: u64,
 ) -> gpui::Point<gpui::Pixels> {
-    let origin = window
-        .debug_bounds("canvas-viewport")
-        .expect("the canvas viewport should have been laid out")
-        .origin;
-    let local = read(shell, window, |canvas| {
-        canvas
-            .document_objects()
-            .iter()
-            .position(|object| object.spool_id.as_str() == spool_id)
-            .and_then(|index| canvas.object_screen_center(index))
-    })
-    .unwrap_or_else(|| panic!("{spool_id} should be on the canvas"));
-    origin + gpui::Point::new(px(local.x), px(local.y))
+    engine_node_centre(shell, window, figcraft_doc::NodeId(id))
 }
 
 #[gpui::test]
-#[ignore = "the mounted canvas is now engine::canvas::EngineCanvas, which takes input through the engine's own Session::pointer and its keymap, not through CanvasView. These tests click the canvas-viewport selector and assert on CanvasView's state, so they are testing the retired runtime. Re-pointed at the engine equivalents as part of finishing the swap -- they are ignored, NOT deleted, and the coverage they provided is genuinely missing until then."]
+#[ignore = "the fixture compiles to zero-sized nodes under the engine -- the authored CSS gives the frame no width or height and the engine's compile does not invent a layout -- so the container has no box to click, and the shell's save reports its outcome through the status line rather than returning a result the test could hold. Kept, NOT deleted: the coverage it provided is genuinely missing until the engine lays a source-backed project out."]
 fn deleting_a_container_takes_its_contents_with_it_and_still_saves(cx: &mut TestAppContext) {
     // Deleting a container deletes what is inside it.
     //
@@ -1225,7 +1053,7 @@ fn deleting_a_container_takes_its_contents_with_it_and_still_saves(cx: &mut Test
         all.get(1).cloned().expect("a nested child"),
         all.get(2).cloned().expect("another nested child"),
     );
-    let target = object_centre(&shell, window, &container);
+    let target = object_centre(&shell, window, container);
     window.simulate_click(target, Modifiers::none());
     window.run_until_parked();
     window.simulate_keystrokes("delete");
@@ -1238,15 +1066,14 @@ fn deleting_a_container_takes_its_contents_with_it_and_still_saves(cx: &mut Test
     // The save is the point of the test. Before the cascade, this failed
     // validation with a dangling `parent`, wrote nothing, and every later save
     // failed the same way, so the user's deletion was silently lost.
-    let outcome = window.update(|_, cx| {
-        shell.update(cx, |shell, cx| {
-            shell.canvas().update(cx, |canvas, _| canvas.save_project())
-        })
-    });
+    window.simulate_keystrokes("cmd-s");
+    window.run_until_parked();
+    let (message, failed) = window
+        .update(|_, cx| shell.read_with(cx, |shell, _| shell.status_message()))
+        .expect("the save reported something");
     assert!(
-        outcome.is_ok(),
-        "deleting a container must leave a project that can still be saved: {:?}",
-        outcome.err()
+        !failed,
+        "deleting a container must leave a project that can still be saved: {message}"
     );
 
     // And the cascade has to be real, not just saveable: the objects inside the
@@ -1290,7 +1117,7 @@ fn deleting_a_container_takes_its_contents_with_it_and_still_saves(cx: &mut Test
 }
 
 #[gpui::test]
-#[ignore = "the mounted canvas is now engine::canvas::EngineCanvas, which takes input through the engine's own Session::pointer and its keymap, not through CanvasView. These tests click the canvas-viewport selector and assert on CanvasView's state, so they are testing the retired runtime. Re-pointed at the engine equivalents as part of finishing the swap -- they are ignored, NOT deleted, and the coverage they provided is genuinely missing until then."]
+#[ignore = "the engine's save path reports a node the manifest does not describe as unsupported, so a text object the editor created cannot be put in the source and the typed text cannot survive a reopen. The fixture also compiles to zero-sized nodes, so the click that ends the session has nothing to land on. Kept, NOT deleted: the coverage it provided is genuinely missing until the engine can author a created object."]
 fn text_typed_after_a_click_survives_a_save_and_a_reopen(cx: &mut TestAppContext) {
     // The same chain for the Text handover, because a text object has content the
     // shape tools do not, and content is the part a source-backed save is most
@@ -1304,7 +1131,7 @@ fn text_typed_after_a_click_survives_a_save_and_a_reopen(cx: &mut TestAppContext
     redraw(&shell, window);
 
     choose_tool(window, "Text");
-    let spot = empty_canvas_point(&shell, window);
+    let spot = empty_engine_point(&shell, window);
     window.simulate_click(spot, Modifiers::none());
     window.run_until_parked();
     flush_frame(window, &spot);
@@ -1312,18 +1139,12 @@ fn text_typed_after_a_click_survives_a_save_and_a_reopen(cx: &mut TestAppContext
     window.run_until_parked();
 
     // End the session so the typed text is committed before saving.
-    click_object(&shell, window, 0, Modifiers::none());
+    click_engine_node(&shell, window, 0, Modifiers::none());
     window.run_until_parked();
     window.simulate_keystrokes("cmd-s");
     window.run_until_parked();
 
-    let expected: Vec<String> = read(&shell, window, |canvas| {
-        canvas
-            .document_objects()
-            .iter()
-            .map(|object| object.text_content.clone().unwrap_or_default())
-            .collect()
-    });
+    let expected: Vec<String> = engine_texts(&shell, window);
 
     let (reopened, second) = cx.add_window_view({
         let root = root.clone();
@@ -1331,13 +1152,7 @@ fn text_typed_after_a_click_survives_a_save_and_a_reopen(cx: &mut TestAppContext
     });
     redraw(&reopened, second);
 
-    let after_reopen: Vec<String> = read(&reopened, second, |canvas| {
-        canvas
-            .document_objects()
-            .iter()
-            .map(|object| object.text_content.clone().unwrap_or_default())
-            .collect()
-    });
+    let after_reopen: Vec<String> = engine_texts(&reopened, second);
     assert!(
         after_reopen.iter().any(|text| text.contains("Typed")),
         "typed text should survive the round trip; reopened had {after_reopen:?}"
@@ -1352,7 +1167,7 @@ fn text_typed_after_a_click_survives_a_save_and_a_reopen(cx: &mut TestAppContext
 }
 
 #[gpui::test]
-#[ignore = "the mounted canvas is now engine::canvas::EngineCanvas, which takes input through the engine's own Session::pointer and its keymap, not through CanvasView. These tests click the canvas-viewport selector and assert on CanvasView's state, so they are testing the retired runtime. Re-pointed at the engine equivalents as part of finishing the swap -- they are ignored, NOT deleted, and the coverage they provided is genuinely missing until then."]
+#[ignore = "the engine's `object.rename` does not refuse a name another layer already holds -- it writes the name and leaves uniqueness to the metadata -- and the shell has no refusal channel any more: the retired runtime's canvas reported a refusal the shell could put in the status line, and the engine reports a refused command on stderr instead. Kept, NOT deleted: the coverage it provided is genuinely missing until there is somewhere for a refused rename to be shown."]
 fn a_refused_rename_is_reported_in_the_status_line(cx: &mut TestAppContext) {
     // The whole chain through real events: create, rename with F2, create again,
     // try the same name. The second rename is refused because names are unique,
@@ -1365,17 +1180,24 @@ fn a_refused_rename_is_reported_in_the_status_line(cx: &mut TestAppContext) {
     redraw(&shell, window);
 
     let names = |shell: &Entity<AppShell>, window: &mut VisualTestContext| -> Vec<String> {
-        read(shell, window, |canvas| {
-            canvas
-                .document_objects()
-                .iter()
-                .map(|object| object.name.clone())
-                .collect()
+        window.update(|_, cx| {
+            shell.read_with(cx, |shell, _| {
+                let canvas = shell.engine_canvas().read(cx);
+                canvas.with_session(|session| {
+                    let Ok(doc) = session.doc() else {
+                        return Vec::new();
+                    };
+                    doc.nodes()
+                        .filter(|node| !matches!(node.kind, figcraft_doc::NodeKind::Page { .. }))
+                        .map(|node| node.name.clone())
+                        .collect()
+                })
+            })
         })
     };
     let create_and_rename = |shell: &Entity<AppShell>, window: &mut VisualTestContext| {
         choose_tool(window, "Rectangle");
-        let spot = empty_canvas_point(shell, window);
+        let spot = empty_engine_point(shell, window);
         window.simulate_click(spot, Modifiers::none());
         window.run_until_parked();
         window.simulate_keystrokes("f2 t a k e n enter");
@@ -1403,4 +1225,3 @@ fn a_refused_rename_is_reported_in_the_status_line(cx: &mut TestAppContext) {
 
     let _ = std::fs::remove_dir_all(&root);
 }
-

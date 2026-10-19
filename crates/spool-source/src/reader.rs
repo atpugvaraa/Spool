@@ -63,7 +63,7 @@ use figcraft_doc::{
     NodeKind, StrokeProps, TextAlignH, TextData,
 };
 
-use crate::css::{RankedValue, Stylesheet};
+use crate::css::{Cascade, Stylesheet};
 use crate::manifest::{Manifest, ManifestError, NodeRecord};
 
 /// The identity of the page every compiled node hangs from.
@@ -1065,7 +1065,7 @@ impl<'a> Builder<'a> {
         record: &NodeRecord,
         element: &Element,
     ) -> Result<BTreeMap<String, String>, ReadError> {
-        let mut winners = Winners::default();
+        let mut winners = Cascade::default();
         if let Some(parsed) = self.files.get(&record.binding.file) {
             for (index, sheet) in parsed.stylesheets.iter().enumerate() {
                 // Scoped to the properties this reader actually compiles, the
@@ -1089,13 +1089,13 @@ impl<'a> Builder<'a> {
                 for (property, resolved) in
                     sheet.resolve_ranked(&element.tag, &element.classes, element.id.as_deref())
                 {
-                    winners.consider(property.to_owned(), index, resolved);
+                    winners.consider(&property, index, &resolved);
                 }
             }
         }
         let mut out: BTreeMap<String, String> = BTreeMap::new();
-        for (property, winner) in winners.by_property {
-            out.insert(property, winner.value);
+        for (property, winner) in winners.iter() {
+            out.insert(property.to_owned(), winner.value.clone());
         }
         for (property, value) in &element.inline {
             out.insert(property.clone(), value.clone());
@@ -1329,55 +1329,6 @@ fn page_node() -> Node {
         0.0,
         0.0,
     )
-}
-
-/// One declaration competing for a property across every sheet the document
-/// links, with the ranking that decides it.
-///
-/// Three criteria, in the order a browser applies them: selector specificity,
-/// then which sheet the document links the declaration from, then author order
-/// inside that sheet. Link order sits *between* specificity and author order
-/// rather than replacing both, so an earlier `#hero` outranks a later `.theme`
-/// and a later `.theme` still beats an earlier `.theme`.
-struct Winner {
-    specificity: u32,
-    sheet: usize,
-    order: usize,
-    value: String,
-}
-
-impl Winner {
-    /// The comparable rank, for deciding whether this beats the incumbent.
-    fn rank(&self) -> (u32, usize, usize) {
-        (self.specificity, self.sheet, self.order)
-    }
-}
-
-/// The sheet-wide winner map, ranked rather than overwritten.
-#[derive(Default)]
-struct Winners {
-    by_property: BTreeMap<String, Winner>,
-}
-
-impl Winners {
-    /// Keep this declaration if it outranks the incumbent for `property`.
-    ///
-    /// A tie cannot happen across sheets: `order` is unique within a sheet and
-    /// `sheet` separates them, so exactly one declaration wins each property.
-    fn consider(&mut self, property: String, sheet: usize, resolved: RankedValue) {
-        let candidate = Winner {
-            specificity: resolved.specificity,
-            sheet,
-            order: resolved.order,
-            value: resolved.value,
-        };
-        match self.by_property.get(&property) {
-            Some(current) if current.rank() >= candidate.rank() => {}
-            _ => {
-                self.by_property.insert(property, candidate);
-            }
-        }
-    }
 }
 
 /// Refuse a value this cascade cannot order.

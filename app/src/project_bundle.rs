@@ -663,8 +663,7 @@ pub(crate) fn write_atomically(target: &Path, bytes: &[u8]) -> Result<(), Bundle
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operations::{OperationTarget, SemanticHistory, SemanticOperation};
-    use crate::source_document::RenameNode;
+    use crate::source_document::{RenameNode, SemanticHistory};
 
     /// Copy a checked-in fixture into a scratch directory so tests that save,
     /// corrupt, or delete files never modify the committed fixture.
@@ -1237,20 +1236,17 @@ mod tests {
             before: "Headline".into(),
             after: "Hero headline".into(),
         };
-        assert!(history.record(SemanticOperation::Rename(rename.clone())));
+        assert!(history.record(rename.clone()));
         // The bundle holds no canvas runtime, which is why the unified
         // boundary needs a metadata-only target rather than requiring a
         // throwaway `Document` to satisfy `Full`.
-        crate::operations::apply(
-            &SemanticOperation::Rename(rename),
-            &mut OperationTarget::Document(&mut bundle.document),
-            crate::canvas::ReplayDirection::Redo,
-        )
-        .expect("the rename applies");
+        rename
+            .apply(&mut bundle.document)
+            .expect("the rename applies");
         bundle.save().expect("save renamed metadata");
 
         assert!(history
-            .undo(&mut OperationTarget::Document(&mut bundle.document))
+            .undo(&mut bundle.document)
             .expect("undo replays the rename"));
         bundle.save().expect("save after undo");
         let reloaded = ProjectBundle::load(&dir).expect("reload");

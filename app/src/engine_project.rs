@@ -170,6 +170,27 @@ pub struct EngineProject {
     /// lie the caller has to be able to see. A failed compile is reported here
     /// too — see [`compile_or_report`].
     pub unresolved: Vec<String>,
+    /// The engine's node id for every persistent key in the project.
+    ///
+    /// The engine's node id is the manifest's numeric id and the persistent key
+    /// is the manifest's `key`, so the two are related only through the
+    /// manifest. This is that relation, kept, so a caller does not have to
+    /// rebuild it — and cannot get it subtly wrong.
+    pub keys: BTreeMap<String, figcraft_doc::NodeId>,
+}
+
+impl EngineProject {
+    /// The engine's node for a persistent key.
+    ///
+    /// `None` when the project does not hold that key, or when the compile
+    /// failed and the document holds nothing at all.
+    ///
+    /// Read by the save path's tests, which ask the engine's document what a
+    /// node looks like rather than keeping a second model of the project.
+    #[allow(dead_code, reason = "the save path's round-trip checks read it")]
+    pub fn node_for_key(&self, key: &str) -> Option<&figcraft_doc::Node> {
+        self.keys.get(key).and_then(|id| self.document.node(*id))
+    }
 }
 
 /// Compile a persistent document into the engine's document model.
@@ -228,6 +249,11 @@ pub fn compile_with_metadata(
                     .map(spool_source::reader::Unresolved::to_string),
             )
             .collect(),
+        keys: manifest
+            .nodes
+            .iter()
+            .map(|record| (record.key.clone(), figcraft_doc::NodeId(record.id)))
+            .collect(),
     })
 }
 
@@ -266,8 +292,92 @@ pub fn compile_or_report(persistent: &PersistentDocument, metadata: Option<&str>
         Err(error) => EngineProject {
             document: Document::without_pages(FAILED_DOCUMENT_NAME),
             unresolved: vec![format!("the engine document did not compile: {error}")],
+            keys: BTreeMap::new(),
         },
     }
+}
+
+/// The nodes of a project the engine has no kind for.
+///
+/// A probe, not a document. The published engine document is all-or-nothing —
+/// see [`compile_or_report`] — and this answers a different question: which of
+/// this project's nodes the engine cannot represent at all, because their kind
+/// is not one it has.
+///
+/// The answer is found by compiling and, when the compile refuses a kind,
+/// dropping that one record and trying again. Nothing here publishes a partial
+/// document: the document the editor draws is the one [`compile_or_report`]
+/// produced, and this only says which nodes are missing from it.
+///
+/// This is the engine-backed answer to a question the retired hand-written
+/// runtime answered with its own drawable kinds. The names are the same shape
+/// the old answer used — `name (key)` — so a reader sees the same thing.
+pub fn unrenderable_nodes(persistent: &PersistentDocument, metadata: Option<&str>) -> Vec<String> {
+    let Ok((mut manifest, _)) = to_manifest(persistent, metadata) else {
+        return Vec::new();
+    };
+    // `spool-source` keys sources by the same project-root-relative paths the
+    // bindings use, so the app's map converts without renaming anything.
+    let sources: BTreeMap<String, String> = persistent
+        .sources
+        .iter()
+        .map(|(path, contents)| (path.clone(), contents.clone()))
+        .collect();
+    let mut unrendered = Vec::new();
+    loop {
+        match reader::read_with_diagnostics(&manifest, &sources) {
+            // The whole project compiles: nothing is missing from it.
+            Ok(_) => break,
+            Err(ReadError::UnknownKind { id, .. }) => {
+                let Some((name, key)) = manifest
+                    .nodes
+                    .iter()
+                    .find(|record| record.id == id)
+                    .map(|record| (record.name.clone(), record.key.clone()))
+                else {
+                    break;
+                };
+                unrendered.push(format!("{name} ({key})"));
+                if !drop_record(&mut manifest, id) {
+                    break;
+                }
+            }
+            // Any other refusal says nothing about kinds, so it says nothing
+            // about which nodes the engine can represent.
+            Err(_) => break,
+        }
+    }
+    unrendered
+}
+
+/// The nodes of a compiled document that are not its page.
+///
+/// The engine's document holds one page per project alongside the project's
+/// own nodes, so the count of what the editor can actually draw is this and
+/// not [`Document::node_count`].
+pub fn content_node_count(document: &Document) -> usize {
+    document
+        .nodes()
+        .filter(|node| !matches!(node.kind, figcraft_doc::NodeKind::Page { .. }))
+        .count()
+}
+
+/// Drop a node from a manifest, and the edges that named it.
+///
+/// The children of a dropped node are re-parented onto its own parent, so the
+/// manifest stays a tree the reader can compile.
+pub(crate) fn drop_record(manifest: &mut Manifest, id: u64) -> bool {
+    let Some(index) = manifest.nodes.iter().position(|record| record.id == id) else {
+        return false;
+    };
+    let record = manifest.nodes.remove(index);
+    for other in &mut manifest.nodes {
+        if other.parent == Some(id) {
+            other.parent = record.parent;
+        }
+        other.children.retain(|child| *child != id);
+    }
+    true
 }
 
 /// The manifest to compile, plus what had to be said to get it.
@@ -819,15 +929,14 @@ mod tests {
 
     #[test]
     fn a_kind_the_engine_does_not_have_fails_the_compile_rather_than_becoming_a_guess() {
-        // `nested` declares `spool-image-logo` with kind `image`. The old path
-        // opens it and reports the node as unrendered; the engine has no such
-        // kind, and `kind` is Owner B — so picking the nearest one would be
-        // inventing a node the author never described. Refused, by name.
+        // `nested` declares `spool-image-logo` with kind `image`. The engine has
+        // no such kind, and `kind` is Owner B — so picking the nearest one would
+        // be inventing a node the author never described. Refused, by name.
         let loaded = open_project(fixture_root("nested")).expect("nested opens");
         assert_eq!(
             loaded.unrendered,
             vec!["Logo (spool-image-logo)".to_string()],
-            "the old path surfaces it as unrendered"
+            "the node the engine has no kind for is named rather than dropped"
         );
 
         let error = compile(&loaded.document).expect_err("the engine compile must refuse it");
@@ -862,12 +971,13 @@ mod tests {
 
     #[test]
     fn a_failed_compile_is_reported_beside_an_empty_document_rather_than_fatal() {
-        // `nested` is the case that makes this real: a committed project the old
-        // path opens and renders, which the engine cannot yet compile.
+        // `nested` is the case that makes this real: a committed project the
+        // editor opens, which the engine cannot compile.
         let loaded = open_project(fixture_root("nested")).expect("nested opens");
-        assert!(
-            !loaded.runtime.objects().is_empty(),
-            "the old path drew it, so the project does open"
+        assert_eq!(
+            loaded.unrendered,
+            vec!["Logo (spool-image-logo)".to_string()],
+            "and the node it cannot represent is named"
         );
 
         let reported = compile_or_report(&loaded.document, None);
@@ -907,24 +1017,22 @@ mod tests {
             opened.engine.unresolved
         );
         assert_eq!(
-            opened.runtime.objects().len(),
-            2,
-            "and the editor still draws the project it always drew"
+            opened.engine.document.node_count(),
+            0,
+            "and the editor is told the project holds nothing it can draw"
         );
     }
 
     #[test]
-    fn opening_a_project_compiles_it_and_leaves_the_old_path_untouched() {
+    fn opening_a_project_compiles_it_into_the_document_the_editor_draws() {
         let loaded = open_project(fixture_root("landing")).expect("landing opens");
 
         assert_eq!(
             names(&loaded.engine.document),
             vec!["Landing Frame", "Headline", "Primary CTA"],
-            "opening a project now produces an engine document"
+            "opening a project produces the engine document the editor draws"
         );
-        // The runtime the editor actually draws is the pre-existing one, built
-        // the same way as before this module existed.
-        assert_eq!(loaded.runtime.objects().len(), 3);
+        assert_eq!(content_node_count(&loaded.engine.document), 3);
         assert!(loaded.unrendered.is_empty());
         assert_eq!(
             loaded.document.structure.nodes.len(),
@@ -1300,7 +1408,11 @@ mod tests {
     fn a_version_two_project_opens_in_the_editor_and_still_draws() {
         let opened = open_project(fixture_root("owner-b")).expect("a version 2 project opens");
 
-        assert_eq!(opened.runtime.objects().len(), 3, "all three nodes drew");
+        assert_eq!(
+            content_node_count(&opened.engine.document),
+            3,
+            "all three nodes drew"
+        );
         assert!(opened.unrendered.is_empty());
         assert_eq!(opened.document.structure.nodes.len(), 3);
         // The persistent document is the six fields the editor has always held.

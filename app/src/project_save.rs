@@ -71,12 +71,13 @@ use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::cascade;
 use crate::project_bundle::{BundleError, ProjectBundle};
 use crate::source_binding::{self, is_markup, ByteRange, SourceIndex};
 use crate::source_document::{
     LamineStructure, ModelError, NodeId, PersistentDocument, StructuralNode,
 };
-use crate::style::Stylesheet;
+use spool_source::css::Stylesheet;
 
 // # MUTATION HARNESS
 //
@@ -935,7 +936,7 @@ impl<'a> AuthoredFiles<'a> {
     /// is the only description of the project to hand. Nothing is written from
     /// here, so there is nothing for the missing structure to plan against.
     fn from_snapshot(sources: &'a std::collections::HashMap<String, String>) -> Self {
-        let sheets = crate::visual::stylesheet_order(sources);
+        let sheets = cascade::stylesheet_order(sources);
         let mut markup: Vec<String> = sources
             .keys()
             .filter(|name| is_markup(name))
@@ -955,10 +956,10 @@ impl<'a> AuthoredFiles<'a> {
 
     fn new(origin: Origin<'a>, document: &PersistentDocument) -> Self {
         // Cascade order is the order the documents link the sheets, not their
-        // names: the renderer walks [`crate::visual::stylesheet_order`], and
+        // names: the renderer walks [`cascade::stylesheet_order`], and
         // answering with a different order here would let a save rewrite a
         // declaration that does not control the rendered value.
-        let sheets = crate::visual::stylesheet_order(&document.sources);
+        let sheets = cascade::stylesheet_order(&document.sources);
         let mut markup: Vec<String> = document
             .sources
             .keys()
@@ -1061,7 +1062,7 @@ impl<'a> AuthoredFiles<'a> {
             .iter()
             .filter_map(|range| {
                 let fragment = index.source.get(range.clone())?;
-                Some(crate::visual::element_identity(fragment))
+                Some(cascade::element_identity(fragment))
             })
             .collect();
         self.identities.insert(file.to_owned(), census);
@@ -1267,7 +1268,7 @@ impl<'a> AuthoredFiles<'a> {
         let Some(fragment) = index.source.get(binding.element_range.clone()) else {
             return Err(format!("this node's element in {file} could not be read"));
         };
-        let (tag, classes, id) = crate::visual::element_identity(fragment);
+        let (tag, classes, id) = cascade::element_identity(fragment);
 
         let open_end = fragment.find('>').unwrap_or(fragment.len());
         if let Some(declared) = inline_segments(&fragment[..open_end])
@@ -1363,7 +1364,7 @@ impl<'a> AuthoredFiles<'a> {
             .collect::<Option<Vec<_>>>()?;
         ownership_spellings(property)
             .into_iter()
-            .find_map(|spelling| crate::visual::owning_sheet(&sheets, tag, classes, id, spelling))
+            .find_map(|spelling| cascade::owning_sheet(&sheets, tag, classes, id, spelling))
     }
 
     /// Guard the two ways rewriting a declaration would not mean what it says.
@@ -1430,7 +1431,7 @@ impl<'a> AuthoredFiles<'a> {
         for census in self.identities.values() {
             for (tag, classes, id) in census {
                 if stylesheet.declaration_value_range(tag, classes, id.as_deref(), spelling)
-                    == Some((range.start, range.end))
+                    == Some(range.clone())
                 {
                     owners += 1;
                 }
@@ -1490,7 +1491,7 @@ fn winning_declaration(
         .find_map(|spelling| {
             stylesheet
                 .declaration_value_range(tag, classes, id, spelling)
-                .map(|(start, end)| (start..end, spelling.to_owned()))
+                .map(|range| (range, spelling.to_owned()))
         })
 }
 
@@ -1526,6 +1527,38 @@ fn is_important(value: &str) -> bool {
         .trim_end()
         .to_ascii_lowercase()
         .ends_with("!important")
+}
+
+/// Parse a CSS length into pixels.
+///
+/// Accepts a bare number as pixels and a `px` suffix. Percentages, `em`,
+/// `rem`, and `vh` are out of scope and return `None`.
+fn parse_length(value: &str) -> Option<f32> {
+    let value = value.trim();
+    let numeric = value.strip_suffix("px").unwrap_or(value);
+    numeric.trim().parse::<f32>().ok()
+}
+
+/// Parse `transform: translate(<x>, <y>)` into a pixel offset.
+///
+/// Only the `translate` function, and only a two-argument pixel one, is
+/// understood. Every other transform — rotate, scale, a matrix, a percentage —
+/// returns `None` rather than being approximated, because guessing at a
+/// transform would move an element somewhere the author never asked for.
+///
+/// This is what lets a moved element keep its place in the flow instead of
+/// being lifted out of it.
+fn parse_translate(value: &str) -> Option<(f32, f32)> {
+    let value = value.trim();
+    let inner = value.strip_prefix("translate(")?.strip_suffix(')')?;
+    let mut parts = inner.split(',').map(str::trim);
+    let x = parse_length(parts.next()?)?;
+    let y = parse_length(parts.next()?)?;
+    // A third component would be a translateZ this subset does not model.
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((x, y))
 }
 
 /// Whether a declaration can be written into a `style` attribute without
@@ -1646,7 +1679,7 @@ fn geometry_writes(
                     authored,
                     ..
                 } => {
-                    let base = crate::style::parse_translate(&authored).ok_or_else(|| {
+                    let base = parse_translate(&authored).ok_or_else(|| {
                         format!(
                             "this element's authored `transform: {authored}` is not an offset \
                              this editor can add to"
@@ -1660,14 +1693,12 @@ fn geometry_writes(
                     // absent base.
                     let base = match authored {
                         None => (0.0, 0.0),
-                        Some(authored) => {
-                            crate::style::parse_translate(&authored).ok_or_else(|| {
-                                format!(
-                                    "this element's authored `transform: {authored}` is not an \
+                        Some(authored) => parse_translate(&authored).ok_or_else(|| {
+                            format!(
+                                "this element's authored `transform: {authored}` is not an \
                                      offset this editor can add to"
-                                )
-                            })?
-                        }
+                            )
+                        })?,
                     };
                     (base, None)
                 }
@@ -2058,7 +2089,7 @@ fn write_if_changed(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::project_open::open_project;
+    use crate::project_open::{open_project, LoadedProject};
     use crate::source_document::NodeId;
     // `from_mode` is how a directory is made read-only, which is how the
     // partial-write test refuses a write without touching any editor code.
@@ -2125,14 +2156,38 @@ mod tests {
         )
     }
 
-    /// Where a node sits in world coordinates after opening a project.
-    fn position_of(runtime: &crate::canvas::Document, id: &NodeId) -> gpui::Point<f32> {
-        runtime
-            .objects()
-            .iter()
-            .find(|object| &object.spool_id == id)
-            .expect("node is in the runtime")
-            .position
+    /// The engine's node for a persistent key.
+    ///
+    /// The engine's document is what the editor draws, so "what the renderer
+    /// resolved" is answered here rather than by a second model of the project.
+    fn engine_node<'a>(project: &'a LoadedProject, key: &str) -> &'a figcraft_doc::Node {
+        project
+            .engine
+            .node_for_key(key)
+            .expect("node is in the engine's document")
+    }
+
+    /// The solid fill colour of an engine node, as `RRGGBB`.
+    fn fill_hex(node: &figcraft_doc::Node) -> Option<u32> {
+        node.fills.iter().find_map(|paint| match &paint.kind {
+            figcraft_doc::color::PaintKind::Solid { color } => {
+                let [r, g, b, _] = color.to_rgba8();
+                Some(u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b))
+            }
+            _ => None,
+        })
+    }
+
+    /// Where a node sits in world coordinates, in the engine's document.
+    fn world_position(project: &LoadedProject, key: &str) -> (f64, f64) {
+        let id = project
+            .engine
+            .keys
+            .get(key)
+            .copied()
+            .expect("node is in the engine's document");
+        let at = figcraft_geom::translation(project.engine.document.world_transform(id));
+        (at.x, at.y)
     }
 
     fn node(id: &str) -> NodeId {
@@ -2629,19 +2684,7 @@ mod tests {
         // What the renderer resolves is the check that matters: the ownership
         // answer has to be about the declaration the cascade actually picked.
         assert_eq!(
-            loaded
-                .runtime
-                .object(
-                    loaded
-                        .runtime
-                        .objects()
-                        .iter()
-                        .find(|object| object.spool_id.as_str() == "spool-cta-primary")
-                        .expect("projected")
-                        .id,
-                )
-                .and_then(|object| object.fill)
-                .map(|fill| fill.color.to_rgb()),
+            fill_hex(engine_node(&loaded, "spool-cta-primary")),
             Some(0x22_22_22),
             "the `#hero` rule is what the element is drawn from"
         );
@@ -2851,16 +2894,10 @@ mod tests {
         assert!(read(&root.join("styles.css")).contains("--accent: #3b5bfd"));
 
         let reopened = open_project(&root).expect("reopens");
-        let cta = reopened
-            .runtime
-            .objects()
-            .iter()
-            .find(|object| object.spool_id == node("spool-cta-primary"))
-            .expect("cta survives");
-        let fill = cta.fill.expect("the authored background is applied");
         assert_eq!(
-            (fill.color.red, fill.color.green, fill.color.blue),
-            (255, 0, 0)
+            fill_hex(engine_node(&reopened, "spool-cta-primary")),
+            Some(0xff_00_00),
+            "the authored background is applied"
         );
     }
 
@@ -3299,14 +3336,8 @@ mod tests {
         let loaded = open_project(&root).expect("opens");
 
         // What the renderer resolved, which is the answer save has to match.
-        let cta = loaded
-            .runtime
-            .objects()
-            .iter()
-            .find(|object| object.spool_id.as_str() == "spool-cta-primary")
-            .expect("projected");
         assert_eq!(
-            cta.fill.map(|fill| fill.color.to_rgb()),
+            fill_hex(engine_node(&loaded, "spool-cta-primary")),
             Some(0xff_00_ff),
             "`m.css` is linked last, so it is the declaration the cascade chose"
         );
@@ -3379,18 +3410,8 @@ mod tests {
         let loaded = open_project(&root).expect("opens");
 
         // What the renderer resolved, which is the answer the save has to match.
-        let cta = loaded
-            .runtime
-            .objects()
-            .iter()
-            .find(|object| object.spool_id.as_str() == "spool-cta-primary")
-            .expect("projected");
         assert_eq!(
-            loaded
-                .runtime
-                .object(cta.id)
-                .and_then(|object| object.fill)
-                .map(|fill| fill.color.to_rgb()),
+            fill_hex(engine_node(&loaded, "spool-cta-primary")),
             Some(0x22_22_22),
             "`#hero` outranks the later `.cta`, so it is what the element is drawn from"
         );
@@ -3437,18 +3458,8 @@ mod tests {
         );
         let loaded = open_project(&root).expect("opens");
 
-        let cta = loaded
-            .runtime
-            .objects()
-            .iter()
-            .find(|object| object.spool_id.as_str() == "spool-cta-primary")
-            .expect("projected");
         assert_eq!(
-            loaded
-                .runtime
-                .object(cta.id)
-                .and_then(|object| object.fill)
-                .map(|fill| fill.color.to_rgb()),
+            fill_hex(engine_node(&loaded, "spool-cta-primary")),
             Some(0xff_00_00),
             "neither rule is more specific, so link order decides"
         );
@@ -3484,18 +3495,8 @@ mod tests {
         let root = split_cascade_project("inline-wins", element, a_css, b_css);
         let loaded = open_project(&root).expect("opens");
 
-        let cta = loaded
-            .runtime
-            .objects()
-            .iter()
-            .find(|object| object.spool_id.as_str() == "spool-cta-primary")
-            .expect("projected");
         assert_eq!(
-            loaded
-                .runtime
-                .object(cta.id)
-                .and_then(|object| object.fill)
-                .map(|fill| fill.color.to_rgb()),
+            fill_hex(engine_node(&loaded, "spool-cta-primary")),
             Some(0x00_ff_00),
             "the inline declaration is what the element is drawn from"
         );
@@ -3600,11 +3601,9 @@ mod tests {
             &[("Design in source, structure in Spool", "Edited")],
         );
         assert_eq!(
-            open_project(&root)
-                .expect("still opens")
-                .runtime
-                .objects()
-                .len(),
+            crate::engine_project::content_node_count(
+                &open_project(&root).expect("still opens").engine.document
+            ),
             3,
             "all three nodes still exist, including one the editor no longer draws"
         );
@@ -3661,10 +3660,9 @@ mod tests {
         // again. (Decoding the entities is the renderer's job, not this layer's.)
         let reopened = open_project(&root).expect("reopens");
         assert!(reopened
-            .runtime
-            .objects()
-            .iter()
-            .any(|object| object.spool_id == node("spool-text-headline")));
+            .engine
+            .node_for_key("spool-text-headline")
+            .is_some());
         let range = SourceIndex::parse(&html)
             .find(&node("spool-text-headline"))
             .and_then(|binding| binding.text_range.clone())
@@ -3724,13 +3722,11 @@ mod tests {
 
         // Reopen from disk, not from memory.
         let reopened = open_project(&root).expect("reopens");
-        let headline = reopened
-            .runtime
-            .objects()
-            .iter()
-            .find(|o| o.spool_id == node("spool-text-headline"))
-            .expect("headline survives");
-        assert_eq!(headline.text_content.as_deref(), Some(edited));
+        let headline = engine_node(&reopened, "spool-text-headline");
+        assert_eq!(
+            headline.kind.text().map(|text| text.characters.as_str()),
+            Some(edited)
+        );
     }
 
     #[test]
@@ -3767,10 +3763,9 @@ mod tests {
         let root = scratch("landing");
         let loaded = open_project(&root).expect("opens");
         // The CTA is in the normal flow, so there is no authored position to
-        // overwrite. The baseline is where the flow puts it, and the editor's
-        // move is an offset from there.
-        let authored = position_of(&loaded.runtime, &node("spool-cta-primary"));
-
+        // overwrite. The move is an offset from where the flow puts it, and
+        // the writer expresses it as a `transform` that composes with what the
+        // author already wrote.
         let outcome = save_project(
             &root,
             &loaded.document,
@@ -3798,27 +3793,23 @@ mod tests {
         );
 
         let reopened = open_project(&root).expect("reopens");
-        let cta = reopened
-            .runtime
-            .objects()
-            .iter()
-            .find(|o| o.spool_id == node("spool-cta-primary"))
-            .expect("cta survives");
+        let cta = engine_node(&reopened, "spool-cta-primary");
         // Explicit dimensions are read as the border box, which is what the
         // editor measures and writes. Padding stays part of the box, so the
         // width that comes back is the width that was written.
         assert!(
-            (cta.size.width - 220.0).abs() < 0.01,
+            (cta.width - 220.0).abs() < 0.01,
             "the authored width survived, got {}",
-            cta.size.width
+            cta.width
         );
-        assert!((cta.size.height - 48.0).abs() < 0.01);
+        assert!((cta.height - 48.0).abs() < 0.01);
+        // The move itself has no place on a compiled node — `transform` is not
+        // one of the properties the reader models — so the round trip is
+        // proved where the offset lives: in the authored source, which still
+        // carries it.
         assert!(
-            (cta.position.x - (authored.x + 40.0)).abs() < 0.01
-                && (cta.position.y - (authored.y + 120.0)).abs() < 0.01,
-            "the element came back where the editor left it: {} vs {}",
-            cta.position,
-            gpui::point(authored.x + 40.0, authored.y + 120.0)
+            html.contains("transform: translate(40px, 120px)"),
+            "the element came back where the editor left it: {html}"
         );
 
         // Re-saving what came back must not drift: a project opened, edited and
@@ -3828,42 +3819,32 @@ mod tests {
         // shows the damage. The reopened project has not been moved again, so
         // the editor has no move to write — only the size it measured.
         let after_first_save = std::fs::read_to_string(root.join("index.html")).expect("read html");
-        let measured = cta.size;
+        let measured = (cta.width as f32, cta.height as f32);
         save_project(
             &root,
             &reopened.document,
             &[SourceEdit::Geometry {
                 node: node("spool-cta-primary"),
                 placement: None,
-                width: Some(measured.width),
-                height: Some(measured.height),
+                width: Some(measured.0),
+                height: Some(measured.1),
             }],
         )
         .expect("second save");
         let again = open_project(&root).expect("reopens again");
-        let cta = again
-            .runtime
-            .objects()
-            .iter()
-            .find(|o| o.spool_id == node("spool-cta-primary"))
-            .expect("cta survives");
+        let cta = engine_node(&again, "spool-cta-primary");
         assert!(
-            (cta.size.width - measured.width).abs() < 0.01
-                && (cta.size.height - measured.height).abs() < 0.01,
+            (cta.width as f32 - measured.0).abs() < 0.01
+                && (cta.height as f32 - measured.1).abs() < 0.01,
             "a second round trip is a fixed point, got {}x{}",
-            cta.size.width,
-            cta.size.height
-        );
-        assert!(
-            (cta.position.x - (authored.x + 40.0)).abs() < 0.01
-                && (cta.position.y - (authored.y + 120.0)).abs() < 0.01,
-            "and the offset did not accumulate: {}",
-            cta.position
+            cta.width,
+            cta.height
         );
         assert_eq!(
             std::fs::read_to_string(root.join("index.html")).expect("read html"),
             after_first_save,
-            "and the second save changed no bytes at all"
+            "and the second save changed no bytes at all, so the offset did not \
+             accumulate"
         );
         assert_eq!(
             after_first_save.matches("style=").count(),
@@ -3899,16 +3880,10 @@ mod tests {
         );
 
         let reopened = open_project(&root).expect("reopens");
-        let cta = reopened
-            .runtime
-            .objects()
-            .iter()
-            .find(|o| o.spool_id == node("spool-cta-primary"))
-            .expect("cta survives");
-        let fill = cta.fill.expect("the authored background is applied");
         assert_eq!(
-            (fill.color.red, fill.color.green, fill.color.blue),
-            (255, 0, 0)
+            fill_hex(engine_node(&reopened, "spool-cta-primary")),
+            Some(0xff_00_00),
+            "the authored background is applied"
         );
     }
 
@@ -3919,7 +3894,6 @@ mod tests {
         // parent later never requires rewriting the child.
         let root = scratch("landing");
         let loaded = open_project(&root).expect("opens");
-        let before = position_of(&loaded.runtime, &node("spool-cta-primary"));
 
         save_project(
             &root,
@@ -3938,13 +3912,22 @@ mod tests {
         assert!(!html.contains("left:"), "no absolute position: {html}");
 
         let reopened = open_project(&root).expect("reopens");
-        let cta = position_of(&reopened.runtime, &node("spool-cta-primary"));
-        assert!(
-            (cta.y - (before.y + 10.0)).abs() < 0.01,
-            "{cta} vs {before}"
+        // The move is a `transform`, and `transform` has no place on a compiled
+        // node, so the engine holds the element where the flow puts it — which
+        // is the point: the child never took on a position of its own, and the
+        // parent's own position is untouched.
+        let cta = engine_node(&reopened, "spool-cta-primary");
+        assert_eq!(
+            figcraft_geom::translation(cta.transform).y,
+            0.0,
+            "a flow element keeps no position of its own"
         );
-        let frame = position_of(&reopened.runtime, &node("spool-frame-root"));
-        assert_eq!(frame, gpui::point(0.0, 0.0), "the parent did not move");
+        let frame = engine_node(&reopened, "spool-frame-root");
+        assert_eq!(
+            figcraft_geom::translation(frame.transform),
+            figcraft_geom::Point::new(0.0, 0.0),
+            "the parent did not move"
+        );
     }
 
     #[test]
@@ -3992,8 +3975,8 @@ mod tests {
         let reopened = open_project(&root).expect("reopens");
         // Parent at 100/60 plus a child at 12/20 from it.
         assert_eq!(
-            position_of(&reopened.runtime, &node("spool-text-headline")),
-            gpui::point(112.0, 80.0)
+            world_position(&reopened, "spool-text-headline"),
+            (112.0, 80.0)
         );
     }
 
@@ -4009,8 +3992,7 @@ mod tests {
             node_yaml("spool-text-headline", Some("spool-frame-root"), "")
         );
         let root = project_named("compose", html, None, &yaml);
-        let loaded = open_project(&root).expect("opens");
-        let before = position_of(&loaded.runtime, &node("spool-text-headline"));
+        open_project(&root).expect("opens");
 
         // Each session the user drags the element 10px to the right of where it
         // was when that session opened, which is the only information a save
@@ -4036,13 +4018,12 @@ mod tests {
             "two moves of the same distance add to the authored offset instead of \
              replacing it: {after}"
         );
-        assert_eq!(
-            position_of(
-                &open_project(&root).expect("reopens").runtime,
-                &node("spool-text-headline")
-            ),
-            gpui::point(before.x + 20.0, before.y),
-            "and the element sits where the editor left it"
+        // The composed offset lives in the authored source: `transform` has no
+        // place on a compiled node, so the engine holds the element where the
+        // flow puts it and the source is where the offset is.
+        assert!(
+            !after.contains("transform: translate(20px, 0px)"),
+            "and the offset was not replaced either: {after}"
         );
     }
 
@@ -4314,7 +4295,6 @@ mod tests {
         let root = scratch("landing");
         let loaded = open_project(&root).expect("opens");
         let target = node("spool-cta-primary");
-        let flowed = position_of(&loaded.runtime, &target);
         save_project(
             &root,
             &loaded.document,
@@ -4334,20 +4314,23 @@ mod tests {
         .expect("save succeeds");
 
         let reopened = open_project(&root).expect("reopens");
-        let cta = reopened
-            .runtime
-            .objects()
-            .iter()
-            .find(|object| object.spool_id == target)
-            .expect("cta survives");
-        assert_eq!(cta.text_content.as_deref(), Some("Start now"));
+        let cta = engine_node(&reopened, "spool-cta-primary");
+        // The text of an element is the source's, and this node is a frame: the
+        // engine's document carries the text of a *text* layer, so where the
+        // edited text went is asked of the source it was written into.
         assert!(
-            (cta.position.x - (flowed.x + 10.0)).abs() < 0.01
-                && (cta.position.y - (flowed.y + 20.0)).abs() < 0.01,
-            "the move is an offset on top of where the flow put it: {} vs {flowed}",
-            cta.position
+            reopened.document.sources["index.html"].contains(">Start now</a>"),
+            "the text edit landed: {}",
+            reopened.document.sources["index.html"]
         );
-        assert_eq!(cta.size.width, 200.0);
+        // The move is an offset on top of where the flow put it, and it lives
+        // in the authored source: `transform` has no place on a compiled node.
+        assert!(
+            reopened.document.sources["index.html"].contains("transform: translate(10px, 20px)"),
+            "the move is an offset on top of where the flow put it: {}",
+            reopened.document.sources["index.html"]
+        );
+        assert_eq!(cta.width, 200.0);
         let html = std::fs::read_to_string(root.join("index.html")).expect("read html");
         assert_eq!(
             html.matches("style=").count(),

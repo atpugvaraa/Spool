@@ -4,8 +4,8 @@
 //!
 //! | Surface | Owns | Where |
 //! |---|---|---|
-//! | A text buffer | characters, caret keys, its own Escape | [`crate::inspector`] for a field or a name, `canvas` for an object's text |
-//! | A panel | its own navigation over its own rows | [`crate::layers`] |
+//! | A text buffer | characters, caret keys, its own Escape | [`crate::inspector`] for a field or a name, the engine's canvas for an object's text |
+//! | A panel | its own navigation over its own rows | [`crate::engine::layers`] |
 //! | This module | everything the whole editor answers to | [`crate::shell`] |
 //!
 //! So this file resolves keys into [`Command`]s and knows nothing about how one
@@ -31,7 +31,7 @@
 
 use gpui::Modifiers;
 
-use crate::canvas::{Tool, Traversal};
+use crate::tools::{Tool, Traversal};
 
 /// The command modifier: `⌘` on macOS, `Ctrl` on Windows and Linux.
 ///

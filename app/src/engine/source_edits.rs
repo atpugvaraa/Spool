@@ -61,14 +61,16 @@
 //!   answer, so the declaration an edit rewrites is the one the editor is
 //!   drawing.
 //!
-//! # Which CSS parser the write path should use
+//! # Which CSS parser the write path uses
 //!
-//! The repository has two CSS readers with byte-range provenance:
+//! The write path reads the cascade with [`spool_source::css::Stylesheet`],
+//! the same reader the source-to-model compile uses, and so does the engine
+//! that draws the document. There is no second reader:
 //!
-//! | | [`crate::style::Stylesheet`] | [`spool_source::css::Stylesheet`] |
+//! | | the app's own reader (gone) | [`spool_source::css::Stylesheet`] |
 //! |---|---|---|
-//! | used by | the app's renderer (`visual.rs`) and the writer (`project_save.rs`) | the source-to-model compile (`spool-source`) |
-//! | winning declaration | private `winner()`; the writer re-implements the shorthand grouping in `ownership_spellings` | public `winner()` — the declaration *and* the spelling it was authored as |
+//! | used by | the app's renderer (`visual.rs`) and the writer (`project_save.rs`) | the source-to-model compile (`spool-source`) and the writer |
+//! | winning declaration | private `winner()`; the writer re-implemented the shorthand grouping in `ownership_spellings` | public `winner()` — the declaration *and* the spelling it was authored as |
 //! | `!important` | re-derived from the value text | recorded on the declaration when it is parsed |
 //! | selector subset | a type selector may only lead | a type selector may appear anywhere, as CSS allows |
 //!
@@ -79,17 +81,17 @@
 //!    draws and the declaration an edit rewrites then come from one cascade
 //!    rather than two that have to agree.
 //! 2. It records `!important` as a fact on the declaration. The app's reader
-//!    keeps the flag inside the value text, so a value that goes through
-//!    `var()` substitution can no longer be recognised as important — and
+//!    kept the flag inside the value text, so a value that goes through
+//!    `var()` substitution could no longer be recognised as important — and
 //!    dropping the flag while rewriting a value changes which declaration
 //!    wins.
 //! 3. It exposes the winning declaration itself, so the writer can ask for
 //!    the property *as it was authored* instead of guessing a spelling.
 //!
-//! The writer still uses the app's reader today. Switching it is a change to
-//! [`crate::project_save`] and to [`crate::visual::owning_sheet`], which is the
-//! one place the cross-stylesheet ranking lives; see the report that came with
-//! this module for the exact shape of that change.
+//! The writer switched to it, and the cross-stylesheet ranking — the one place
+//! that decides which sheet owns a property — moved with it into
+//! [`crate::cascade`], which is the single implementation the writer and the
+//! renderer now share.
 //!
 //! # What is compared
 //!
@@ -134,6 +136,7 @@ use figcraft_doc::{Document, Node, NodeId, Sizing};
 use spool_source::manifest::{Manifest, ManifestError, NodeRecord};
 use spool_source::reader::{self, Read, ReadError};
 
+use crate::engine_project::drop_record;
 use crate::project_bundle::{BundleError, ProjectBundle, METADATA_FILE};
 use crate::project_save::{
     self, NewElement, Placement, SaveError, SaveOutcome, SourceEdit, UnsupportedEdit,
@@ -424,24 +427,6 @@ fn compile_baseline(manifest: &Manifest, sources: &BTreeMap<String, String>) -> 
             Baseline::Broken { unbound, reason }
         }
     }
-}
-
-/// Drop a node from a manifest, and the edges that named it.
-///
-/// The children of a dropped node are re-parented onto its own parent, so the
-/// manifest stays a tree the reader can compile.
-fn drop_record(manifest: &mut Manifest, id: u64) -> bool {
-    let Some(index) = manifest.nodes.iter().position(|record| record.id == id) else {
-        return false;
-    };
-    let record = manifest.nodes.remove(index);
-    for other in &mut manifest.nodes {
-        if other.parent == Some(id) {
-            other.parent = record.parent;
-        }
-        other.children.retain(|child| *child != id);
-    }
-    true
 }
 
 /// The persistent document the engine's document describes.

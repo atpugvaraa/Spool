@@ -61,7 +61,7 @@ use serde_json::Value as JsonValue;
 
 use crate::engine::canvas::EngineCanvas;
 use crate::engine::inspector_model as model;
-use crate::{canvas, theme};
+use crate::theme;
 
 /// The word for a property the selected objects disagree about.
 ///
@@ -562,10 +562,8 @@ impl Scrub {
 
     /// The box this scrub is describing, given where the pointer is.
     pub fn geometry_at(&self, screen_x: f32) -> model::Geometry {
-        self.property.write(
-            self.before,
-            self.value_at(screen_x, self.property.spec()),
-        )
+        self.property
+            .write(self.before, self.value_at(screen_x, self.property.spec()))
     }
 
     pub fn property(&self) -> Property {
@@ -906,33 +904,6 @@ pub fn color_hex(color: model::Color) -> String {
 // The layer name
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Which layer a rename request names.
-///
-/// The engine's identity for a layer is its node id, so that is what a rename
-/// names. The retired runtime's ids are runtime handles — allocated in document
-/// order, never durable — so they cannot name a layer in the engine's document
-/// at all. A request in that form is answered by a report rather than by a
-/// rename of the wrong layer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LayerRef {
-    /// A layer in the engine's document.
-    Engine(model::EngineObjectId),
-    /// A layer the retired runtime named.
-    Retired(canvas::ObjectId),
-}
-
-impl From<model::EngineObjectId> for LayerRef {
-    fn from(id: model::EngineObjectId) -> Self {
-        Self::Engine(id)
-    }
-}
-
-impl From<canvas::ObjectId> for LayerRef {
-    fn from(id: canvas::ObjectId) -> Self {
-        Self::Retired(id)
-    }
-}
-
 /// A layer name being edited.
 ///
 /// A buffer, not a second name store: the name only becomes real when Enter
@@ -1086,19 +1057,11 @@ pub struct Inspector {
 impl Inspector {
     /// The Inspector, before the engine canvas is attached.
     ///
-    /// The retired runtime's canvas is not read: the panel reads the engine's
-    /// document and writes through the engine's commands, so the retired
-    /// runtime's document is not a thing this panel looks at. It is observed
-    /// all the same, because a panel that never repaints shows a value the
-    /// document has already moved past, and until the shell attaches the engine
-    /// canvas the retired canvas is the only thing that says "something
-    /// changed".
-    ///
-    /// The parameter is here because the shell builds the Inspector before it
-    /// builds the engine canvas, and the two are joined by
-    /// [`Inspector::set_engine_canvas`].
-    pub fn new(retired: Entity<canvas::CanvasView>, cx: &mut Context<Self>) -> Self {
-        let observations = vec![cx.observe(&retired, |_, _, cx| cx.notify())];
+    /// The engine's canvas is not read yet: the panel reads the engine's
+    /// document and writes through the engine's commands, and the shell builds
+    /// the Inspector before it builds the engine canvas, so the two are joined
+    /// afterwards by [`Inspector::set_engine_canvas`].
+    pub fn new() -> Self {
         Self {
             engine: None,
             tab: 0,
@@ -1108,7 +1071,7 @@ impl Inspector {
             scrub: None,
             rename: None,
             palette: None,
-            observations,
+            observations: Vec::new(),
         }
     }
 
@@ -1136,34 +1099,15 @@ impl Inspector {
     /// commit, and the same Escape behaviour. The existing name arrives
     /// selected, because a rename that appends to the old name is a different
     /// command from renaming.
-    pub fn open_rename(&mut self, id: impl Into<LayerRef>, cx: &mut Context<Self>) {
-        let id = match id.into() {
-            LayerRef::Engine(id) => id,
-            LayerRef::Retired(id) => {
-                // The retired runtime's ids are runtime handles, not the
-                // engine's identity, so they cannot name a layer in the
-                // engine's document. Reported rather than guessed at: renaming
-                // the wrong layer is worse than not renaming one.
-                eprintln!("spool_inspector_rename_refused reason=retired_runtime_id id={id:?}");
-                return;
-            }
-        };
+    ///
+    /// The layer is named by the engine's identity. There is no other id space
+    /// to name it by, and a request in a form the engine cannot answer is not
+    /// a rename of some other layer.
+    pub fn open_rename(&mut self, id: model::EngineObjectId, cx: &mut Context<Self>) {
         let Some(name) = self.name_of(id, cx) else {
             return;
         };
         self.rename = Some(RenameSession::replacing(id, name));
-    }
-
-    /// Which layer is being renamed, if any.
-    ///
-    /// Presentation only: a layers panel shows the row without owning an
-    /// editing model of its own.
-    ///
-    /// The retired runtime's own ids are not the engine's identity, so a rename
-    /// in the engine's document has no retired id to report: the engine's
-    /// answer is [`Inspector::renaming_node`].
-    pub fn renaming(&self) -> Option<canvas::ObjectId> {
-        None
     }
 
     /// Which layer the engine is renaming, if any.
@@ -1358,11 +1302,7 @@ impl Inspector {
     }
 
     /// The name one layer has in the engine's document.
-    fn name_of(
-        &self,
-        id: model::EngineObjectId,
-        cx: &mut Context<Self>,
-    ) -> Option<String> {
+    fn name_of(&self, id: model::EngineObjectId, cx: &mut Context<Self>) -> Option<String> {
         let engine = self.engine.as_ref()?;
         engine.read(cx).with_session(|session| {
             let doc = session.doc().ok()?;
@@ -1416,9 +1356,7 @@ impl Inspector {
             return;
         };
         engine.update(cx, |canvas, cx| {
-            canvas.with_session_mut(cx, |session| {
-                session.commit_interaction().is_ok()
-            })
+            canvas.with_session_mut(cx, |session| session.commit_interaction().is_ok())
         });
     }
 
@@ -1428,9 +1366,7 @@ impl Inspector {
             return;
         };
         engine.update(cx, |canvas, cx| {
-            canvas.with_session_mut(cx, |session| {
-                session.cancel_interaction().is_ok()
-            })
+            canvas.with_session_mut(cx, |session| session.cancel_interaction().is_ok())
         });
     }
 
@@ -2928,7 +2864,10 @@ mod tests {
             Some(model::BoxProperty::X),
             "X is a property of the box"
         );
-        assert_eq!(Property::Width.box_property(), Some(model::BoxProperty::Width));
+        assert_eq!(
+            Property::Width.box_property(),
+            Some(model::BoxProperty::Width)
+        );
         assert_eq!(
             Property::Opacity.box_property(),
             None,
@@ -3267,15 +3206,40 @@ mod tests {
     // ── Which layer a request names ─────────────────────────────────────────
 
     #[test]
-    fn the_engines_node_id_names_a_layer_and_the_retired_runtimes_does_not() {
-        let engine: LayerRef = model::EngineObjectId(7).into();
-        assert_eq!(engine, LayerRef::Engine(model::EngineObjectId(7)));
-        let retired: LayerRef = canvas::ObjectId::LANDING.into();
-        assert_eq!(retired, LayerRef::Retired(canvas::ObjectId::LANDING));
-        assert_ne!(
-            engine, retired,
-            "the two id spaces are not the same id, and pretending they are would rename the wrong layer"
+    fn the_engines_node_id_names_a_layer() {
+        // One id space, and it is the engine's. The retired runtime's ids were
+        // runtime handles that could not name a layer in the engine's document
+        // at all, so there is nothing to compare them against.
+        let id = model::EngineObjectId(7);
+        assert_eq!(id, model::EngineObjectId(7));
+    }
+
+    // ── Which layer a request names ─────────────────────────────────────────
+
+    #[gpui::test]
+    fn a_rename_names_the_layer_the_engine_asked_for(cx: &mut gpui::TestAppContext) {
+        // The layer a rename names is the engine's own node id. There is one id
+        // space: the retired runtime's ids were runtime handles that could not
+        // name a layer in the engine's document at all.
+        let (root, window, _session, id) = open_panel(cx);
+        window.draw(
+            point(px(0.0), px(0.0)),
+            size(px(300.0), px(900.0)),
+            |_, _| root.clone().into_any_element(),
         );
+        window.run_until_parked();
+
+        let inspector = window.update(|_, cx| root.read_with(cx, |panel, _| panel.0.clone()));
+        window.update(|_, cx| {
+            inspector.update(cx, |inspector, cx| {
+                inspector.open_rename(model::EngineObjectId(id), cx);
+                assert_eq!(
+                    inspector.renaming_node(),
+                    Some(model::EngineObjectId(id)),
+                    "the rename names the engine's layer"
+                );
+            })
+        });
     }
 
     // ── The panel and the engine, in a window ───────────────────────────────
@@ -3328,8 +3292,7 @@ mod tests {
         let (session, id) = session_with_a_selected_rectangle();
         let (root, window) = cx.add_window_view(|_, cx| {
             let engine = cx.new(|cx| EngineCanvas::from_handle(Rc::clone(&session), cx));
-            let retired = cx.new(canvas::CanvasView::new_with_context);
-            let inspector = cx.new(|cx| Inspector::new(retired, cx));
+            let inspector = cx.new(|_| Inspector::new());
             inspector.update(cx, |inspector, cx| inspector.set_engine_canvas(engine, cx));
             Panel(inspector)
         });
@@ -3378,9 +3341,8 @@ mod tests {
         window.run_until_parked();
 
         let inspector = window.update(|_, cx| root.read_with(cx, |panel, _| panel.0.clone()));
-        let selected = window.update(|_, cx| {
-            inspector.update(cx, |inspector, cx| inspector.selected(cx))
-        });
+        let selected =
+            window.update(|_, cx| inspector.update(cx, |inspector, cx| inspector.selected(cx)));
         assert_eq!(selected.len(), 1, "one layer is selected");
         let object = &selected[0];
         assert_eq!(object.id, model::EngineObjectId(id));

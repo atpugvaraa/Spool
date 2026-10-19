@@ -461,7 +461,11 @@ mod tests {
 
         let loaded = project.open().expect("the canonical fixture opens");
         assert_eq!(loaded.document.structure.nodes.len(), 3);
-        assert_eq!(loaded.runtime.objects().len(), 3);
+        assert_eq!(
+            crate::engine_project::content_node_count(&loaded.engine.document),
+            3,
+            "and the engine's document holds the same three nodes"
+        );
         assert!(
             loaded.unrendered.is_empty(),
             "{}",
@@ -681,9 +685,9 @@ mod tests {
             match open(&path) {
                 Err(_) => {}
                 Ok(loaded) => panic!(
-                    "{why} ({}) must not open; produced {} objects",
+                    "{why} ({}) must not open; produced {} engine nodes",
                     path.display(),
-                    loaded.runtime.objects().len()
+                    crate::engine_project::content_node_count(&loaded.engine.document)
                 ),
             }
         }
@@ -725,7 +729,11 @@ mod tests {
         // project, and to get the same answer.
         let loaded = open(&root).expect("the new project opens");
         assert_eq!(loaded.document.structure.nodes.len(), 1, "one object");
-        assert_eq!(loaded.runtime.objects().len(), 1, "and it is drawable");
+        assert_eq!(
+            crate::engine_project::content_node_count(&loaded.engine.document),
+            1,
+            "and it is drawable"
+        );
         assert!(
             loaded.unrendered.is_empty(),
             "a new project has nothing unrendered: {:?}",
@@ -839,7 +847,10 @@ mod tests {
         let root = fresh("peer");
         create(&root).expect("creates");
         let loaded = open(&root).expect("opens");
-        assert_eq!(loaded.runtime.objects().len(), 1);
+        assert_eq!(
+            crate::engine_project::content_node_count(&loaded.engine.document),
+            1
+        );
 
         // And a created object survives save and reopen in it, which is the whole
         // product loop and the reason the project exists.
@@ -871,7 +882,10 @@ mod tests {
 
         let reopened = open(&root).expect("reopens");
         assert_eq!(reopened.document.structure.nodes.len(), 2);
-        assert_eq!(reopened.runtime.objects().len(), 2);
+        assert_eq!(
+            crate::engine_project::content_node_count(&reopened.engine.document),
+            2
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1120,7 +1134,7 @@ mod tests {
         let reopened = open(&root).expect("reopens");
         assert_eq!(reopened.document.structure.nodes[1].name, "Hero headline");
         assert_eq!(
-            reopened.runtime.objects().len(),
+            crate::engine_project::content_node_count(&reopened.engine.document),
             3,
             "the project is still a whole project"
         );

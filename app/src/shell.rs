@@ -1,25 +1,25 @@
 use gpui::{
-    div, prelude::*, px, rgb, App, Context, Entity, Modifiers, Render, SharedString,
-    Subscription, Window,
+    div, prelude::*, px, rgb, App, Context, Entity, Modifiers, Render, SharedString, Subscription,
+    Window,
 };
 use std::cell::Cell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use crate::{canvas, commands, inspector, layers::LayersView, project_open, theme};
+use crate::{commands, inspector, project_open, theme, tools};
 
 /// The tools the toolbar offers, in the order it shows them.
 ///
 /// `pub(crate)` so the window-level interaction tests can enumerate exactly what
 /// the toolbar renders rather than keeping a second list that could drift.
-pub(crate) const TOOLS: [(&str, &str, &str, canvas::Tool); 7] = [
-    ("↖", "Select", "V", canvas::Tool::Select),
-    ("▱", "Frame", "F", canvas::Tool::Frame),
-    ("□", "Rectangle", "R", canvas::Tool::Rectangle),
-    ("○", "Ellipse", "O", canvas::Tool::Ellipse),
-    ("⌁", "Pen", "P", canvas::Tool::Pen),
-    ("T", "Text", "T", canvas::Tool::Text),
-    ("◌", "Comment", "C", canvas::Tool::Comment),
+pub(crate) const TOOLS: [(&str, &str, &str, tools::Tool); 7] = [
+    ("↖", "Select", "V", tools::Tool::Select),
+    ("▱", "Frame", "F", tools::Tool::Frame),
+    ("□", "Rectangle", "R", tools::Tool::Rectangle),
+    ("○", "Ellipse", "O", tools::Tool::Ellipse),
+    ("⌁", "Pen", "P", tools::Tool::Pen),
+    ("T", "Text", "T", tools::Tool::Text),
+    ("◌", "Comment", "C", tools::Tool::Comment),
 ];
 
 const PAGES: [&str; 4] = ["Landing", "App", "Components", "Explorations"];
@@ -31,15 +31,15 @@ const PAGES: [&str; 4] = ["Landing", "App", "Components", "Explorations"];
 /// the engine because the engine's names are the upstream's, not Spool's to
 /// change. `Select` is the engine's `move`: the select tool IS the move tool
 /// with the pointer, and the engine's tool table has no separate select.
-pub(crate) fn engine_tool_name(tool: canvas::Tool) -> &'static str {
+pub(crate) fn engine_tool_name(tool: tools::Tool) -> &'static str {
     match tool {
-        canvas::Tool::Select => "move",
-        canvas::Tool::Frame => "frame",
-        canvas::Tool::Rectangle => "rectangle",
-        canvas::Tool::Ellipse => "ellipse",
-        canvas::Tool::Pen => "pen",
-        canvas::Tool::Text => "text",
-        canvas::Tool::Comment => "comment",
+        tools::Tool::Select => "move",
+        tools::Tool::Frame => "frame",
+        tools::Tool::Rectangle => "rectangle",
+        tools::Tool::Ellipse => "ellipse",
+        tools::Tool::Pen => "pen",
+        tools::Tool::Text => "text",
+        tools::Tool::Comment => "comment",
     }
 }
 
@@ -83,20 +83,19 @@ fn development_override() -> Option<PathBuf> {
         .filter(|path| !path.as_os_str().is_empty())
 }
 
-/// Load the requested project into `view`.
+/// Load the requested project.
 ///
 /// Returns the message to show the user when the project could not be opened.
 /// Three outcomes, kept distinct because they mean different things:
 ///
 /// - **no project requested** — the starter scene, which is a normal state.
-/// - **a project that opened** — loaded into the canvas.
+/// - **a project that opened** — compiled into the engine's document.
 /// - **a project that did not open** — an error, reported on stderr *and* shown
 ///   in the window. The starter scene is still what is on screen, but it is
 ///   never presented as though it were the project: a named project that failed
 ///   to open has failed, and saying so is the whole point of reporting it.
 fn load_requested_project(
     request: Option<&ProjectRequest>,
-    view: &mut canvas::CanvasView,
 ) -> (
     Option<SharedString>,
     Option<crate::engine_project::EngineProject>,
@@ -120,19 +119,15 @@ fn load_requested_project(
             // Reported so a launch log shows what actually opened, rather than
             // leaving the operator to infer it from pixels.
             eprintln!(
-                "spool_project_open ok root={} persistent_nodes={} runtime_objects={} unrendered={:?} unstyled={:?}",
+                "spool_project_open ok root={} persistent_nodes={} engine_nodes={} unrendered={:?} unresolved={:?}",
                 loaded.root.display(),
                 loaded.document.structure.nodes.len(),
-                loaded.runtime.objects().len(),
+                crate::engine_project::content_node_count(&loaded.engine.document),
                 loaded.unrendered,
-                loaded.unstyled,
+                loaded.engine.unresolved,
             );
-            // The engine's own document, taken before `loaded` is moved into the
-            // retired canvas. This is the document the engine frontend draws; the
-            // old runtime keeps its copy for as long as both paths exist.
             let engine = loaded.engine.clone();
             let root = loaded.root.clone();
-            view.load_project(loaded);
             (None, Some(engine), Some(root))
         }
         Err(error) => {
@@ -259,16 +254,13 @@ fn shellexpand_home(path: &str) -> String {
 pub struct AppShell {
     /// The directory the open project came from.
     ///
-    /// Kept here because the save path needs it and the retired canvas's own
-    /// copy is private with no accessor. The save writes the ENGINE's document
-    /// back to these files, so this is the one thing the shell must still know
-    /// about the project on disk.
+    /// Kept here because the save path needs it. The save writes the ENGINE's
+    /// document back to these files, so this is the one thing the shell must
+    /// still know about the project on disk.
     project_root: Option<PathBuf>,
-    canvas: Entity<canvas::CanvasView>,
-    layers: Entity<LayersView>,
-    /// The editor over the figcraft engine. This is the one the application is
-    /// migrating to; `canvas` above is the retired hand-written runtime and is
-    /// still mounted only until the panels behind it are ported.
+    /// The editor over the figcraft engine. This is the editor: the retired
+    /// hand-written runtime is gone, and the engine's document is the only
+    /// model of the open project.
     engine_canvas: Entity<crate::engine::canvas::EngineCanvas>,
     /// The engine's layers panel, sharing the one session with `engine_canvas`.
     engine_layers: Entity<crate::engine::layers::LayersPanel>,
@@ -282,18 +274,18 @@ pub struct AppShell {
     new_project: Option<NewProjectPrompt>,
     /// A message shown over the canvas, and whether it reports a failure.
     ///
-    /// Carries the result of the last save, the result of opening the
-    /// requested project, and the last edit the canvas refused. All have to be
-    /// visible for the same reason: a save that silently dropped an edit, a
-    /// project that silently failed to open and left the starter scene on
-    /// screen, or an edit that was refused and put back, would each look
-    /// identical to one that succeeded.
+    /// Carries the result of the last save and the result of opening the
+    /// requested project. Both have to be visible for the same reason: a save
+    /// that silently dropped an edit, or a project that silently failed to open
+    /// and left the starter scene on screen, would each look identical to one
+    /// that succeeded.
     save_status: Option<(SharedString, bool)>,
     /// Repaint subscriptions that must outlive this function.
     ///
     /// A dropped `Subscription` detaches its observer, so the shell keeps them
-    /// for its whole life: it reads the canvas on every render, and a canvas
-    /// edit has to cause a shell render or the surrounding chrome goes stale.
+    /// for its whole life: the two engine panels share one session and cannot
+    /// see each other's edits, so this is where cross-panel invalidation
+    /// happens.
     /// Nothing reads this field; holding it is the point.
     #[allow(dead_code)]
     observations: Vec<Subscription>,
@@ -306,13 +298,10 @@ impl AppShell {
     /// no argument — is the ordinary empty state, and is also what the tests and
     /// the `SPOOL_PROJECT` override rely on.
     pub fn new_with_project(requested: Option<PathBuf>, cx: &mut Context<Self>) -> Self {
-        let canvas = cx.new(canvas::CanvasView::new_with_context);
         let request = project_request(requested, development_override());
-        let (message, engine, root) =
-            canvas.update(cx, |view, _| load_requested_project(request.as_ref(), view));
+        let (message, engine, root) = load_requested_project(request.as_ref());
         let status = message.map(|message| (message, true));
-        let layers = cx.new(|_| LayersView::new(canvas.downgrade()));
-        let inspector = cx.new(|cx| inspector::Inspector::new(canvas.clone(), cx));
+        let inspector = cx.new(|_| inspector::Inspector::new());
 
         // The engine frontend. ONE session is built here and shared: the canvas
         // owns it, and the layers panel takes the same `Rc<RefCell<Session>>`.
@@ -331,8 +320,7 @@ impl AppShell {
         // The Inspector is built before the engine canvas exists, so it is
         // joined to it afterwards. It reads the engine's document and the
         // engine's selection; without this it would show "No selection" for
-        // ever, because the retired canvas is no longer mounted and its
-        // selection is always empty.
+        // ever, because nothing else holds a selection.
         inspector.update(cx, |inspector, cx| {
             inspector.set_engine_canvas(engine_canvas.clone(), cx);
         });
@@ -359,12 +347,6 @@ impl AppShell {
         // them again.
         let seen: Rc<Cell<u64>> = Rc::new(Cell::new(u64::MAX));
         let observations = vec![
-            cx.observe(&canvas, |shell, canvas, cx| {
-                if let Some(message) = canvas.update(cx, |canvas, _| canvas.take_refusal()) {
-                    shell.save_status = Some((message.into(), true));
-                }
-                cx.notify();
-            }),
             cx.observe(&engine_canvas, {
                 let seen = Rc::clone(&seen);
                 move |shell, canvas, cx| {
@@ -386,8 +368,6 @@ impl AppShell {
         ];
         Self {
             project_root: root,
-            canvas,
-            layers,
             engine_canvas,
             engine_layers,
             inspector,
@@ -402,27 +382,6 @@ impl AppShell {
         }
     }
 
-    /// Run a canvas mutation and repaint both sides of the editor.
-    ///
-    /// The canvas and the Inspector are two views of one document, so a change
-    /// made through either has to redraw both. Notifying the canvas alone leaves
-    /// the fields showing a value the canvas has already moved past; notifying
-    /// the shell alone leaves the object where it was on screen.
-    fn edit_canvas<T>(
-        &mut self,
-        cx: &mut Context<Self>,
-        edit: impl FnOnce(&mut canvas::CanvasView, &mut Context<canvas::CanvasView>) -> T,
-    ) -> T {
-        let result = self.canvas.update(cx, |canvas, cx| edit(canvas, cx));
-        self.canvas.update(cx, |_, cx| cx.notify());
-        result
-    }
-
-    /// Keys pressed while an Inspector rename is in progress.
-    ///
-    /// Returns `true` when the key belonged to the rename, so the editor's own
-    /// shortcuts stay out of the way: typing `f` into a name must not also
-    /// switch to the frame tool.
     /// Escape, as one ladder walked from the top.
     ///
     /// What Escape cancels must never depend on which listener happened to see
@@ -446,44 +405,23 @@ impl AppShell {
     ///
     /// Returns whether anything was cancelled, so the caller knows the key was
     /// consumed.
-    /// Release the pan modifier, whatever else happens.
-    ///
-    /// The space bar is the one piece of state in the editor that a key-down
-    /// sets and a key-up clears, and it is only correct while both halves arrive.
-    /// Escape is the way to lose the second half deliberately: the user is
-    /// asking to back out of whatever they started, and "you are still holding
-    /// the pan modifier" is not it.
-    ///
-    /// Cheap and unconditional: the worst a redundant call costs is one
-    /// comparison, and being wrong here is a canvas that silently stops
-    /// responding to drags.
-    fn release_pan_modifier(&mut self, cx: &mut Context<Self>) {
-        self.canvas
-            .update(cx, |canvas, _| canvas.set_space_held(false));
-    }
-
     fn escape_topmost(&mut self, cx: &mut Context<Self>) -> bool {
-        // Any rung at all, so the pan modifier is released on the way past.
-        self.release_pan_modifier(cx);
         // Whatever the Inspector is part-way through — a number being typed, a
         // name being typed, or a drag in flight — is read as one rung. The
         // panel walks its own rungs internally, in the same order, so the two
         // cannot disagree about which of its two states is on top.
         //
         // The rungs are read from the ENGINE, because the engine is what holds
-        // the document, the selection, the tool and the text session now. Read
-        // from the retired runtime the ladder would answer about a document
-        // nobody is editing: it would never see the selection, so it would
-        // skip the selection rung and the ordering it exists to protect would
-        // be gone.
-        let engine_canvas = self.engine_canvas.read(cx);
-        let (gesture, text_editing, has_selection, tool_is_held) = (
-            engine_canvas.busy(),
-            engine_canvas.is_editing_text(),
-            !engine_canvas.selection().is_empty(),
-            engine_canvas.active_tool() != "move",
-        );
-        drop(engine_canvas);
+        // the document, the selection, the tool and the text session now.
+        let (gesture, text_editing, has_selection, tool_is_held) = {
+            let engine_canvas = self.engine_canvas.read(cx);
+            (
+                engine_canvas.busy(),
+                engine_canvas.is_editing_text(),
+                !engine_canvas.selection().is_empty(),
+                engine_canvas.active_tool() != "move",
+            )
+        };
         let state = commands::EscapeState {
             panel: self.ai_open || self.share_open || self.export_open || self.zoom_open,
             inspector: self
@@ -508,8 +446,7 @@ impl AppShell {
                 .update(cx, |inspector, cx| inspector.cancel_in_flight(cx)),
             // The engine's own escape: it knows whether a gesture is in flight
             // and whether a text session is open, and it cancels whichever is
-            // actually there. The retired runtime's two separate calls cannot
-            // be used, because neither of them knows about the engine's state.
+            // actually there.
             Some(commands::Rung::Gesture) | Some(commands::Rung::TextEditing) => {
                 self.engine_canvas.update(cx, |canvas, cx| {
                     canvas.escape(cx);
@@ -620,9 +557,7 @@ impl AppShell {
         };
         eprintln!("spool_project_create ok root={}", project.root().display());
         let request = ProjectRequest::Project(path.clone());
-        let (message, engine, root) = self
-            .canvas
-            .update(cx, |view, _| load_requested_project(Some(&request), view));
+        let (message, engine, root) = load_requested_project(Some(&request));
         self.project_root = root;
         if let Some(message) = message {
             self.save_status = Some((message, true));
@@ -659,18 +594,17 @@ impl AppShell {
 
     /// The one place a keystroke the whole editor answers to is handled.
     ///
-    /// Four steps, always in this order, and the order is the whole point: what
+    /// Three steps, always in this order, and the order is the whole point: what
     /// a key means is decided by which surface is above, never by which listener
     /// happened to run first.
     ///
-    /// 1. A performance workload owns the input outright while it is running.
-    /// 2. The Inspector gets first refusal. A number or a name being typed is
+    /// 1. The Inspector gets first refusal. A number or a name being typed is
     ///    not an editor shortcut, so letters go into the field rather than into
     ///    the tool shortcuts. It declines Escape, which is the ladder's.
-    /// 3. Escape walks [`commands::EscapeState`] from the top. It is not in the
+    /// 2. Escape walks [`commands::EscapeState`] from the top. It is not in the
     ///    command table, because "leave the most recent thing you entered" is
     ///    not one of the table's verbs.
-    /// 4. Everything else is one row of [`commands::resolve`].
+    /// 3. Everything else is one row of [`commands::resolve`].
     fn handle_key(
         &mut self,
         key: &str,
@@ -678,9 +612,6 @@ impl AppShell {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        if self.canvas.read(cx).workload_controls_input() {
-            return;
-        }
         // An open prompt owns the keyboard outright: it is the only surface
         // accepting a path right now, so letting the Inspector or an editor
         // shortcut answer first would type into the wrong place.
@@ -699,22 +630,13 @@ impl AppShell {
         }
         // While the engine canvas owns the keyboard, the engine is the
         // authority: its own keymap dispatches figcraft command ids, and its
-        // gesture handling answers the keys that are not commands. The retired
-        // runtime's command table must not answer the same chord as well, or
-        // one Cmd+Z would undo twice -- once in each runtime.
+        // gesture handling answers the keys that are not commands. The shell's
+        // command table must not answer the same chord as well, or one Cmd+Z
+        // would undo twice -- once in each runtime.
         if self.engine_canvas.read(cx).has_focus(window) {
             return;
         }
-        // The pan modifier is held rather than pressed, so it is not a command
-        // and has no place in the table: it is answered on the way down and
-        // released on the way up. Space still scrolls the page when there is
-        // nothing to pan, so it is answered only here and nowhere else.
-        if matches!(key, "space" | " ") {
-            self.canvas
-                .update(cx, |canvas, _| canvas.set_space_held(true));
-            return;
-        }
-        let scope = if self.canvas.read(cx).is_text_editing() {
+        let scope = if self.engine_canvas.read(cx).is_editing_text() {
             commands::Scope::TextEditing
         } else {
             commands::Scope::Editor
@@ -724,29 +646,11 @@ impl AppShell {
         }
     }
 
-    /// Whether the toolbar should show `tool` as the one in effect.
-    ///
-    /// One method rather than the expression written out in each toolbar,
-    /// because there are two of them and they had already drifted: when the shell
-    /// carried its own copy of the active tool, the two toolbars and the Escape
-    /// logic each read a different field. Reading the canvas here means there is
-    /// only one answer to this question in the program.
-    fn tool_is_highlighted(&self, tool: canvas::Tool, cx: &App) -> bool {
-        self.canvas.read(cx).tool() == tool
-    }
-
-    /// The same question, for the window-level interaction tests.
-    #[cfg(test)]
-    pub fn test_tool_is_highlighted(&self, tool: canvas::Tool, cx: &App) -> bool {
-        self.tool_is_highlighted(tool, cx)
-    }
-
     /// Choose a tool, on the engine.
     ///
-    /// The toolbar's buttons go through here rather than through the retired
-    /// canvas, because the engine is what the user is now editing. The name is
-    /// the engine's own, so this is the same call a shortcut, the CLI or an
-    /// agent would make.
+    /// The toolbar's buttons go through here, and so does every shortcut: the
+    /// engine is what the user is editing. The name is the engine's own, so
+    /// this is the same call a shortcut, the CLI or an agent would make.
     fn select_engine_tool(&mut self, tool: &str, cx: &mut Context<Self>) {
         self.engine_canvas
             .update(cx, |canvas, cx| canvas.set_tool(tool, cx));
@@ -778,16 +682,6 @@ impl AppShell {
         self.engine_tool_is_highlighted(tool, cx)
     }
 
-    /// The canvas entity, for the window-level interaction tests.
-    ///
-    /// Test-only because it is only ever needed to ask the canvas something from
-    /// outside its own module: those tests drive a real window, and a real
-    /// window reaches the canvas through the shell that contains it.
-    #[cfg(test)]
-    pub fn canvas(&self) -> &Entity<canvas::CanvasView> {
-        &self.canvas
-    }
-
     /// The message over the canvas and whether it reports a failure, for the
     /// window-level interaction tests.
     #[cfg(test)]
@@ -799,10 +693,10 @@ impl AppShell {
 
     /// Carry out one editor-wide command.
     ///
-    /// Every history-affecting arm below goes through the canvas, which commits
-    /// to the one `EditSession` history the pointer uses. There is no second
-    /// route from the keyboard to the document, and no arm that edits state
-    /// directly: a command that mutated here would be invisible to undo.
+    /// Every history-affecting arm below goes through the engine, which commits
+    /// to the one history the pointer uses. There is no second route from the
+    /// keyboard to the document, and no arm that edits state directly: a
+    /// command that mutated here would be invisible to undo.
     fn run_command(&mut self, command: commands::Command, cx: &mut Context<Self>) {
         match command {
             commands::Command::Undo => {
@@ -837,15 +731,15 @@ impl AppShell {
                 // children, out to the parent. One command per rung, so the
                 // ladder is the engine's and not a second list here.
                 let id = match step {
-                    canvas::Traversal::Sibling(next) => {
+                    tools::Traversal::Sibling(next) => {
                         if next {
                             "select.next"
                         } else {
                             "select.previous"
                         }
                     }
-                    canvas::Traversal::Descend => "select.children",
-                    canvas::Traversal::Ascend => "select.parent",
+                    tools::Traversal::Descend => "select.children",
+                    tools::Traversal::Ascend => "select.parent",
                 };
                 self.run_engine_command(id, serde_json::json!({}), cx);
             }
@@ -894,9 +788,7 @@ impl AppShell {
     /// does nothing otherwise, and renaming forty layers into one string would
     /// not be a rename.
     fn rename_selection(&mut self, cx: &mut Context<Self>) {
-        // The engine's selection, and the engine's identity. The retired
-        // canvas's object id is a runtime handle, not the engine's node id, so
-        // it cannot name a layer in the engine's document.
+        // The engine's selection, and the engine's identity.
         let ids = self.engine_canvas.read(cx).selection();
         let [id] = ids.as_slice() else {
             return;
@@ -909,14 +801,12 @@ impl AppShell {
 
     /// Save the open project and report what actually happened.
     ///
-    /// Goes through the canvas so there is exactly one save path, and says what
-    /// could not be written rather than implying everything persisted.
+    /// Goes through the engine's document, so there is exactly one save path,
+    /// and says what could not be written rather than implying everything
+    /// persisted.
     fn save_project(&mut self, cx: &mut Context<Self>) {
         // The ENGINE's document is what is saved, because the engine is what the
-        // user has been editing. The retired canvas's document is not: nothing
-        // has been changing it since the swap, so saving it would write the
-        // project's state as it was BEFORE the session -- silently undoing the
-        // user's work on disk.
+        // user has been editing.
         let Some(root) = self.project_root.clone() else {
             self.save_status = Some(("No project open".into(), true));
             cx.notify();
@@ -932,9 +822,10 @@ impl AppShell {
             return;
         };
         let status = match crate::engine::source_edits::save_engine_document(&root, &document) {
-            Ok(outcome) if outcome.written.is_empty()
-                && outcome.unsupported.is_empty()
-                && outcome.notes.is_empty() =>
+            Ok(outcome)
+                if outcome.written.is_empty()
+                    && outcome.unsupported.is_empty()
+                    && outcome.notes.is_empty() =>
             {
                 "No changes to save".to_owned()
             }
@@ -1261,7 +1152,12 @@ impl AppShell {
     }
 
     fn zoom_control(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let label = format!("{}%", self.canvas.read(cx).zoom_percent());
+        // The engine's own camera, so the readout cannot drift from what the
+        // canvas is actually showing.
+        let label = format!(
+            "{}%",
+            (self.engine_canvas.read(cx).view().zoom * 100.0).round() as i64
+        );
         let mut control = div().relative().child(
             div()
                 .id("zoom-control")
@@ -1327,13 +1223,21 @@ impl AppShell {
             .text_xs()
             .text_color(rgb(theme::TEXT_SECONDARY))
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.canvas.update(cx, |canvas, _| {
-                    if let Some(zoom_percent) = zoom_percent {
-                        canvas.set_zoom_percent(zoom_percent);
-                    } else {
-                        canvas.fit_canvas();
+                // The engine's own camera commands, so the zoom a menu item
+                // asks for is the zoom the engine's keymap and the CLI ask
+                // for.
+                match zoom_percent {
+                    Some(percent) => {
+                        this.run_engine_command(
+                            "view.set",
+                            serde_json::json!({ "zoom": f64::from(percent) / 100.0 }),
+                            cx,
+                        );
                     }
-                });
+                    None => {
+                        this.run_engine_command("view.zoomFit", serde_json::json!({}), cx);
+                    }
+                }
                 this.zoom_open = false;
                 cx.notify();
             }))
@@ -1376,9 +1280,8 @@ impl AppShell {
             );
         }
 
-        // Not `.cached(..)`: the retired `LayersView` was wrapped in a styled
-        // element, and the engine panel paints its own rows. Caching it inside a
-        // `cached_style` element has nothing to cache.
+        // Not `.cached(..)`: the engine panel paints its own rows, and caching
+        // it inside a `cached_style` element has nothing to cache.
         let tree = self.engine_layers.clone();
 
         div()
@@ -1698,31 +1601,6 @@ impl Render for AppShell {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::diagnostics::count("shell_render", 1);
         let render_start = crate::diagnostics::start();
-        // The Layers panel owns no editing state: it says which row the user
-        // double-clicked, and the surface that owns the editing model opens it.
-        // One rename model means one history boundary no matter which surface
-        // started it.
-        let requested = self
-            .layers
-            .update(cx, |layers, _| layers.take_rename_request());
-        self.inspector.update(cx, |inspector, cx| {
-            if let Some(id) = requested {
-                inspector.open_rename(id, cx);
-            }
-        });
-        let renaming_row = self.inspector.read(cx).renaming();
-        self.layers.update(cx, |layers, cx| {
-            // Structure changes and selection changes both notify the Layers
-            // view so its subtree rebuilds. Selection changes are first
-            // reduced to an O(changed rows) presentation diff (counted as
-            // `row_presentation_updates`); applying the diff requires the
-            // subtree rebuild described in the Phase 15 report.
-            layers.set_renaming(renaming_row);
-            let outcome = layers.synchronize(self.canvas.read(cx));
-            if outcome.structure_changed || !outcome.presentation.is_empty() {
-                cx.notify();
-            }
-        });
         let element = div()
             .id("spool-shell")
             .flex()
@@ -1746,18 +1624,6 @@ impl Render for AppShell {
                     });
                 }
             })
-            .on_mouse_down(
-                gpui::MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    if this.canvas.read(cx).workload_controls_input() {
-                        return;
-                    }
-                    if this.canvas.read(cx).is_text_editing() {
-                        this.canvas
-                            .update(cx, |canvas, cx| canvas.commit_text_edit_session(cx));
-                    }
-                }),
-            )
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
                 this.handle_key(
                     event.keystroke.key.as_str(),
@@ -1765,12 +1631,6 @@ impl Render for AppShell {
                     window,
                     cx,
                 );
-            }))
-            .on_key_up(cx.listener(|this, event: &gpui::KeyUpEvent, _, cx| {
-                if matches!(event.keystroke.key.as_str(), "space" | " ") {
-                    this.canvas
-                        .update(cx, |canvas, _| canvas.set_space_held(false));
-                }
             }))
             .child(self.top_bar(cx))
             .child(self.render_body(cx));
