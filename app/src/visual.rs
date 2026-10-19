@@ -606,7 +606,15 @@ fn resolve_across(
     sheets: &[(String, Stylesheet)],
     facts: &ElementFacts,
 ) -> BTreeMap<String, String> {
-    let winners = rank_across(sheets, &facts.tag, &facts.classes, facts.id.as_deref());
+    let winners = rank_across(
+        sheets
+            .iter()
+            .enumerate()
+            .map(|(index, (_, sheet))| (index, sheet)),
+        &facts.tag,
+        &facts.classes,
+        facts.id.as_deref(),
+    );
     let mut out: BTreeMap<String, String> = BTreeMap::new();
     for (property, winner) in winners.by_property {
         out.insert(property, winner.value);
@@ -619,22 +627,60 @@ fn resolve_across(
     out
 }
 
+/// Which of `sheets` the cascade says owns `property` for this element.
+///
+/// The index is into `sheets` as given, so a caller that already has the sheets
+/// in link order can name the file without re-deriving the order.
+///
+/// This is [`rank_across`] asked the one question a writer has. It exists so
+/// that deciding *which* declaration owns a value and deciding *what value* it
+/// resolves to are the same traversal: the renderer takes the values out of
+/// [`rank_across`] and a source-preserving edit takes the owning sheet out of
+/// here, so the span an edit rewrites and the fill the user is looking at cannot
+/// come from different rules.
+///
+/// `property` is a computed longhand — the same key [`Stylesheet::resolve_ranked`]
+/// reports under — because that is what both sides of the cascade compare on.
+pub(crate) fn owning_sheet(
+    sheets: &[&Stylesheet],
+    tag: &str,
+    classes: &[String],
+    id: Option<&str>,
+    property: &str,
+) -> Option<usize> {
+    let winners = rank_across(
+        sheets
+            .iter()
+            .enumerate()
+            .map(|(index, sheet)| (index, *sheet)),
+        tag,
+        classes,
+        id,
+    );
+    winners.by_property.get(property).map(|winner| winner.sheet)
+}
+
 /// The winner for every computed longhand, across every stylesheet the document
 /// links.
 ///
 /// One traversal, shared by every caller that asks an element what its sheets
-/// say — including the inherited-text path, which asks one property at a time.
-/// Having a single ranked merge is what stops one of those callers from
-/// answering "whichever sheet mentioned it" while the other answers "whichever
-/// selector was most specific".
-fn rank_across(
-    sheets: &[(String, Stylesheet)],
+/// say — including the inherited-text path, which asks one property at a time,
+/// and the writer, which asks which sheet owns a declaration. Having a single
+/// ranked merge is what stops one of those callers from answering "whichever
+/// sheet mentioned it" while the other answers "whichever selector was most
+/// specific".
+///
+/// `sheets` is `(index, sheet)` rather than a collection, because the index is
+/// the link-order tie-break and has to survive a caller that holds borrowed
+/// sheets in a different container than the renderer does.
+fn rank_across<'a>(
+    sheets: impl IntoIterator<Item = (usize, &'a Stylesheet)>,
     tag: &str,
     classes: &[String],
     id: Option<&str>,
 ) -> Winners {
     let mut winners = Winners::default();
-    for (index, (_, sheet)) in sheets.iter().enumerate() {
+    for (index, sheet) in sheets {
         for (property, resolved) in sheet.resolve_ranked(tag, classes, id) {
             winners.consider(property, index, resolved);
         }
@@ -1170,10 +1216,18 @@ impl Wrapper {
         if let Some(inline) = self.inline.get(property) {
             return Some(inline.clone());
         }
-        rank_across(sheets, &self.tag, &self.classes, self.id.as_deref())
-            .by_property
-            .get(property)
-            .map(|winner| winner.value.clone())
+        rank_across(
+            sheets
+                .iter()
+                .enumerate()
+                .map(|(index, (_, sheet))| (index, sheet)),
+            &self.tag,
+            &self.classes,
+            self.id.as_deref(),
+        )
+        .by_property
+        .get(property)
+        .map(|winner| winner.value.clone())
     }
 }
 

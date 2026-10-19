@@ -1145,40 +1145,85 @@ impl<'a> AuthoredFiles<'a> {
             return self.authored_inline(property, authored, ownership);
         }
 
-        // Across files the cascade is last-wins: `self.sheet_names` is in the order
-        // the documents link the sheets, and a sheet linked later overrides an
-        // earlier one. So the owner is the *last* sheet with a winning
-        // declaration, not the first — which is the opposite of what this loop
-        // used to do, and disagreed with the renderer for any project whose
-        // sheets are linked in an order that is not their name order.
+        // Across files the cascade is decided by specificity first, with link
+        // order as the *last* tie-break — not by link order as an override.
+        // `self.sheet_names` is in the order the documents link the sheets, but
+        // that only settles ties: an `#hero` in an earlier sheet outranks a
+        // `.cta` in a later one. Keeping the last sheet that mentioned the
+        // property therefore rewrote a declaration that had already lost, and
+        // the file on disk ended up naming a different owner for the value than
+        // the renderer had been drawing.
+        //
+        // The ranking itself is not restated here: `owning_sheet` is the same
+        // traversal the renderer resolves values through, so the sheet that
+        // answers "what is drawn" and the sheet that answers "what may be
+        // rewritten" cannot come apart.
         //
         // The rewindability check runs on the sheet that actually won, because
         // that is the only one an edit here would be rewriting.
-        let mut owner: Option<StyleTarget> = None;
-        for name in &self.sheet_names {
-            let Some(sheet) = self.sheets.get(name) else {
-                return Err(unreadable(name, property));
-            };
-            let Some((range, spelling)) =
-                winning_declaration(sheet, &tag, &classes, id.as_deref(), property)
-            else {
-                continue;
-            };
-            let authored = self
-                .texts
-                .get(name)
-                .and_then(|contents| contents.get(range.clone()))
-                .unwrap_or("")
-                .to_owned();
-            self.check_rewritable(name, &range, &spelling, &authored, ownership)?;
-            owner = Some(StyleTarget::Declaration {
-                file: name.clone(),
-                range,
-                authored,
-            });
-        }
-        // Nothing authored here, so the element itself becomes the owner.
-        Ok(owner.unwrap_or(StyleTarget::Element { authored: None }))
+        let owning = self.owning_sheet_for(&tag, &classes, id.as_deref(), property);
+        let Some(index) = owning else {
+            // Nothing authored here, so the element itself becomes the owner.
+            return Ok(StyleTarget::Element { authored: None });
+        };
+        let name = &self.sheet_names[index];
+        let sheet = self
+            .sheets
+            .get(name)
+            .ok_or_else(|| unreadable(name, property))?;
+        // The per-sheet span is `declaration_value_range`'s job and is correct
+        // as written: it names the declaration that won *inside* the sheet the
+        // cascade chose, so the two answers describe the same declaration.
+        let Some((range, spelling)) =
+            winning_declaration(sheet, &tag, &classes, id.as_deref(), property)
+        else {
+            return Ok(StyleTarget::Element { authored: None });
+        };
+        let authored = self
+            .texts
+            .get(name)
+            .and_then(|contents| contents.get(range.clone()))
+            .unwrap_or("")
+            .to_owned();
+        self.check_rewritable(name, &range, &spelling, &authored, ownership)?;
+        Ok(StyleTarget::Declaration {
+            file: name.clone(),
+            range,
+            authored,
+        })
+    }
+
+    /// Which stylesheet owns `property` on this element, by index into
+    /// [`Self::sheet_names`].
+    ///
+    /// The answer is the renderer's, obtained from the shared ranking rather
+    /// than from a second cascade spelled out here.
+    ///
+    /// A sheet this save could not read is not a sheet without an opinion:
+    /// [`Self::style_target`] has already refused unreadable files before
+    /// getting here, so an absent entry means the caller asked a question this
+    /// snapshot cannot answer, and `None` sends the edit to the element rather
+    /// than to a declaration chosen without all the evidence.
+    fn owning_sheet_for(
+        &self,
+        tag: &str,
+        classes: &[String],
+        id: Option<&str>,
+        property: &str,
+    ) -> Option<usize> {
+        // `Stylesheet::resolve_ranked` reports a property under its computed
+        // longhand, so a shorthand is asked for by the name that longhand.
+        // `ownership_spellings` already lists the spellings a visual property
+        // may be authored as; the first one that the cascade reports is the
+        // group both of them are answering about.
+        let sheets: Vec<&Stylesheet> = self
+            .sheet_names
+            .iter()
+            .map(|name| self.sheets.get(name))
+            .collect::<Option<Vec<_>>>()?;
+        ownership_spellings(property)
+            .into_iter()
+            .find_map(|spelling| crate::visual::owning_sheet(&sheets, tag, classes, id, spelling))
     }
 
     /// Guard the two ways rewriting a declaration would not mean what it says.
@@ -1319,6 +1364,10 @@ fn winning_declaration(
 fn ownership_spellings(property: &str) -> Vec<&str> {
     match property {
         "background-color" => vec!["background-color", "background"],
+        // Asking for `background` is asking for `background-color`: the cascade
+        // groups the two into one longhand, so the name a caller passes only
+        // decides which name it is *answered* in.
+        "background" => vec!["background", "background-color"],
         other => vec![other],
     }
 }
@@ -3144,6 +3193,240 @@ mod tests {
             "and the rule that merely sorted first is left as the author wrote it"
         );
         assert_eq!(read(&root.join("z.css")), z_css);
+    }
+
+    /// The two sheets the cross-sheet ranking has to choose between: an `#id`
+    /// rule in the sheet linked *first*, and a class rule in the sheet linked
+    /// last.
+    fn split_cascade_project(name: &str, element: &str, a_css: &str, b_css: &str) -> PathBuf {
+        let html = format!(
+            "<!doctype html>\n<html>\n<head><link rel=\"stylesheet\" href=\"a.css\" />\
+             <link rel=\"stylesheet\" href=\"b.css\" /></head>\n<body>\n  {element}\n\
+             </body>\n</html>\n"
+        );
+        let yaml = format!(
+            "version: 1\nnodes:\n{}",
+            node_yaml("spool-cta-primary", None, "")
+        );
+        project_files(
+            name,
+            &[
+                ("lamine.yaml", yaml.as_str()),
+                ("index.html", html.as_str()),
+                ("a.css", a_css),
+                ("b.css", b_css),
+            ],
+        )
+    }
+
+    #[test]
+    fn an_id_rule_in_an_earlier_sheet_owns_the_declaration_an_edit_rewrites() {
+        // The reader and the writer were wrong in the same direction for long
+        // enough that nobody noticed: both used link order as an unconditional
+        // override. Now the reader is fixed, and this is the case that made the
+        // two disagree — the element is drawn from `#hero` in `a.css`, and an
+        // edit used to be written into the `.cta` declaration in `b.css` that
+        // lost. The file on disk and the screen would then name different owners
+        // for the same value.
+        let a_css = "#hero { background: #222222; }\n";
+        let b_css = ".cta { background: #ff0000; }\n";
+        let root = split_cascade_project(
+            "id-earlier-sheet",
+            "<div id=\"hero\" class=\"cta\" data-spool-id=\"spool-cta-primary\">Go</div>",
+            a_css,
+            b_css,
+        );
+        let loaded = open_project(&root).expect("opens");
+
+        // What the renderer resolved, which is the answer the save has to match.
+        let cta = loaded
+            .runtime
+            .objects()
+            .iter()
+            .find(|object| object.spool_id.as_str() == "spool-cta-primary")
+            .expect("projected");
+        assert_eq!(
+            loaded
+                .runtime
+                .object(cta.id)
+                .and_then(|object| object.fill)
+                .map(|fill| fill.color.to_rgb()),
+            Some(0x22_22_22),
+            "`#hero` outranks the later `.cta`, so it is what the element is drawn from"
+        );
+
+        let outcome = save_project(
+            &root,
+            &loaded.document,
+            &[SourceEdit::Style {
+                node: node("spool-cta-primary"),
+                property: "background".into(),
+                value: "#0000ff".into(),
+            }],
+        )
+        .expect("save");
+        assert!(outcome.unsupported.is_empty(), "{:?}", outcome.unsupported);
+
+        assert_only(
+            a_css,
+            &read(&root.join("a.css")),
+            &[(
+                "#hero { background: #222222;",
+                "#hero { background: #0000ff;",
+            )],
+        );
+        assert_eq!(
+            read(&root.join("b.css")),
+            b_css,
+            "the later class rule lost the cascade, so the edit must not land there"
+        );
+    }
+
+    #[test]
+    fn equal_specificity_across_sheets_still_resolves_to_the_later_sheet() {
+        // The guard against over-correcting. Ranking by link order instead of
+        // by it *first* would rewrite `a.css` here and leave the element
+        // rendering `b.css`, so the edit would silently do nothing visible.
+        let a_css = ".cta { background: #222222; }\n";
+        let b_css = ".cta { background: #ff0000; }\n";
+        let root = split_cascade_project(
+            "equal-specificity",
+            "<div id=\"hero\" class=\"cta\" data-spool-id=\"spool-cta-primary\">Go</div>",
+            a_css,
+            b_css,
+        );
+        let loaded = open_project(&root).expect("opens");
+
+        let cta = loaded
+            .runtime
+            .objects()
+            .iter()
+            .find(|object| object.spool_id.as_str() == "spool-cta-primary")
+            .expect("projected");
+        assert_eq!(
+            loaded
+                .runtime
+                .object(cta.id)
+                .and_then(|object| object.fill)
+                .map(|fill| fill.color.to_rgb()),
+            Some(0xff_00_00),
+            "neither rule is more specific, so link order decides"
+        );
+
+        save_project(
+            &root,
+            &loaded.document,
+            &[SourceEdit::Style {
+                node: node("spool-cta-primary"),
+                property: "background".into(),
+                value: "#0000ff".into(),
+            }],
+        )
+        .expect("save");
+
+        assert_eq!(read(&root.join("a.css")), a_css);
+        assert_only(
+            b_css,
+            &read(&root.join("b.css")),
+            &[(".cta { background: #ff0000;", ".cta { background: #0000ff;")],
+        );
+    }
+
+    #[test]
+    fn an_inline_declaration_outranks_every_sheet_and_is_left_alone() {
+        // The inline attribute is not part of the cross-sheet ranking at all:
+        // it is applied after the merge, so a save must neither move the edit
+        // into a sheet nor touch one while the element carries its own.
+        let a_css = "#hero { background: #222222; }\n";
+        let b_css = ".cta { background: #ff0000; }\n";
+        let element = "<div id=\"hero\" class=\"cta\" style=\"background: #00ff00\" \
+                       data-spool-id=\"spool-cta-primary\">Go</div>";
+        let root = split_cascade_project("inline-wins", element, a_css, b_css);
+        let loaded = open_project(&root).expect("opens");
+
+        let cta = loaded
+            .runtime
+            .objects()
+            .iter()
+            .find(|object| object.spool_id.as_str() == "spool-cta-primary")
+            .expect("projected");
+        assert_eq!(
+            loaded
+                .runtime
+                .object(cta.id)
+                .and_then(|object| object.fill)
+                .map(|fill| fill.color.to_rgb()),
+            Some(0x00_ff_00),
+            "the inline declaration is what the element is drawn from"
+        );
+
+        save_project(
+            &root,
+            &loaded.document,
+            &[SourceEdit::Style {
+                node: node("spool-cta-primary"),
+                property: "background".into(),
+                value: "#0000ff".into(),
+            }],
+        )
+        .expect("save");
+
+        assert_eq!(
+            read(&root.join("a.css")),
+            a_css,
+            "the sheets lose to the inline attribute, so neither is rewritten"
+        );
+        assert_eq!(read(&root.join("b.css")), b_css);
+        assert!(
+            read(&root.join("index.html")).contains("style=\"background: #0000ff\""),
+            "and the inline declaration was the one rewritten, in place: {}",
+            read(&root.join("index.html"))
+        );
+    }
+
+    #[test]
+    fn a_shared_rule_that_lost_the_cascade_does_not_veto_the_edit() {
+        // The rewindability guard exists to stop an edit from restyling elements
+        // the author did not select. It can only do that for the declaration
+        // actually being rewritten, so it runs on the sheet that won — a
+        // *losing* rule that happens to be shared says nothing about the safety
+        // of touching the winner. Refusing here would leave the element
+        // uneditable because of a rule that has no effect on it.
+        let a_css = ".cta { background: #00ff00; }\n";
+        let b_css = "#hero { background: #222222; }\n";
+        let root = split_cascade_project(
+            "shared-loser",
+            "<div id=\"hero\" class=\"cta\" data-spool-id=\"spool-cta-primary\">Mine</div>\n  \
+             <a class=\"cta\">Not mine</a>",
+            a_css,
+            b_css,
+        );
+        let loaded = open_project(&root).expect("opens");
+
+        save_project(
+            &root,
+            &loaded.document,
+            &[SourceEdit::Style {
+                node: node("spool-cta-primary"),
+                property: "background".into(),
+                value: "#0000ff".into(),
+            }],
+        )
+        .expect("save");
+
+        assert_eq!(
+            read(&root.join("a.css")),
+            a_css,
+            "the `.cta` rule governs two elements but lost, so it is untouched"
+        );
+        assert_only(
+            b_css,
+            &read(&root.join("b.css")),
+            &[(
+                "#hero { background: #222222;",
+                "#hero { background: #0000ff;",
+            )],
+        );
     }
 
     // -- Known limitations, pinned so they cannot drift silently.
