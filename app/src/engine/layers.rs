@@ -1131,6 +1131,9 @@ pub struct PanelState {
     pub pages_open: bool,
     pub layer_search: bool,
     pub expanded: BTreeSet<NodeId>,
+    /// The page whose top-level layers were last opened, so a new document
+    /// opens open.
+    pub expanded_page: Option<NodeId>,
     pub rename: Option<Rename>,
     /// The rename buffer, for the row being renamed.
     pub rename_field: Option<TextField>,
@@ -1279,6 +1282,26 @@ impl LayersPanel {
         let Ok(page) = self.session.borrow().page() else {
             return Arc::new(Vec::new());
         };
+        // A NEW DOCUMENT OPENS WITH ITS TOP-LEVEL LAYERS OPEN.
+        //
+        // The rows are collected from the page downwards, and a layer's
+        // children are listed only if that layer is in the expanded set. A
+        // freshly opened project had an empty expanded set, so the panel listed
+        // the page's top-level frames and nothing inside them: the project's
+        // own layers were missing, and the panel looked broken.
+        //
+        // This fires on a PAGE CHANGE and not on every frame, so "Collapse
+        // layers" still works -- that command clears the set, and the panel
+        // must not immediately undo it.
+        if self.state.expanded_page != Some(page) {
+            self.state.expanded_page = Some(page);
+            self.state.expanded.clear();
+            if let Some(node) = doc.node(page) {
+                for child in &node.children {
+                    self.state.expanded.insert(*child);
+                }
+            }
+        }
         let filter = self.filter();
         let expanded = std::mem::take(&mut self.state.expanded);
         let rows = self.cache.rows(&doc, page, &expanded, &filter);
@@ -2089,8 +2112,21 @@ impl LayersPanel {
         .absolute()
         .left(px(0.0))
         .top(px(0.0))
-        .w(px(0.0))
-        .h(px(0.0))
+        // THE LIST'S OWN SIZE, not zero.
+        //
+        // This probe exists to measure the box the rows are drawn in, so that
+        // the rows can be windowed against it: only the rows on screen are
+        // built, and a long tree does not cost a long list of elements.
+        //
+        // It measured a box of zero by zero, so the window was computed
+        // against a height of zero and NO ROWS WERE DRAWN AT ALL. The panel
+        // showed its chrome and an empty tree, and the rows were there --
+        // `rows.len()` was 1 for a project with one frame in it.
+        //
+        // It is absolutely positioned so it does not take part in the list's
+        // layout, and it is the list's FIRST child so the rows paint over it
+        // and keep their own hit testing.
+        .size_full()
     }
 
     /// Which control of a row a pointer at window `x` went down on, given how the panel lays the
@@ -3185,6 +3221,40 @@ mod tests {
         want.reverse();
         assert_eq!(got, want);
         assert!(rows.iter().all(|r| r.depth == 0 && !r.has_kids));
+    }
+
+    /// A layer's children are listed only when that layer is in the expanded
+    /// set, so a document that opens with its top-level layers closed shows
+    /// the frames and nothing inside them.
+    ///
+    /// This is the rule the panel's own open-on-load behaviour depends on: the
+    /// top-level layers are what gets opened, so the rows inside them are
+    /// listed.
+    #[test]
+    fn a_layers_children_are_listed_only_when_it_is_expanded() {
+        // A GROUP, because a rectangle cannot have children -- the engine
+        // refuses the create and the helper hands back the parent, which would
+        // make this test pass for the wrong reason.
+        let (mut doc, page, _) = doc_with(0);
+        let top = group(&mut doc, page, "G");
+        let kid = rect(&mut doc, top, "K");
+        assert_ne!(top, kid, "the child is a different layer");
+
+        let closed = listed_rows(&doc, page, &BTreeSet::new(), "");
+        assert_eq!(
+            closed.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![top],
+            "a closed layer's children are not listed"
+        );
+
+        let mut ex = BTreeSet::new();
+        ex.insert(top);
+        let open = listed_rows(&doc, page, &ex, "");
+        assert_eq!(
+            open.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![top, kid],
+            "an expanded layer's children are listed"
+        );
     }
 
     #[test]
