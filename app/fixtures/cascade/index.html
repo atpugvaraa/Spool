@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Cascade</title>
+    <!-- Link order and selector specificity deliberately disagree, so the two
+         possible readings of the cascade give visibly different results.
+
+           #hero / #anchor  (base.css, id)      vs .theme / .anchor (theme.css,
+                                                  class)  -> the id MUST win
+           .swatch (base.css) vs .swatch (theme.css)        -> equal specificity,
+                                                  theme.css is later, so theme.css
+
+         A reader that lets a later stylesheet override an earlier one paints the
+         hero blue instead of white. That is the bug this fixture was made for. -->
+    <link rel="stylesheet" href="base.css" />
+    <link rel="stylesheet" href="theme.css" />
+  </head>
+  <body>
+    <main id="hero" class="theme" data-spool-id="spool-frame-hero">
+      <div data-spool-id="spool-frame-note">
+        White panels below beat the later <code>.theme</code> sheet; orange
+        swatches lose to it on a tie.
+      </div>
+      <div id="anchor" class="anchor" data-spool-id="spool-frame-anchor">
+        <div class="swatch theme" data-spool-id="spool-frame-swatch-a"></div>
+        <div class="swatch theme" data-spool-id="spool-frame-swatch-b"></div>
+      </div>
+    </main>
+  </body>
+</html>

@@ -2394,6 +2394,73 @@ mod tests {
         Color::from_hex(value).unwrap_or_else(|| panic!("{value} is a colour"))
     }
 
+    /// The first fill of a frame, as a colour, if it has one.
+    fn first_fill(node: &Node) -> Option<Color> {
+        node.fills.first().map(solid_color)
+    }
+
+    #[test]
+    fn the_cascade_fixture_resolves_by_specificity_not_by_link_order() {
+        // app/fixtures/cascade is the fixture the running application is checked
+        // against, so this test and that directory must not be able to drift: the
+        // files are read at compile time rather than copied into the test.
+        const HTML: &str = include_str!("../../../app/fixtures/cascade/index.html");
+        const BASE: &str = include_str!("../../../app/fixtures/cascade/base.css");
+        const THEME: &str = include_str!("../../../app/fixtures/cascade/theme.css");
+
+        let manifest = Manifest {
+            nodes: vec![
+                record(1, "spool-frame-hero", None, vec![2, 3]),
+                text_record(2, "spool-frame-note", Some(1), vec![]),
+                record(3, "spool-frame-anchor", Some(1), vec![4, 5]),
+                record(4, "spool-frame-swatch-a", Some(3), vec![]),
+                record(5, "spool-frame-swatch-b", Some(3), vec![]),
+            ],
+            ..Default::default()
+        };
+        let read = read_with_diagnostics(
+            &manifest,
+            &files(&[
+                ("index.html", HTML),
+                ("base.css", BASE),
+                ("theme.css", THEME),
+            ]),
+        )
+        .expect("the cascade fixture compiles");
+
+        // `#hero` and `#anchor` are ids in base.css. `.theme` and `.anchor` are
+        // classes in theme.css, which is linked LATER. Specificity outranks link
+        // order, so both frames are white. Were link order deciding instead, they
+        // would be the #0000ff of the theme sheet -- which is what the fixture is
+        // built to make visible.
+        assert_eq!(
+            first_fill(node_of(&read.document, 1)),
+            Some(hex("ffffff")),
+            "#hero beats .theme even though theme.css is linked later"
+        );
+        assert_eq!(
+            first_fill(node_of(&read.document, 3)),
+            Some(hex("ffffff")),
+            "#anchor beats .anchor even though theme.css is linked later"
+        );
+
+        // `.swatch` appears once in each sheet, at equal specificity. Nothing is
+        // being outranked here, so link order is the only thing left to decide,
+        // and the later sheet's orange is correct. This is the case that must NOT
+        // change: a fix that made specificity the sole criterion, ignoring order,
+        // would turn these green and be wrong in the other direction.
+        assert_eq!(
+            first_fill(node_of(&read.document, 4)),
+            Some(hex("ff9500")),
+            "an equal-specificity tie is still decided by link order"
+        );
+        assert_eq!(
+            first_fill(node_of(&read.document, 5)),
+            Some(hex("ff9500")),
+            "and the same for the sibling swatch"
+        );
+    }
+
     #[test]
     fn an_inline_project_compiles_to_the_values_it_authors() {
         let (manifest, sources) = inline(
