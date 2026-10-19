@@ -1545,6 +1545,85 @@ impl EngineCanvas {
             .map_or(0, |doc| doc.revision)
     }
 
+    /// Choose a tool, by the engine's own name.
+    ///
+    /// The name is the engine's, not Spool's: `move`, `frame`, `rectangle`,
+    /// `ellipse`, `pen`, `text`, `comment`. It goes through `tool.set`, the
+    /// command the CLI and the palette use, rather than reaching into the
+    /// session's tool state -- one operation surface, so the same tool can be
+    /// set by a click, a shortcut, the CLI or an agent.
+    pub fn set_tool(&mut self, tool: &str, cx: &mut gpui::Context<Self>) {
+        let params = serde_json::json!({ "tool": tool });
+        self.run_engine_command("tool.set", params, cx);
+    }
+
+    /// The engine's name for the tool in effect.
+    ///
+    /// The toolbar asks this rather than keeping its own answer, so the
+    /// highlighted tool is the engine's and cannot drift from it.
+    pub fn active_tool(&self) -> &'static str {
+        use figcraft_engine::tools::ToolId;
+        match self.session.borrow().tool.tool {
+            ToolId::Move => "move",
+            ToolId::Scale => "scale",
+            ToolId::Hand => "hand",
+            ToolId::Frame => "frame",
+            ToolId::Section => "section",
+            ToolId::Slice => "slice",
+            ToolId::Rectangle => "rectangle",
+            ToolId::Line => "line",
+            ToolId::Arrow => "arrow",
+            ToolId::Ellipse => "ellipse",
+            ToolId::Polygon => "polygon",
+            ToolId::Star => "star",
+            ToolId::Pen => "pen",
+            ToolId::Pencil => "pencil",
+            ToolId::Text => "text",
+            ToolId::Comment => "comment",
+            ToolId::Eyedropper => "eyedropper",
+            ToolId::ShapeBuilder => "shapeBuilder",
+        }
+    }
+
+    /// Run one engine command, and report what it did.
+    ///
+    /// The engine's commands are the operation surface: the toolbar, the
+    /// keymap, the command palette, the CLI and a future agent all dispatch
+    /// command ids, so an edit made by a click and an edit made by a shortcut
+    /// go through the same code and produce the same history.
+    ///
+    /// A refused command is not an error the user has to be told about -- the
+    /// engine declines commands that do not apply to the current state, and
+    /// reporting every one of those as a failure would be noise. It IS worth
+    /// reporting, because a command that fails for an unexpected reason is a
+    /// bug, and the user should be able to see it.
+    pub fn run_engine_command(
+        &mut self,
+        id: &str,
+        params: serde_json::Value,
+        cx: &mut gpui::Context<Self>,
+    ) -> bool {
+        let result = self.session.borrow_mut().execute(id, &params);
+        cx.notify();
+        match result {
+            Ok(_) => true,
+            Err(error) => {
+                eprintln!("spool_engine_command_failed id={id} error={error}");
+                false
+            }
+        }
+    }
+
+    /// Whether the canvas holds the keyboard focus.
+    ///
+    /// The shell needs this to know whose keyboard it is: while the engine
+    /// canvas has focus, the engine's own key handling is the authority, and
+    /// the shell must not answer the same chord a second time through the
+    /// retired runtime's command table.
+    pub fn has_focus(&self, window: &gpui::Window) -> bool {
+        self.focus.is_focused(window)
+    }
+
     /// Run `f` with the session. The borrow cannot outlive the call.
     pub fn with_session<R>(&self, f: impl FnOnce(&Session) -> R) -> R {
         f(&self.session.borrow())
@@ -1743,10 +1822,15 @@ impl EngineCanvas {
             )
         };
         let (doc, page, origin, zoom, options) = request;
-        match self
-            .renderer
-            .render_canvas(doc, page, origin, zoom, self.viewport.size, ratio, options)
-        {
+        match self.renderer.render_canvas(
+            doc,
+            page,
+            origin,
+            zoom,
+            self.viewport.size,
+            ratio,
+            options,
+        ) {
             Ok(_) => {
                 self.state.awaiting = self.renderer.generation() + 1;
                 // Once, on the first submission that the render thread accepted.
@@ -1757,10 +1841,7 @@ impl EngineCanvas {
                     self.state.reported_first_submit = true;
                     eprintln!(
                         "SPOOL_RENDER_SUBMITTED page={:?} origin={:?} zoom={} viewport={:?}",
-                        page,
-                        origin,
-                        zoom,
-                        self.viewport.size,
+                        page, origin, zoom, self.viewport.size,
                     );
                 }
             }
@@ -2112,10 +2193,7 @@ impl EngineCanvas {
         // size check is what makes this safe to run on every paint: before the
         // element has been laid out the viewport is empty, and fitting against it
         // is exactly the failure this defers past.
-        if self.state.pending_fit
-            && self.viewport.size.0 > 0.0
-            && self.viewport.size.1 > 0.0
-        {
+        if self.state.pending_fit && self.viewport.size.0 > 0.0 && self.viewport.size.1 > 0.0 {
             self.state.pending_fit = false;
             let page = self.session.borrow().page().ok();
             if let Some(page) = page {
@@ -3440,34 +3518,34 @@ impl Render for EngineCanvas {
             .on_pinch(cx.listener(Self::on_pinch))
             .child(
                 canvas(
-                move |bounds, window, cx| {
-                    let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
-                    hitbox_pre.replace(Some(hitbox.clone()));
-                    let viewport = Viewport::new(bounds);
-                    // Keep the engine's viewport in step: zoom-to-fit and the rulers need it.
-                    entity_pre.update(cx, |this, _| {
-                        this.viewport = viewport;
-                        let mut session = this.session.borrow_mut();
-                        if let Ok(ds) = session.ds_mut() {
-                            ds.view.vw = f64::from(viewport.size.0);
-                            ds.view.vh = f64::from(viewport.size.1);
-                        }
-                    });
-                    hitbox
-                },
-                move |bounds, _hitbox, window, cx| {
-                    window.handle_input(
-                        &focus,
-                        ElementInputHandler::new(bounds, entity_paint.clone()),
-                        cx,
-                    );
-                    let ratio = window.scale_factor();
-                    let hitbox = hitbox_paint.borrow().clone();
-                    entity_paint.update(cx, |this, cx| {
-                        this.paint(window, cx, bounds, ratio, hitbox);
-                    });
-                },
-            )
+                    move |bounds, window, cx| {
+                        let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
+                        hitbox_pre.replace(Some(hitbox.clone()));
+                        let viewport = Viewport::new(bounds);
+                        // Keep the engine's viewport in step: zoom-to-fit and the rulers need it.
+                        entity_pre.update(cx, |this, _| {
+                            this.viewport = viewport;
+                            let mut session = this.session.borrow_mut();
+                            if let Ok(ds) = session.ds_mut() {
+                                ds.view.vw = f64::from(viewport.size.0);
+                                ds.view.vh = f64::from(viewport.size.1);
+                            }
+                        });
+                        hitbox
+                    },
+                    move |bounds, _hitbox, window, cx| {
+                        window.handle_input(
+                            &focus,
+                            ElementInputHandler::new(bounds, entity_paint.clone()),
+                            cx,
+                        );
+                        let ratio = window.scale_factor();
+                        let hitbox = hitbox_paint.borrow().clone();
+                        entity_paint.update(cx, |this, cx| {
+                            this.paint(window, cx, bounds, ratio, hitbox);
+                        });
+                    },
+                )
                 // GPUI's `Canvas` element lays itself out from its OWN style
                 // (`request_layout` builds `Style::default()` and refines it with
                 // whatever is set here). It is childless, so with no size set it

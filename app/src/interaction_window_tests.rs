@@ -66,6 +66,14 @@ fn read<R>(
     window.update(|_, cx| shell.read_with(cx, |shell, _| f(shell.canvas().read(cx))))
 }
 
+/// The engine's tool in effect.
+///
+/// The toolbar drives the engine, so the toolbar's answer is the engine's. The
+/// retired canvas keeps its own tool state and is not what the user is editing.
+fn read_engine_tool(shell: &Entity<AppShell>, window: &mut VisualTestContext) -> &'static str {
+    window.update(|_, cx| shell.read_with(cx, |shell, _| shell.test_engine_tool(cx)))
+}
+
 /// Whether the canvas holds keyboard focus right now.
 ///
 /// Separate from `read` because it needs the `Window`, which only exists inside
@@ -125,6 +133,16 @@ fn click_object(
 /// `add_window_view` lends out the window for as long as the test lives and a
 /// helper cannot hold that borrow across the calls that follow.
 fn open_shell(cx: &mut TestAppContext) -> (Entity<AppShell>, &mut VisualTestContext) {
+    // The application installs the engine's keymap in `lifecycle::install`, which
+    // a test does not run. Installing it here keeps the test window the same
+    // shape as the real one: without it a shortcut would go nowhere, and the
+    // test would be measuring the absence of a binding rather than the
+    // behaviour it claims to test.
+    cx.update(|app| {
+        app.bind_keys(crate::engine::keymap::bindings(
+            figcraft_engine::keymap::Platform::current(),
+        ));
+    });
     let (shell, window) = cx.add_window_view(|_, cx| AppShell::new_with_project(None, cx));
     redraw(&shell, window);
     (shell, window)
@@ -580,7 +598,9 @@ fn highlighted_tools(shell: &Entity<AppShell>, window: &mut VisualTestContext) -
         shell.read_with(cx, |shell, _| {
             toolbar_tools()
                 .iter()
-                .filter(|(_, tool, _)| shell.test_tool_is_highlighted(*tool, cx))
+                .filter(|(_, tool, _)| {
+                    shell.test_engine_tool_is_highlighted(crate::shell::engine_tool_name(*tool), cx)
+                })
                 .map(|(label, _, _)| label.to_string())
                 .collect()
         })
@@ -598,9 +618,9 @@ fn every_toolbar_button_selects_its_tool_and_highlights_only_itself(cx: &mut Tes
         choose_tool(window, label);
 
         assert_eq!(
-            read(&shell, window, |canvas| canvas.tool()),
-            tool,
-            "clicking {label} should put the canvas on that tool"
+            read_engine_tool(&shell, window),
+            crate::shell::engine_tool_name(tool),
+            "clicking {label} should put the engine canvas on that tool"
         );
         assert_eq!(
             highlighted_tools(&shell, window),
@@ -610,12 +630,54 @@ fn every_toolbar_button_selects_its_tool_and_highlights_only_itself(cx: &mut Tes
     }
 }
 
+/// A keyboard shortcut reaches the engine, not the retired runtime.
+///
+/// The engine's keymap is figcraft's own table, and its tool shortcuts are the
+/// same letters the toolbar shows. This asserts the whole path in one go: the
+/// canvas takes focus, the key is dispatched through the engine's GPUI binding,
+/// the binding becomes a `tool.*` command, and the command reaches the engine's
+/// session -- which is the only thing that can change the engine's tool.
+///
+/// Asserting on the retired canvas here would prove nothing: the old runtime
+/// has its own key handling and would have passed this test before the swap.
+#[gpui::test]
+fn a_tool_shortcut_reaches_the_engine(cx: &mut TestAppContext) {
+    let (shell, window) = open_shell(cx);
+    assert_eq!(
+        read_engine_tool(&shell, window),
+        "move",
+        "the engine starts on its move tool"
+    );
+
+    // The canvas has to own the keyboard, or the key goes to the shell instead.
+    let canvas_bounds = window
+        .debug_bounds("engine-canvas")
+        .expect("the engine canvas is on screen");
+    window.simulate_click(canvas_bounds.center(), Modifiers::none());
+    window.run_until_parked();
+
+    window.simulate_keystrokes("f");
+    window.run_until_parked();
+
+    assert_eq!(
+        read_engine_tool(&shell, window),
+        "frame",
+        "F is the engine's frame-tool shortcut, so the engine must be on it"
+    );
+    assert_eq!(
+        highlighted_tools(&shell, window),
+        vec!["Frame".to_string()],
+        "and the toolbar must show that same tool, or the two have drifted"
+    );
+}
+
 #[gpui::test]
 fn the_toolbar_starts_on_selection(cx: &mut TestAppContext) {
     let (shell, window) = open_shell(cx);
     assert_eq!(
-        read(&shell, window, |canvas| canvas.tool()),
-        crate::canvas::Tool::Select
+        read_engine_tool(&shell, window),
+        "move",
+        "the engine starts on its move tool, which is Spool's Select"
     );
     assert_eq!(
         highlighted_tools(&shell, window),

@@ -24,6 +24,25 @@ pub(crate) const TOOLS: [(&str, &str, &str, canvas::Tool); 7] = [
 
 const PAGES: [&str; 4] = ["Landing", "App", "Components", "Explorations"];
 
+/// The engine's name for one of Spool's tools.
+///
+/// The toolbar is written in Spool's tool names because that is what the
+/// product is; the engine has its own, and the mapping is here rather than in
+/// the engine because the engine's names are the upstream's, not Spool's to
+/// change. `Select` is the engine's `move`: the select tool IS the move tool
+/// with the pointer, and the engine's tool table has no separate select.
+pub(crate) fn engine_tool_name(tool: canvas::Tool) -> &'static str {
+    match tool {
+        canvas::Tool::Select => "move",
+        canvas::Tool::Frame => "frame",
+        canvas::Tool::Rectangle => "rectangle",
+        canvas::Tool::Ellipse => "ellipse",
+        canvas::Tool::Pen => "pen",
+        canvas::Tool::Text => "text",
+        canvas::Tool::Comment => "comment",
+    }
+}
+
 /// Which project the application was asked to open.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProjectRequest {
@@ -78,7 +97,10 @@ fn development_override() -> Option<PathBuf> {
 fn load_requested_project(
     request: Option<&ProjectRequest>,
     view: &mut canvas::CanvasView,
-) -> (Option<SharedString>, Option<crate::engine_project::EngineProject>) {
+) -> (
+    Option<SharedString>,
+    Option<crate::engine_project::EngineProject>,
+) {
     let Some(request) = request else {
         return (None, None);
     };
@@ -113,10 +135,7 @@ fn load_requested_project(
         }
         Err(error) => {
             eprintln!("spool_project_open failed root={root}: {error}");
-            (
-                Some(format!("Could not open {root}: {error}").into()),
-                None,
-            )
+            (Some(format!("Could not open {root}: {error}").into()), None)
         }
     }
 }
@@ -286,9 +305,6 @@ impl AppShell {
         // owns it, and the layers panel takes the same `Rc<RefCell<Session>>`.
         // Two sessions would be two documents that disagree, which is the one
         // thing this architecture exists to prevent.
-        let unresolved = engine
-            .as_ref()
-            .map_or_else(Vec::new, |engine| engine.unresolved.clone());
         let document = engine.map_or_else(Default::default, |engine| engine.document);
         let session = figcraft_engine::Session::with_document(document);
         let engine_canvas = cx.new(|cx| crate::engine::canvas::EngineCanvas::new(session, cx));
@@ -464,9 +480,10 @@ impl AppShell {
                 true
             }
             Some(commands::Rung::Tool) => {
-                self.canvas
-                    .update(cx, |canvas, _| canvas.set_tool(canvas::Tool::Select));
-                cx.notify();
+                // Escape returns to the select tool, and the select tool is the
+                // engine's `move` tool. It has to be the engine's, because the
+                // engine canvas is what the user is now driving.
+                self.select_engine_tool("move", cx);
                 true
             }
             None => false,
@@ -571,18 +588,15 @@ impl AppShell {
     /// new document is installed by replacing the session's document in place.
     /// Swapping the whole `Session` instead would leave the layers panel holding
     /// the old one, and the two would disagree about what is open.
-    fn load_engine_document(
-        &mut self,
-        document: figcraft_doc::Document,
-        cx: &mut Context<Self>,
-    ) {
+    fn load_engine_document(&mut self, document: figcraft_doc::Document, cx: &mut Context<Self>) {
         let session = self
             .engine_canvas
             .update(cx, |canvas, _| canvas.session_handle());
         {
             let mut session = session.borrow_mut();
             session.docs.clear();
-            session.docs
+            session
+                .docs
                 .push(figcraft_engine::DocState::new(document, None));
             session.active = 0;
         }
@@ -607,7 +621,13 @@ impl AppShell {
     ///    command table, because "leave the most recent thing you entered" is
     ///    not one of the table's verbs.
     /// 4. Everything else is one row of [`commands::resolve`].
-    fn handle_key(&mut self, key: &str, modifiers: Modifiers, cx: &mut Context<Self>) {
+    fn handle_key(
+        &mut self,
+        key: &str,
+        modifiers: Modifiers,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.canvas.read(cx).workload_controls_input() {
             return;
         }
@@ -625,6 +645,14 @@ impl AppShell {
         }
         if key == "escape" {
             self.escape_topmost(cx);
+            return;
+        }
+        // While the engine canvas owns the keyboard, the engine is the
+        // authority: its own keymap dispatches figcraft command ids, and its
+        // gesture handling answers the keys that are not commands. The retired
+        // runtime's command table must not answer the same chord as well, or
+        // one Cmd+Z would undo twice -- once in each runtime.
+        if self.engine_canvas.read(cx).has_focus(window) {
             return;
         }
         // The pan modifier is held rather than pressed, so it is not a command
@@ -661,6 +689,37 @@ impl AppShell {
     #[cfg(test)]
     pub fn test_tool_is_highlighted(&self, tool: canvas::Tool, cx: &App) -> bool {
         self.tool_is_highlighted(tool, cx)
+    }
+
+    /// Choose a tool, on the engine.
+    ///
+    /// The toolbar's buttons go through here rather than through the retired
+    /// canvas, because the engine is what the user is now editing. The name is
+    /// the engine's own, so this is the same call a shortcut, the CLI or an
+    /// agent would make.
+    fn select_engine_tool(&mut self, tool: &str, cx: &mut Context<Self>) {
+        self.engine_canvas
+            .update(cx, |canvas, cx| canvas.set_tool(tool, cx));
+    }
+
+    /// Whether the engine's tool in effect is `tool`.
+    ///
+    /// The engine's answer, read from the engine, so the highlighted tool in the
+    /// toolbar cannot drift from the tool the canvas is actually using.
+    fn engine_tool_is_highlighted(&self, tool: &str, cx: &App) -> bool {
+        self.engine_canvas.read(cx).active_tool() == tool
+    }
+
+    /// The engine's tool in effect, for the window-level interaction tests.
+    #[cfg(test)]
+    pub fn test_engine_tool(&self, cx: &App) -> &'static str {
+        self.engine_canvas.read(cx).active_tool()
+    }
+
+    /// Whether the engine's tool in effect is `tool`, for the tests.
+    #[cfg(test)]
+    pub fn test_engine_tool_is_highlighted(&self, tool: &str, cx: &App) -> bool {
+        self.engine_tool_is_highlighted(tool, cx)
     }
 
     /// The canvas entity, for the window-level interaction tests.
@@ -944,7 +1003,7 @@ impl AppShell {
             .border_1()
             .border_color(rgb(theme::BORDER));
         for (index, (icon, label, _shortcut, tool)) in TOOLS.iter().enumerate() {
-            let selected = self.tool_is_highlighted(*tool, cx);
+            let selected = self.engine_tool_is_highlighted(engine_tool_name(*tool), cx);
             let background = if selected {
                 theme::SURFACE_HOVER
             } else {
@@ -955,7 +1014,7 @@ impl AppShell {
             } else {
                 theme::TEXT_SECONDARY
             };
-            let tool = *tool;
+            let tool = engine_tool_name(*tool);
             tools = tools.child(
                 div()
                     .id(SharedString::from(format!("top-tool-{index}")))
@@ -976,8 +1035,7 @@ impl AppShell {
                     .text_sm()
                     .text_color(rgb(foreground))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.canvas.update(cx, |canvas, _| canvas.set_tool(tool));
-                        cx.notify();
+                        this.select_engine_tool(tool, cx);
                     }))
                     .child(*icon)
                     .child(div().text_xs().child(*label)),
@@ -1310,7 +1368,7 @@ impl AppShell {
             .border_1()
             .border_color(rgb(theme::BORDER));
         for (index, (icon, label, _shortcut, tool)) in TOOLS.iter().enumerate() {
-            let selected = self.tool_is_highlighted(*tool, cx);
+            let selected = self.engine_tool_is_highlighted(engine_tool_name(*tool), cx);
             let background = if selected {
                 theme::ACCENT_WASH
             } else {
@@ -1321,7 +1379,7 @@ impl AppShell {
             } else {
                 theme::TEXT_SECONDARY
             };
-            let tool = *tool;
+            let tool = engine_tool_name(*tool);
             palette = palette.child(
                 div()
                     .id(SharedString::from(format!("palette-tool-{index}")))
@@ -1338,8 +1396,7 @@ impl AppShell {
                     .active(|style| style.opacity(0.78))
                     .text_color(rgb(foreground))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.canvas.update(cx, |canvas, _| canvas.set_tool(tool));
-                        cx.notify();
+                        this.select_engine_tool(tool, cx);
                     }))
                     .child(div().text_sm().child(*icon))
                     .child(
@@ -1558,6 +1615,22 @@ impl Render for AppShell {
             .size_full()
             .bg(rgb(theme::WINDOW))
             .text_color(rgb(theme::TEXT))
+            // The engine's keymap dispatches figcraft command ids as GPUI
+            // actions. The shell's root is in the dispatch path for every action
+            // in the window, so this is where a shortcut becomes an engine
+            // command -- the same route a menu item, the command palette, the
+            // CLI and a future agent take, so an edit made by a key and an edit
+            // made by a click are the same edit.
+            .on_action({
+                let engine_canvas = self.engine_canvas.clone();
+                move |action: &crate::engine::keymap::RunCommand, _window, cx| {
+                    let id = action.id.clone();
+                    let params = action.params.clone();
+                    engine_canvas.update(cx, |canvas, cx| {
+                        canvas.run_engine_command(&id, params, cx);
+                    });
+                }
+            })
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
@@ -1570,8 +1643,13 @@ impl Render for AppShell {
                     }
                 }),
             )
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
-                this.handle_key(event.keystroke.key.as_str(), event.keystroke.modifiers, cx);
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                this.handle_key(
+                    event.keystroke.key.as_str(),
+                    event.keystroke.modifiers,
+                    window,
+                    cx,
+                );
             }))
             .on_key_up(cx.listener(|this, event: &gpui::KeyUpEvent, _, cx| {
                 if matches!(event.keystroke.key.as_str(), "space" | " ") {
