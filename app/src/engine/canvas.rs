@@ -1370,7 +1370,7 @@ fn blit_bounds(
     viewport_origin: GPoint<f32>,
 ) -> Bounds<Pixels> {
     let (x, y) = f.origin_in_view(view_origin, zoom);
-    let (w, h) = f.logical_size();
+    let (w, h) = f.logical_size(zoom);
     // THE VIEWPORT'S ORIGIN, or the image lands in the wrong place.
     //
     // `origin_in_view` measures from the VIEWPORT's top-left, and the overlay
@@ -1967,7 +1967,9 @@ impl EngineCanvas {
             return;
         }
         let mut session = self.session.borrow_mut();
-        let used = session.tool_key(name, m.shift, m.alt, m.cmd).unwrap_or(false);
+        let used = session
+            .tool_key(name, m.shift, m.alt, m.cmd)
+            .unwrap_or(false);
         drop(session);
         if used {
             cx.notify();

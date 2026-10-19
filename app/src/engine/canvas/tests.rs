@@ -1094,7 +1094,7 @@ fn the_renderer_publishes_a_frame_of_the_requested_size() {
     // The engine renders one device pixel wider and taller than the view it was given, so at
     // ratio 1 the frame covers the whole 200×150 viewport and one pixel past each edge.
     assert_eq!((frame.size.width, frame.size.height), (201, 151));
-    assert_eq!(frame.logical_size(), (201.0, 151.0));
+    assert_eq!(frame.logical_size(1.0), (201.0, 151.0));
     assert!(
         !renderer.diagnostics().contains("faulted"),
         "{}",

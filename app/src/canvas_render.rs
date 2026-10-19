@@ -585,8 +585,37 @@ pub struct CanvasFrame {
 
 impl CanvasFrame {
     /// The size to place the element at, in logical points.
-    pub fn logical_size(&self) -> (f32, f32) {
-        self.size.logical(self.ratio)
+    pub fn logical_size(&self, zoom: f64) -> (f32, f32) {
+        // The size of the frame's CONTENT, in logical points, at the zoom the
+        // view is at NOW.
+        //
+        // The frame's pixels are at ITS OWN scale, which is the zoom it was
+        // rendered at times the device pixel ratio. So the content covers
+        // `size / scale` page units, and in the current view those page units
+        // are `zoom` logical points each. Dividing out the ratio instead --
+        // which is what this did -- gives the right answer only while the
+        // frame's zoom IS the current zoom.
+        //
+        // And it is not, for exactly as long as a new frame is on its way:
+        // between a zoom gesture and the frame that answers it, the frame on
+        // screen is the OLD one. Drawing it at its own size while the overlay
+        // drew the new zoom's content is what made objects change size as the
+        // canvas zoomed, and what made a resized object disagree with the
+        // handle being dragged.
+        let zoom = if zoom.is_finite() && zoom > 0.0 {
+            zoom
+        } else {
+            1.0
+        };
+        let scale = if self.scale.is_finite() && self.scale > 0.0 {
+            self.scale
+        } else {
+            1.0
+        };
+        (
+            (self.size.width as f64 / scale * zoom) as f32,
+            (self.size.height as f64 / scale * zoom) as f32,
+        )
     }
 
     /// Where the blit goes, in logical points from the viewport's top-left.
@@ -1542,8 +1571,8 @@ mod tests {
     /// viewport, so the element is 800 points wide.
     #[test]
     fn the_logical_size_divides_out_the_device_pixel_ratio() {
-        assert_eq!(frame((0, 0), 2.0, 2.0).logical_size(), (800.0, 600.0));
-        assert_eq!(frame((0, 0), 1.0, 1.0).logical_size(), (1600.0, 1200.0));
+        assert_eq!(frame((0, 0), 2.0, 2.0).logical_size(1.0), (800.0, 600.0));
+        assert_eq!(frame((0, 0), 1.0, 1.0).logical_size(1.0), (1600.0, 1200.0));
     }
 
     #[test]
@@ -1679,7 +1708,7 @@ mod tests {
         assert_eq!(frame.scale, 2.0);
         // The engine renders one pixel wider and taller than the view it is given.
         assert_eq!(frame.size, size(401, 301));
-        assert_eq!(frame.logical_size(), (200.5, 150.5));
+        assert_eq!(frame.logical_size(1.0), (200.5, 150.5));
         assert_eq!(frame.origin_px, (0, 0));
     }
 
@@ -1958,5 +1987,35 @@ mod tests {
         let frame = renderer.frame().expect("a frame");
         drop(renderer);
         assert!(frame.image.is_some(), "the frame went with the renderer");
+    }
+    /// A frame rendered at one zoom, drawn while the view is at another, must
+    /// be drawn at the NEW zoom's size.
+    ///
+    /// Between a zoom gesture and the frame that answers it, the frame on
+    /// screen is the old one. Drawing it at its own size while the overlay
+    /// drew the new zoom's content is what made objects change size as the
+    /// canvas zoomed, and what made a resized object disagree with the handle
+    /// being dragged.
+    #[test]
+    fn a_frame_drawn_at_a_different_zoom_keeps_up_with_the_view() {
+        // A frame of 1600x1200 device pixels, rendered at a ratio of 2 and a
+        // scale of 2 device pixels per page unit -- so it covers 800x600 page
+        // units, and it was rendered at a zoom of 1.
+        let f = frame((0, 0), 2.0, 2.0);
+        assert_eq!(
+            f.logical_size(1.0),
+            (800.0, 600.0),
+            "at the zoom it was rendered at, it covers its own page units"
+        );
+        assert_eq!(
+            f.logical_size(2.0),
+            (1600.0, 1200.0),
+            "at twice the zoom, it must be drawn twice as large"
+        );
+        assert_eq!(
+            f.logical_size(0.5),
+            (400.0, 300.0),
+            "and at half the zoom, half as large"
+        );
     }
 }
