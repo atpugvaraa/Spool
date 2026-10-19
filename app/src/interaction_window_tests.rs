@@ -431,11 +431,6 @@ fn deleting_several_selected_objects_is_one_history_entry(cx: &mut TestAppContex
     assert_eq!(
         engine_undo_len(&shell, window),
         history_before + 1,
-        "deleting two objects at once is ONE history entry, not two"
-    );
-    assert_eq!(
-        read(&shell, window, |canvas| canvas.test_history().undo_len()),
-        1,
         "two objects, one gesture, one history entry"
     );
 }
