@@ -29,6 +29,17 @@
 //! `visual`, and inheritance belongs to the document tree rather than to a
 //! stylesheet. `docs/` records that boundary.
 //!
+//! # One sheet at a time, and the rank that outlives it
+//!
+//! [`Stylesheet::resolve`] answers for a single sheet, and a project has more
+//! than one. Merging several sheets is not "take the last sheet that has a
+//! value": link order decides only between declarations of *equal* specificity,
+//! so the ranking has to survive into the caller that merges. A merge done on
+//! [`Stylesheet::resolve`] alone has already lost the fact that made an earlier
+//! `#hero` win, and hands the element whichever sheet happens to be linked last.
+//! [`Stylesheet::resolve_ranked`] is the same answer with the rank attached, for
+//! that caller; `visual` is where the two are put back together.
+//!
 //! # Flex longhands
 //!
 //! `flex-direction`, `flex-wrap`, `gap`, `row-gap`, `column-gap`,
@@ -308,42 +319,78 @@ impl Stylesheet {
     /// — so a `background` shorthand and a `background-color` declaration land on
     /// the same key and only one of them survives. Returns the resolved value
     /// with the provenance of the winning declaration.
+    ///
+    /// The rank that made each winner is not reported, because this answers for
+    /// one sheet and a merge of several cannot rank anything from it — see
+    /// [`Stylesheet::resolve_ranked`].
+    ///
+    /// The renderer merges through [`Stylesheet::resolve_ranked`], so outside the
+    /// tests this has no caller: it answers for a *single* sheet, and `visual`
+    /// is the only caller that ever needed one answer covering several. Kept as
+    /// the unranked entry point rather than deleted, because dropping the rank
+    /// is only safe once one declaration has won — the property a single-sheet
+    /// caller is relying on.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn resolve(
         &self,
         tag: &str,
         classes: &[String],
         id: Option<&str>,
     ) -> BTreeMap<String, ResolvedValue> {
+        self.resolve_ranked(tag, classes, id)
+            .into_iter()
+            .map(|(property, ranked)| (property, ranked.into_resolved()))
+            .collect()
+    }
+
+    /// [`Stylesheet::resolve`], keeping each winner's specificity and author
+    /// order.
+    ///
+    /// Author order is only comparable *within* one stylesheet, so a caller that
+    /// merges several has nothing to compare unless the specificity travels with
+    /// the value. Dropping it here is only correct once exactly one declaration
+    /// has won; converting earlier discards the rank while it still decides the
+    /// answer.
+    pub fn resolve_ranked(
+        &self,
+        tag: &str,
+        classes: &[String],
+        id: Option<&str>,
+    ) -> BTreeMap<String, RankedValue> {
         self.cascaded(tag, classes, id)
             .into_iter()
-            .map(|(property, declaration)| {
+            .map(|(property, winner)| {
+                let declaration = winner.declaration;
                 (
                     property,
-                    ResolvedValue {
+                    RankedValue {
                         value: self.substitute_variables(&declaration.value),
                         order: declaration.order,
+                        specificity: winner.specificity,
                     },
                 )
             })
             .collect()
     }
 
-    /// Every declaration that wins for one computed longhand on one element.
+    /// Every declaration that wins for one computed longhand on one element,
+    /// with the rank that made it win.
     ///
-    /// Single source of truth for the cascade: [`Stylesheet::resolve`] reads
-    /// values out of it and [`Stylesheet::declaration_value_range`] reads spans
-    /// out of it, so the value a node is drawn with and the authored text an edit
-    /// would rewrite cannot disagree.
+    /// Single source of truth for the cascade: [`Stylesheet::resolve`] and
+    /// [`Stylesheet::resolve_ranked`] read values out of it, and
+    /// [`Stylesheet::declaration_value_range`] reads spans out of it, so the
+    /// value a node is drawn with and the authored text an edit would rewrite
+    /// cannot disagree.
     fn cascaded<'a>(
         &'a self,
         tag: &str,
         classes: &[String],
         id: Option<&str>,
-    ) -> BTreeMap<String, &'a Declaration> {
+    ) -> BTreeMap<String, Winner<'a>> {
         // The incumbent's own specificity is carried alongside it. Reusing the
         // candidate rule's specificity for the incumbent would make the
         // comparison depend on the order the rules happen to be visited in.
-        let mut winners: BTreeMap<String, (&'a Declaration, u32)> = BTreeMap::new();
+        let mut winners: BTreeMap<String, Winner<'a>> = BTreeMap::new();
         for rule in &self.rules {
             if !rule.selector.matches(tag, classes, id) {
                 continue;
@@ -352,24 +399,33 @@ impl Stylesheet {
             for declaration in &rule.declarations {
                 for group in property_groups(&declaration.property) {
                     match winners.get(&group) {
-                        Some((current, current_specificity)) => {
+                        Some(current) => {
                             if declaration.rank_for(specificity)
-                                > current.rank_for(*current_specificity)
+                                > current.declaration.rank_for(current.specificity)
                             {
-                                winners.insert(group, (declaration, specificity));
+                                winners.insert(
+                                    group,
+                                    Winner {
+                                        declaration,
+                                        specificity,
+                                    },
+                                );
                             }
                         }
                         None => {
-                            winners.insert(group, (declaration, specificity));
+                            winners.insert(
+                                group,
+                                Winner {
+                                    declaration,
+                                    specificity,
+                                },
+                            );
                         }
                     }
                 }
             }
         }
         winners
-            .into_iter()
-            .map(|(property, (declaration, _))| (property, declaration))
-            .collect()
     }
 
     /// The declaration that currently wins for one property on one element.
@@ -390,7 +446,7 @@ impl Stylesheet {
         let cascaded = self.cascaded(tag, classes, id);
         property_groups(property)
             .into_iter()
-            .find_map(|group| cascaded.get(&group).copied())
+            .find_map(|group| cascaded.get(&group).map(|winner| winner.declaration))
     }
 
     /// The authored span of the declaration that currently wins for `property`
@@ -444,10 +500,60 @@ impl Stylesheet {
 ///
 /// The span is a `(start, end)` byte range into the stylesheet the value was
 /// read from, which is what a later source-preserving write targets.
+///
+/// Only [`Stylesheet::resolve`] produces this, and only a single-sheet caller
+/// wants it; a merge wants [`RankedValue`].
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub struct ResolvedValue {
     pub value: String,
     pub order: usize,
+}
+
+/// The declaration that currently wins one longhand, with the specificity of the
+/// rule it came from.
+///
+/// Split out from [`Declaration`] because the specificity belongs to the
+/// selector: keeping the pair adjacent is what stops a declaration from being
+/// ranked by a rule other than its own.
+struct Winner<'a> {
+    declaration: &'a Declaration,
+    specificity: u32,
+}
+
+/// A resolved declaration that carries the rank that made it win.
+///
+/// [`ResolvedValue`] is this without the rank. A caller reading a single
+/// stylesheet does not need it; a caller merging stylesheets cannot rank a
+/// merge without it, because the rank is exactly what the merge is decided on.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RankedValue {
+    /// The winning value, with `var()` references substituted.
+    pub value: String,
+    /// Author order of the winning declaration, within its own stylesheet.
+    ///
+    /// Not comparable across stylesheets on its own: it counts declarations
+    /// from this file only.
+    pub order: usize,
+    /// Specificity of the rule the winning declaration was authored under.
+    ///
+    /// The criterion a cross-sheet merge has to compare first.
+    pub specificity: u32,
+}
+
+impl RankedValue {
+    /// The same declaration without the rank, for a caller that has finished
+    /// merging.
+    ///
+    /// Dropping the rank is only correct once one declaration has won: there is
+    /// then nothing left to rank against, so the fact that decided it is spent.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn into_resolved(self) -> ResolvedValue {
+        ResolvedValue {
+            value: self.value,
+            order: self.order,
+        }
+    }
 }
 
 /// Iterate `(body_range, prelude)` for every top-level rule in `source`.

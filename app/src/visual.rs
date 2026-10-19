@@ -31,7 +31,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::canvas::{Color, Fill, ObjectStyle, Stroke};
 use crate::source_binding::{Reconciliation, SourceIndex};
 use crate::source_document::{NodeId, PersistentDocument};
-use crate::style::{self, Stylesheet};
+use crate::style::{self, RankedValue, Stylesheet};
 
 /// Width the layout uses for a top-level frame when CSS does not say.
 pub const DEFAULT_CONTENT_WIDTH: f32 = 960.0;
@@ -358,7 +358,16 @@ pub fn element_identity(fragment: &str) -> (String, Vec<String>, Option<String>)
     let open_tag_end = fragment.find('>').unwrap_or(fragment.len());
     let open_tag = &fragment[..open_tag_end];
     let id = attribute_values(open_tag, "id").into_iter().next();
-    (tag, attribute_values(open_tag, "class"), id)
+    // A `class` attribute is a whitespace-separated SET, not one name. Returning
+    // the raw attribute handed the cascade a single class called
+    // "swatch theme", which no `.swatch` or `.theme` rule can ever match — so
+    // every multi-class element came out unstyled.
+    let classes: Vec<String> = attribute_values(open_tag, "class")
+        .iter()
+        .flat_map(|value| value.split_whitespace())
+        .map(str::to_owned)
+        .collect();
+    (tag, classes, id)
 }
 
 /// Every value authored for one attribute of an open tag.
@@ -583,25 +592,103 @@ fn source_key_for(page: &str, href: &str) -> Option<String> {
 
 /// Resolve declarations for an element across every stylesheet.
 ///
-/// Sheets are consulted in document order and later sheets overwrite earlier
-/// ones, so cross-file cascade order matches the page. The element's `id` is
-/// passed through because an `#id` rule is the most specific thing an author
-/// can write, and without it the rule is simply unreachable.
+/// Each sheet is resolved on its own and the winners are then ranked against
+/// each other: specificity first, then which sheet the document links the
+/// declaration from, then author order inside it. Link order is therefore the
+/// *last* tie-break rather than an override. Ranking on link order alone lets a
+/// later `.theme` beat an earlier `#hero`, which is a value the author never
+/// asked for and which nothing about the result would reveal as wrong.
+///
+/// The element's `id` is passed through because an `#id` rule is the most
+/// specific thing an author can write, and without it the rule is simply
+/// unreachable.
 fn resolve_across(
     sheets: &[(String, Stylesheet)],
     facts: &ElementFacts,
 ) -> BTreeMap<String, String> {
+    let winners = rank_across(sheets, &facts.tag, &facts.classes, facts.id.as_deref());
     let mut out: BTreeMap<String, String> = BTreeMap::new();
-    for (_, sheet) in sheets {
-        for (property, resolved) in sheet.resolve(&facts.tag, &facts.classes, facts.id.as_deref()) {
-            out.insert(property, resolved.value);
-        }
+    for (property, winner) in winners.by_property {
+        out.insert(property, winner.value);
     }
-    // An inline `style` attribute outranks the stylesheet.
+    // An inline `style` attribute outranks the stylesheet, so it is applied
+    // after the merge rather than ranked into it.
     for (property, value) in &facts.inline {
         out.insert(property.clone(), value.clone());
     }
     out
+}
+
+/// The winner for every computed longhand, across every stylesheet the document
+/// links.
+///
+/// One traversal, shared by every caller that asks an element what its sheets
+/// say — including the inherited-text path, which asks one property at a time.
+/// Having a single ranked merge is what stops one of those callers from
+/// answering "whichever sheet mentioned it" while the other answers "whichever
+/// selector was most specific".
+fn rank_across(
+    sheets: &[(String, Stylesheet)],
+    tag: &str,
+    classes: &[String],
+    id: Option<&str>,
+) -> Winners {
+    let mut winners = Winners::default();
+    for (index, (_, sheet)) in sheets.iter().enumerate() {
+        for (property, resolved) in sheet.resolve_ranked(tag, classes, id) {
+            winners.consider(property, index, resolved);
+        }
+    }
+    winners
+}
+
+/// One declaration competing for a property across every sheet the document
+/// links, with the ranking that decides it.
+///
+/// Three criteria, in the order a browser applies them: selector specificity,
+/// then which sheet the declaration is linked from, then author order inside
+/// that sheet. Link order sits *between* specificity and author order rather
+/// than replacing both, so an earlier `#hero` outranks a later `.theme` and a
+/// later `.theme` still beats an earlier `.theme`.
+#[derive(Default)]
+struct Winners {
+    by_property: BTreeMap<String, Winner>,
+}
+
+impl Winners {
+    /// Keep this declaration if it outranks the incumbent for `property`.
+    ///
+    /// A tie cannot happen across sheets: `order` is unique within a sheet and
+    /// `sheet` separates them, so exactly one declaration wins each property.
+    fn consider(&mut self, property: String, sheet: usize, resolved: RankedValue) {
+        let candidate = Winner {
+            specificity: resolved.specificity,
+            sheet,
+            order: resolved.order,
+            value: resolved.value,
+        };
+        match self.by_property.get(&property) {
+            Some(current) if current.rank() >= candidate.rank() => {}
+            _ => {
+                self.by_property.insert(property, candidate);
+            }
+        }
+    }
+}
+
+/// A cross-sheet winner and the three numbers that rank it.
+struct Winner {
+    specificity: u32,
+    sheet: usize,
+    order: usize,
+    value: String,
+}
+
+impl Winner {
+    /// The comparable rank, for deciding whether this beats the incumbent.
+    fn rank(&self) -> (u32, usize, usize) {
+        (self.specificity, self.sheet, self.order)
+    }
 }
 
 /// Height of one line of text, as a multiple of the font size.
@@ -1074,17 +1161,19 @@ impl Wrapper {
     /// The value this wrapper contributes for one inherited property, if any.
     ///
     /// Its own `style` attribute outranks its stylesheet rules, same as for a
-    /// node.
+    /// node. The sheets are merged by [`rank_across`] rather than searched
+    /// for the first one that mentions the property, because a wrapper is
+    /// styled by the same cascade a node is — `body#shell` in one file and
+    /// `body.theme` in another is decided by specificity, not by which file
+    /// happens to be linked first.
     fn declaration(&self, property: &str, sheets: &[(String, Stylesheet)]) -> Option<String> {
         if let Some(inline) = self.inline.get(property) {
             return Some(inline.clone());
         }
-        sheets.iter().find_map(|(_, sheet)| {
-            sheet
-                .resolve(&self.tag, &self.classes, self.id.as_deref())
-                .get(property)
-                .map(|resolved| resolved.value.clone())
-        })
+        rank_across(sheets, &self.tag, &self.classes, self.id.as_deref())
+            .by_property
+            .get(property)
+            .map(|winner| winner.value.clone())
     }
 }
 
@@ -1654,6 +1743,156 @@ mod tests {
             .visuals
     }
 
+    /// A project whose page links `sheets` in exactly the order given.
+    ///
+    /// `scratch` writes one stylesheet named `styles.css`, which cannot express a
+    /// case that is about *the order two files are linked in*, so the cascade
+    /// across sheets needs a project of its own. `body_attributes` goes on the
+    /// `<body>` tag, which is the wrapper the inherited-text path reads.
+    fn linked_project(
+        name: &str,
+        structure: &str,
+        body_attributes: &str,
+        body: &str,
+        sheets: &[(&str, &str)],
+    ) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "spool-visual-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create project");
+        std::fs::write(
+            root.join("lamine.yaml"),
+            format!("version: 1\nnodes:\n{structure}"),
+        )
+        .expect("write metadata");
+        let links: String = sheets
+            .iter()
+            .map(|(href, _)| format!("  <link rel=\"stylesheet\" href=\"{href}\" />\n"))
+            .collect();
+        std::fs::write(
+            root.join("index.html"),
+            format!(
+                "<!doctype html>\n<html>\n<head>\n{links}</head>\n<body{body_attributes}>\n{body}\n\
+                 </body>\n</html>\n"
+            ),
+        )
+        .expect("write html");
+        for (href, contents) in sheets {
+            std::fs::write(root.join(href), contents).expect("write css");
+        }
+        root
+    }
+
+    #[test]
+    fn an_id_rule_outranks_a_class_rule_in_another_sheet_however_they_are_linked() {
+        // The defect: each sheet was asked for its winners and the answer
+        // dropped the specificity that decided them, so the merge across sheets
+        // had only link order left and an earlier `#hero` lost to a later
+        // `.theme`. The winner is a value the author never asked for, and
+        // nothing about it looks wrong.
+        let sheets = [
+            ("a.css", "#hero { background-color: #ff0000; }"),
+            ("b.css", ".theme { background-color: #0000ff; }"),
+        ];
+        for (name, sheets) in [
+            ("id-beats-class-id-first", sheets.as_slice()),
+            (
+                "id-beats-class-class-first",
+                [sheets[1], sheets[0]].as_slice(),
+            ),
+        ] {
+            let root = linked_project(
+                name,
+                &node_yaml("spool-a", "A", "frame", None, ""),
+                "",
+                "  <div id=\"hero\" class=\"theme\" data-spool-id=\"spool-a\">A</div>",
+                sheets,
+            );
+            assert_eq!(
+                open(&root).get(&node("spool-a")).expect("node").style.fill,
+                Some(Fill {
+                    color: Color::from_rgb(0xff0000)
+                }),
+                "the id selector wins in both link orders; link order is the last \
+                 tie-break, not an override"
+            );
+        }
+    }
+
+    #[test]
+    fn equal_specificity_across_sheets_is_still_decided_by_link_order() {
+        // The other half of the fix, and the reason the pre-existing link-order
+        // test never caught the bug: `.theme` against `.theme` is a tie, and CSS
+        // settles a tie by source order. Ranking must not have cost that.
+        let sheets = [
+            ("a.css", ".theme { background-color: #ff0000; }"),
+            ("b.css", ".theme { background-color: #0000ff; }"),
+        ];
+        let root = linked_project(
+            "equal-specificity",
+            &node_yaml("spool-a", "A", "frame", None, ""),
+            "",
+            "  <div class=\"theme\" data-spool-id=\"spool-a\">A</div>",
+            &sheets,
+        );
+        assert_eq!(
+            open(&root).get(&node("spool-a")).expect("node").style.fill,
+            Some(Fill {
+                color: Color::from_rgb(0x0000ff)
+            }),
+            "two equally specific rules are settled by the order the page links them"
+        );
+    }
+
+    #[test]
+    fn an_inline_style_outranks_every_sheet_however_specific_those_sheets_are() {
+        let root = linked_project(
+            "inline-outranks-sheets",
+            &node_yaml("spool-a", "A", "text", None, ""),
+            "",
+            "  <div id=\"hero\" class=\"theme\" data-spool-id=\"spool-a\" style=\"color: #00ff00\">A</div>",
+            &[
+                ("a.css", "#hero { color: #ff0000; }"),
+                ("b.css", ".theme { color: #0000ff; }"),
+            ],
+        );
+        assert_eq!(
+            open(&root).get(&node("spool-a")).expect("node").text_color,
+            Some(Color::from_rgb(0x00ff00)),
+            "an inline declaration outranks every stylesheet, however specific"
+        );
+    }
+
+    #[test]
+    fn an_inherited_colour_ranks_across_sheets_the_way_a_node_own_does() {
+        // The wrapper path is a second cross-sheet reader, and it was ranking on
+        // something else again: `find_map` over the sheets took the first one
+        // that *mentioned* the property. Here the tag rule in the first sheet
+        // loses to the class rule in the second by specificity, which is also
+        // what the node itself would have been given.
+        let root = linked_project(
+            "wrapper-across-sheets",
+            &node_yaml("spool-a", "A", "text", None, ""),
+            " class=\"theme\"",
+            "  <p data-spool-id=\"spool-a\">A</p>",
+            &[
+                ("a.css", "body { color: #ff0000; }"),
+                ("b.css", ".theme { color: #0000ff; }"),
+            ],
+        );
+
+        assert_eq!(
+            open(&root).get(&node("spool-a")).expect("node").text_color,
+            Some(Color::from_rgb(0x0000ff)),
+            "the inherited colour comes from the same cascade a node's own \
+             declaration would use, so the class rule beats the tag rule in a \
+             sheet linked earlier"
+        );
+    }
+
     #[test]
     fn padding_is_counted_once_not_twice() {
         // The defect this exists for: `inner_cursor` started at `top + padding-top`
@@ -2159,6 +2398,53 @@ mod tests {
             visuals.get(&node("spool-a")).expect("node").font_size,
             30.0,
             "and so does the id rule"
+        );
+    }
+
+    #[test]
+    fn a_class_attribute_is_a_set_of_names_rather_than_one_name() {
+        // A `class` attribute is whitespace-separated. Returning it whole gave
+        // the cascade a single class called "swatch theme", which no `.swatch` or
+        // `.theme` rule can match — so a multi-class element matched nothing at
+        // all and rendered with no authored paint. The parser accepts `.a.b`, so
+        // the selector side was ready and only the element side was not.
+        let (tag, classes, id) = element_identity("<div class=\"swatch theme\" id=\"a\">x</div>");
+        assert_eq!(tag, "div");
+        assert_eq!(
+            classes,
+            vec!["swatch".to_owned(), "theme".to_owned()],
+            "both names, in the order the author wrote them"
+        );
+        assert_eq!(id.as_deref(), Some("a"));
+
+        let (_, spaced, _) = element_identity("<div class=\"page  page   shell\">x</div>");
+        assert_eq!(
+            spaced,
+            vec!["page".to_owned(), "page".to_owned(), "shell".to_owned()],
+            "runs of whitespace separate names. A repeat is kept rather than \
+             collapsed: matching is a set membership test, so `class=\"body body\"` \
+             being two entries is harmless, and not deduplicating keeps this \
+             reader a faithful report of what was authored"
+        );
+    }
+
+    #[test]
+    fn an_element_with_several_classes_is_styled_by_each_of_them() {
+        // The same defect read through the real loader, because a unit test on
+        // `element_identity` only proves the split; this proves the split
+        // reaches the cascade.
+        let root = project(
+            "multi-class",
+            &node_yaml("spool-a", "A", "frame", None, ""),
+            "<!doctype html>\n<html>\n<head><link rel=\"stylesheet\" href=\"styles.css\" /></head>\n<body>\n  <div class=\"swatch theme\" data-spool-id=\"spool-a\">A</div>\n</body>\n</html>\n",
+            Some(".theme { background-color: #0000ff; }\n"),
+        );
+        assert_eq!(
+            open(&root).get(&node("spool-a")).expect("node").style.fill,
+            Some(Fill {
+                color: Color::from_rgb(0x0000ff)
+            }),
+            "`.theme` matches an element whose class attribute also names another class"
         );
     }
 
