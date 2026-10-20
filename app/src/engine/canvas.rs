@@ -1423,14 +1423,26 @@ impl Mods {
     /// every caller: on macOS the command key is the platform modifier, and
     /// everywhere else it is Control.
     ///
-    /// [`Self::cmd`] stays the physical platform modifier, because the
-    /// pointer path passes it to the engine as the deep-select modifier, and
-    /// that convention is a separate question from this one.
+    /// This is EXACTLY the engine's own `PointerEvent::cmd` — "Cmd on macOS,
+    /// Ctrl elsewhere" — so the pointer path passes this, not [`Self::cmd`].
+    /// Passing the physical platform modifier there meant that on Windows and
+    /// Linux a Control-click did not deep-select, and the Windows key did:
+    /// the opposite of every product on those platforms.
     pub fn command(&self) -> bool {
-        self.cmd
-            || (figcraft_engine::keymap::Platform::current()
-                != figcraft_engine::keymap::Platform::Mac
-                && self.ctrl)
+        self.command_for(figcraft_engine::keymap::Platform::current())
+    }
+
+    /// The command modifier, for a given platform.
+    ///
+    /// Split out from [`Self::command`] so the platform's rule can be tested
+    /// for platforms this build is not running on: only macOS has ever been
+    /// run here, and the rule is different on the other two.
+    pub fn command_for(&self, platform: figcraft_engine::keymap::Platform) -> bool {
+        if platform == figcraft_engine::keymap::Platform::Mac {
+            self.cmd
+        } else {
+            self.ctrl
+        }
     }
 }
 
@@ -1972,7 +1984,10 @@ impl EngineCanvas {
                 at,
                 m.shift,
                 m.alt,
-                m.cmd,
+                // The engine's command modifier: Cmd on macOS, Control
+                // elsewhere. The physical platform modifier would mean
+                // Control-click did not deep-select on Windows or Linux.
+                m.command(),
                 m.ctrl,
                 pressure,
             )

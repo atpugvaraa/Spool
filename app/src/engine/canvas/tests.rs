@@ -1357,3 +1357,61 @@ fn the_frame_is_blitted_where_the_overlay_draws_it() {
         "the frame must be drawn at the size the view says"
     );
 }
+
+/// The command modifier is the platform's, and the engine's.
+///
+/// figcraft's table writes `Cmd` for the command key in every spec and
+/// resolves it to Control off macOS, and the engine's `PointerEvent::cmd`
+/// says the same: "Cmd on macOS, Ctrl elsewhere".
+///
+/// GPUI reports the two separately -- `platform` is the Cmd key on macOS
+/// and the Windows key elsewhere, `control` is always Control -- so the
+/// platform's rule has to be applied once, here. Passing the physical
+/// platform modifier to the engine instead meant that on Windows and Linux
+/// a Control-click did not deep-select, and the Windows key did.
+///
+/// Only macOS has ever been run here, so this is pinned by a test rather
+/// than by a manual check on three platforms.
+#[test]
+fn the_command_modifier_is_the_platforms() {
+    let mac = figcraft_engine::keymap::Platform::Mac;
+    let other = figcraft_engine::keymap::Platform::Other;
+
+    // A Cmd key held: the command modifier on macOS, and NOT on the other
+    // platforms, where the command key is Control.
+    let cmd_key = Mods {
+        shift: false,
+        alt: false,
+        cmd: true,
+        ctrl: false,
+    };
+    assert_eq!(
+        cmd_key.command_for(mac),
+        true,
+        "the Cmd key is the command key on macOS"
+    );
+    assert_eq!(
+        cmd_key.command_for(other),
+        false,
+        "and it is not on Windows or Linux, where the command key is Control"
+    );
+
+    // A Control key held: the command key on Windows and Linux, and not on
+    // macOS.
+    let ctrl_key = Mods {
+        shift: false,
+        alt: false,
+        cmd: false,
+        ctrl: true,
+    };
+    assert_eq!(
+        ctrl_key.command_for(mac),
+        false,
+        "Control is not the command key on macOS"
+    );
+    assert_eq!(
+        ctrl_key.command_for(other),
+        true,
+        "and it is on Windows and Linux"
+    );
+}
