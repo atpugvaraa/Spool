@@ -176,12 +176,13 @@ pub enum Scope {
 /// case: most keys a user presses are either text, a panel's business, or
 /// nothing at all.
 pub fn resolve(key: &str, modifiers: Modifiers, scope: Scope) -> Option<Command> {
-    // History, duplicate and save answer in every scope, so they are asked
-    // first and they never fall through: a command-modifier key is either one
-    // of these or nothing, so the reader never has to know which block a `⌘`
-    // key stopped in. `⌥` is excluded from all of them — `⌥⌘D` is a shortcut in
-    // some other product, not this one, and quietly duplicating for it would be
-    // worse than doing nothing.
+    // THE COMMAND-MODIFIER CHORDS, and which scope answers them.
+    //
+    // They are asked first and they never fall through: a command-modifier key
+    // is either one of these or nothing, so the reader never has to know which
+    // block a `⌘` key stopped in. `⌥` is excluded from all of them — `⌥⌘D` is
+    // a shortcut in some other product, not this one, and quietly duplicating
+    // for it would be worse than doing nothing.
     if command(modifiers) && !modifiers.alt && !modifiers.function {
         // A TEXT SESSION OWNS HISTORY, SELECT-ALL AND DUPLICATE while it is
         // open, so the editor-wide table does not answer them there: `⌘Z`
@@ -198,7 +199,7 @@ pub fn resolve(key: &str, modifiers: Modifiers, scope: Scope) -> Option<Command>
                 _ => None,
             };
         }
-        // The editor scope answers the command modifier's chords, and it
+        // THE EDITOR SCOPE answers the command modifier's chords, and it
         // answers them first: a command-modifier key is either one of these
         // or nothing, so the reader never has to know which block a `⌘` key
         // stopped in. `⌥` is excluded from all of them — `⌥⌘D` is a shortcut
