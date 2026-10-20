@@ -1822,3 +1822,48 @@ fn cmd_d_while_editing_text_does_nothing(cx: &mut TestAppContext) {
         "the session is still open: ⌘D was not a text verb"
     );
 }
+
+/// `⌘⇧Z` while text is being edited does nothing.
+///
+/// Redo is a canvas chord, so it is not live while a text session is open —
+/// and an open session has nothing to redo: it has not been committed yet, so
+/// there is no text step to replay, and the document's redo stack is not the
+/// session's to spend. The assertions are about the DOCUMENT: the text as it
+/// was, the layers, and the depth of the history.
+///
+/// This is the one place Spool parts company with figcraft's own egui
+/// frontend, which ends the session and runs `edit.redo` — a step that has
+/// nothing to replay either, so the only thing it really does is commit the
+/// session. Spool leaves the session open, because a chord that cannot do
+/// anything should not change the state around it.
+#[gpui::test]
+fn cmd_shift_z_while_editing_text_does_nothing(cx: &mut TestAppContext) {
+    let (shell, window) = open_shell(cx);
+    create_engine_rectangle(&shell, window, 40.0, 40.0);
+    open_a_text_session(&shell, window, "Hello");
+    let nodes_before = engine_nodes(&shell, window).len();
+    let history_before = engine_undo_len(&shell, window);
+
+    window.simulate_keystrokes(REDO);
+    window.run_until_parked();
+
+    assert_eq!(
+        engine_last_text(&shell, window).as_deref(),
+        Some("Hello"),
+        "⌘⇧Z must not touch the text"
+    );
+    assert_eq!(
+        engine_nodes(&shell, window).len(),
+        nodes_before,
+        "and it must not add or remove a layer"
+    );
+    assert_eq!(
+        engine_undo_len(&shell, window),
+        history_before,
+        "and it must not record a history entry"
+    );
+    assert!(
+        engine_is_editing_text(&shell, window),
+        "the session is still open: there was no text step to replay"
+    );
+}
