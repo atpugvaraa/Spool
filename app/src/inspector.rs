@@ -1269,10 +1269,20 @@ impl Inspector {
 
     /// The layers the engine has selected, with the properties the panel shows.
     fn selected(&self, cx: &mut Context<Self>) -> Vec<model::DesignObject> {
+        self.selected_objects(cx)
+    }
+
+    /// The layers the engine has selected, with the properties the panel shows.
+    ///
+    /// The panel shows what the engine has selected, so this is the one place
+    /// that answer comes from: the engine's session, read live. The canvas
+    /// draws its selection overlay from the same session, so the two cannot
+    /// be about different layers.
+    pub fn selected_objects(&self, app: &gpui::App) -> Vec<model::DesignObject> {
         let Some(engine) = self.engine.as_ref() else {
             return Vec::new();
         };
-        engine.read(cx).with_session(|session| {
+        engine.read(app).with_session(|session| {
             let Ok(doc) = session.doc() else {
                 return Vec::new();
             };

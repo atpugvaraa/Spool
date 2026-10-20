@@ -205,10 +205,7 @@ impl BoxProperty {
 /// A layer the document does not hold — a selection that outlived its layer —
 /// is skipped rather than shown as an empty one.
 pub fn selected_objects(doc: &Document, selection: &[NodeId]) -> Vec<DesignObject> {
-    selection
-        .iter()
-        .filter_map(|id| object(doc, *id))
-        .collect()
+    selection.iter().filter_map(|id| object(doc, *id)).collect()
 }
 
 /// One layer, with the properties the panel shows.
@@ -221,10 +218,7 @@ pub fn object(doc: &Document, id: NodeId) -> Option<DesignObject> {
         kind: node.kind.label().to_owned(),
         position: geometry.position,
         size: geometry.size,
-        text_content: node
-            .kind
-            .text()
-            .map(|text| text.characters.clone()),
+        text_content: node.kind.text().map(|text| text.characters.clone()),
         text_color: text_color_of(node),
         font_size: node.kind.text().map(|text| text.style.font_size as f32),
         fill: solid_color(&node.fills),
@@ -399,7 +393,15 @@ mod tests {
         let mut doc = Document::new("test");
         let page = doc.add_page("Page 1");
         let id = doc
-            .create(page, NodeKind::Rectangle, "Rectangle", 10.0, 20.0, 30.0, 40.0)
+            .create(
+                page,
+                NodeKind::Rectangle,
+                "Rectangle",
+                10.0,
+                20.0,
+                30.0,
+                40.0,
+            )
             .expect("a rectangle");
         (doc, id)
     }
@@ -423,14 +425,21 @@ mod tests {
         let (doc, id) = document_with_rectangle();
         let object = object(&doc, id).expect("the layer");
         assert_eq!(object.id, id);
-        assert_eq!(object.id.0, id.0, "the id is the manifest's node id, as a number");
+        assert_eq!(
+            object.id.0, id.0,
+            "the id is the manifest's node id, as a number"
+        );
     }
 
     #[test]
     fn a_selection_reads_only_the_layers_the_document_holds() {
         let (doc, id) = document_with_rectangle();
         let selected = selected_objects(&doc, &[id, NodeId(9999)]);
-        assert_eq!(selected.len(), 1, "a layer that is gone is not shown as empty");
+        assert_eq!(
+            selected.len(),
+            1,
+            "a layer that is gone is not shown as empty"
+        );
     }
 
     #[test]
@@ -458,13 +467,7 @@ mod tests {
         node.strokes = vec![EnginePaint::solid(color.to_engine())];
         node.stroke.weight = 3.0;
         let object = object(&doc, id).expect("the layer");
-        assert_eq!(
-            object.stroke,
-            Some(Stroke {
-                color,
-                width: 3.0
-            })
-        );
+        assert_eq!(object.stroke, Some(Stroke { color, width: 3.0 }));
     }
 
     #[test]
@@ -474,7 +477,10 @@ mod tests {
         node.strokes = Vec::new();
         node.stroke.weight = 3.0;
         let object = object(&doc, id).expect("the layer");
-        assert_eq!(object.stroke, None, "a width with no stroke is not a width of zero");
+        assert_eq!(
+            object.stroke, None,
+            "a width with no stroke is not a width of zero"
+        );
     }
 
     #[test]
@@ -482,7 +488,10 @@ mod tests {
         let (mut doc, id) = document_with_rectangle();
         doc.get_mut(id).expect("the layer").corners.radii = [0.0, 4.0, 0.0, 4.0];
         let object = object(&doc, id).expect("the layer");
-        assert_eq!(object.border_radius, None, "a number here would be a radius nobody chose");
+        assert_eq!(
+            object.border_radius, None,
+            "a number here would be a radius nobody chose"
+        );
     }
 
     #[test]
@@ -733,9 +742,7 @@ mod tests {
     #[test]
     fn a_drag_is_one_undo_step() {
         let (mut session, id) = session_with_rectangle();
-        session
-            .begin_interaction("Move")
-            .expect("a gesture opens");
+        session.begin_interaction("Move").expect("a gesture opens");
         for x in [20.0_f32, 30.0, 40.0] {
             let (command, params) = box_command(BoxProperty::X, x, id);
             session
@@ -748,7 +755,11 @@ mod tests {
             1,
             "a drag is one step in the history, not one per pointer movement"
         );
-        assert_eq!(x_of(&session, id), 40.0, "and the layer is where the drag left it");
+        assert_eq!(
+            x_of(&session, id),
+            40.0,
+            "and the layer is where the drag left it"
+        );
         session.undo().expect("undo");
         assert_eq!(
             x_of(&session, id),
@@ -760,14 +771,14 @@ mod tests {
     #[test]
     fn an_abandoned_drag_leaves_the_document_alone() {
         let (mut session, id) = session_with_rectangle();
-        session
-            .begin_interaction("Move")
-            .expect("a gesture opens");
+        session.begin_interaction("Move").expect("a gesture opens");
         let (command, params) = box_command(BoxProperty::X, 99.0, id);
         session
             .execute(&command, &params)
             .expect("the engine accepts the command");
-        session.cancel_interaction().expect("the gesture is abandoned");
+        session
+            .cancel_interaction()
+            .expect("the gesture is abandoned");
         assert_eq!(x_of(&session, id), 10.0, "the layer is where it was");
         assert_eq!(
             session.undo_depth().0,

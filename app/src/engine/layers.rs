@@ -1264,6 +1264,21 @@ impl LayersPanel {
         &self.focus
     }
 
+    /// The layers the panel is listing, the box it is listing them in, and how
+    /// far the list is scrolled.
+    ///
+    /// For the window-level tests: the rows are what the panel has built, and
+    /// the viewport is the box it drew them in, so a test can ask which layer
+    /// a pointer at a given place would land on.
+    #[cfg(test)]
+    pub fn test_listing(&self) -> (Vec<NodeId>, Option<Viewport>, f32) {
+        (
+            self.cached_rows.iter().map(|row| row.id).collect(),
+            self.state.viewport,
+            self.state.offset,
+        )
+    }
+
     /// Run an engine command. The only way this panel changes the document.
     fn run(&mut self, id: &str, params: Value) -> bool {
         self.session.borrow_mut().execute(id, &params).is_ok()
@@ -1316,6 +1331,37 @@ impl LayersPanel {
             .as_ref()
             .map(|f| f.text.trim().to_lowercase())
             .unwrap_or_default()
+    }
+
+    /// The box the pages list is drawn in, measured by its probe.
+    ///
+    /// The fallback is the box the list is given before the probe has measured
+    /// one, so that the first frame has a list to draw rather than none.
+    fn pages_viewport(&self) -> Viewport {
+        self.state.pages_viewport.unwrap_or(Viewport {
+            x: RAIL_W,
+            y: 0.0,
+            width: 240.0,
+            height: 96.0,
+        })
+    }
+
+    /// The height of everything above the layer list: the file header, the
+    /// pages section, the layers header and the search box.
+    ///
+    /// The layer list is laid out as an absolute box under the chrome rather
+    /// than as a flexible child of it, so this is the number that says where
+    /// the list starts. It is the height the chrome is actually drawn at, so
+    /// the list starts exactly where the chrome ends.
+    ///
+    /// It is measured rather than flexed because a flexible child does not
+    /// grow: `flex: 1` asks the layout for the space that is left over, and
+    /// this layout does not hand it over, so a list laid out that way is drawn
+    /// with no height at all and its rows are clipped away.
+    fn chrome_height(&self) -> f32 {
+        let pages = self.pages_viewport();
+        let search = if self.state.layer_search { SEARCH_H } else { 0.0 };
+        FILE_HEADER_H + (HEADER_H + pages.height + 1.0) + HEADER_H + search
     }
 
     /// The pages as listed: `(id, name, divider)`.
@@ -2216,6 +2262,7 @@ impl Render for LayersPanel {
             .flex_col()
             .flex_1()
             .min_w_0()
+            .relative()
             .child(self.render_file_header(cx))
             .child(self.render_pages(page, cx))
             .child(self.render_layers_header(cx))
@@ -2226,6 +2273,11 @@ impl Render for LayersPanel {
             })
             .child(self.render_layers(&doc, page, &rows, &selection, hover, band, cx));
 
+        // The panel fills the box it is given.
+        //
+        // The panel is mounted in the shell's left sidebar, after the shell's
+        // own chrome, so it is laid out in the flow: the shell's chrome is
+        // above it, and the panel takes the rest.
         let root = div()
             .id("layers_panel")
             .flex()
@@ -2430,12 +2482,7 @@ impl LayersPanel {
     fn render_pages(&mut self, page: NodeId, cx: &mut Context<Self>) -> AnyElement {
         let pages = self.pages();
         let open = self.state.pages_open;
-        let pov = self.state.pages_viewport.unwrap_or(Viewport {
-            x: RAIL_W,
-            y: 0.0,
-            width: 240.0,
-            height: 96.0,
-        });
+        let pov = self.pages_viewport();
         let ptotal = pages.len() as f32 * ROW;
         let poffset = self
             .state
@@ -2730,8 +2777,12 @@ impl LayersPanel {
         let probe = self.probe(&self.probe_layers.clone());
         let list = div()
             .id("layers-view")
-            .relative()
-            .flex_1()
+            .debug_selector(|| "layers-list".to_string())
+            .absolute()
+            .left(px(0.0))
+            .right(px(0.0))
+            .top(px(self.chrome_height()))
+            .bottom(px(0.0))
             .min_h(px(0.0))
             .overflow_hidden()
             .on_scroll_wheel(cx.listener(|this, e: &gpui::ScrollWheelEvent, _w, cx| {
@@ -2765,11 +2816,10 @@ impl LayersPanel {
             } else {
                 "No matching layers"
             };
-            return div()
-                .flex_1()
-                .min_h(px(0.0))
-                .relative()
-                .child(list)
+            // The hint lives inside the list, not around it: the list is the
+            // box the rows are drawn in, and a box around it would have to be
+            // given a height of its own.
+            return list
                 .child(
                     div()
                         .absolute()
@@ -2867,6 +2917,10 @@ impl LayersPanel {
         }
         let mut row_div = row_base
             .id(SharedString::from(format!("row-{index}")))
+            // The selector names the LAYER, not the position: a test can then
+            // say which layer it is looking at, and the same layer keeps its
+            // name when the list above it changes.
+            .debug_selector(|| format!("layers-row-{}", row.id.0))
             .h(px(ROW))
             .flex()
             .items_center()

@@ -49,9 +49,9 @@
 //! so emitting figcraft's `Cmd+K` verbatim would add Shift to every letter
 //! shortcut. Both are handled, and both are pinned by tests over the whole table.
 
-pub mod keymap;
 pub mod canvas;
 pub mod inspector_model;
+pub mod keymap;
 pub mod layers;
 pub mod menus;
 pub mod palette;

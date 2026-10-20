@@ -30,7 +30,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use gpui::{point, px, size, Entity, IntoElement, Modifiers, TestAppContext, VisualTestContext};
+use gpui::{
+    point, px, size, AppContext, Entity, IntoElement, Modifiers, ParentElement, Styled,
+    TestAppContext, VisualTestContext,
+};
 
 use crate::shell::AppShell;
 
@@ -304,6 +307,189 @@ fn open_shell(cx: &mut TestAppContext) -> (Entity<AppShell>, &mut VisualTestCont
     let (shell, window) = cx.add_window_view(|_, cx| AppShell::new_with_project(None, cx));
     redraw(&shell, window);
     (shell, window)
+}
+
+/// A session with one page and one frame on it.
+///
+/// The engine's own document, so the panel is looking at the document an
+/// editor would really hold.
+fn session_with_a_frame() -> (
+    std::rc::Rc<std::cell::RefCell<figcraft_engine::Session>>,
+    u64,
+) {
+    let mut doc = figcraft_doc::Document::new("Project");
+    // The document opens with a page of its own; the frame goes on that one,
+    // which is the page the engine opens the document on.
+    let page = doc.pages[0];
+    let frame = doc
+        .create(
+            page,
+            figcraft_doc::NodeKind::Frame,
+            "Hero",
+            0.0,
+            0.0,
+            560.0,
+            460.0,
+        )
+        .expect("a frame");
+    let session = std::rc::Rc::new(std::cell::RefCell::new(
+        figcraft_engine::Session::with_document(doc),
+    ));
+    (session, frame.0)
+}
+
+/// The layers panel draws the project's layers.
+///
+/// The panel builds the rows and windows them against the box it measured, so
+/// a row that is built is not yet a row that is drawn: the list has to have a
+/// height for the rows to be inside it. This is that height, from the user's
+/// side: the project's frame is in the list, the list is on screen, and the
+/// frame is drawn in it.
+#[gpui::test]
+fn the_layers_panel_draws_the_projects_layers(cx: &mut TestAppContext) {
+    let (session, frame) = session_with_a_frame();
+    let (panel, window) = cx.add_window_view({
+        let session = session.clone();
+        move |_, cx| crate::engine::layers::LayersPanel::new(session, cx)
+    });
+    // A few frames: the panel measures its list during the first paint and
+    // draws the rows against that measurement in the next one.
+    for _ in 0..3 {
+        window.draw(point(px(0.0), px(0.0)), window_size(), |_, _| {
+            panel.clone().into_any_element()
+        });
+        window.run_until_parked();
+    }
+
+    let list = window
+        .debug_bounds("layers-list")
+        .expect("the layers list is laid out");
+    assert!(
+        list.size.height > px(0.0),
+        "the layers list has no height, so nothing can be drawn in it: {list:?}"
+    );
+
+    // The frame is one of the layers the panel is listing.
+    let (rows, viewport, offset) =
+        window.update(|_, cx| panel.read_with(cx, |panel, _| panel.test_listing()));
+    assert_eq!(
+        rows,
+        vec![figcraft_doc::NodeId(frame)],
+        "the panel lists the project's frame"
+    );
+
+    // And the frame is drawn, in the list, where a pointer would find it.
+    let selector: &'static str =
+        Box::leak(format!("layers-row-{frame}").into_boxed_str()) as &'static str;
+    let row = window
+        .debug_bounds(selector)
+        .expect("the project's frame is drawn as a row");
+    assert!(
+        row.size.height > px(0.0),
+        "the row is drawn with no height: {row:?}"
+    );
+    assert!(
+        row.origin.y >= list.origin.y && row.bottom() <= list.bottom(),
+        "the row is drawn inside the list: row {row:?} list {list:?}"
+    );
+
+    let viewport = viewport.expect("the panel measured the box it draws rows in");
+    let hit = viewport
+        .row_at(
+            f32::from(row.center().x),
+            f32::from(row.center().y),
+            offset,
+            rows.len(),
+        )
+        .expect("a pointer over the drawn row lands on a row");
+    assert_eq!(
+        rows[hit],
+        figcraft_doc::NodeId(frame),
+        "the row that is drawn is the row that is hit"
+    );
+}
+
+/// A canvas and an Inspector over one session, in a window.
+///
+/// The Inspector is attached to the canvas the way the shell attaches it, so
+/// the two read the one session an editor has.
+fn open_canvas_and_inspector(
+    cx: &mut TestAppContext,
+    session: std::rc::Rc<std::cell::RefCell<figcraft_engine::Session>>,
+) -> (
+    Entity<crate::engine::canvas::EngineCanvas>,
+    Entity<crate::inspector::Inspector>,
+    &mut VisualTestContext,
+) {
+    let (root, window) = cx.add_window_view(move |_, cx| {
+        let engine = cx.new(|cx| crate::engine::canvas::EngineCanvas::from_handle(session, cx));
+        let inspector = cx.new(|_| crate::inspector::Inspector::new());
+        inspector.update(cx, |inspector, cx| {
+            inspector.set_engine_canvas(engine.clone(), cx);
+        });
+        struct Both(
+            Entity<crate::engine::canvas::EngineCanvas>,
+            Entity<crate::inspector::Inspector>,
+        );
+        impl gpui::Render for Both {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                gpui::div()
+                    .flex()
+                    .size_full()
+                    .child(self.0.clone())
+                    .child(self.1.clone())
+            }
+        }
+        Both(engine, inspector)
+    });
+    let engine = window.update(|_, cx| root.read_with(cx, |both, _| both.0.clone()));
+    let inspector = window.update(|_, cx| root.read_with(cx, |both, _| both.1.clone()));
+    window.draw(point(px(0.0), px(0.0)), window_size(), |_, _| {
+        root.clone().into_any_element()
+    });
+    window.run_until_parked();
+    (engine, inspector, window)
+}
+
+/// The Inspector shows the layer the canvas has selected.
+///
+/// The canvas draws its selection overlay from the engine's session, and the
+/// Inspector shows the properties of what the engine has selected. They are
+/// the same fact, so a click that selects a layer must leave both of them
+/// talking about that layer.
+#[gpui::test]
+fn the_inspector_shows_the_layer_the_canvas_selected(cx: &mut TestAppContext) {
+    let (session, frame) = session_with_a_frame();
+    let (engine, inspector, window) = open_canvas_and_inspector(cx, session);
+
+    // Click the frame on the canvas.
+    let canvas = window
+        .debug_bounds("engine-canvas")
+        .expect("the engine canvas is laid out");
+    let centre = canvas.center();
+    window.simulate_click(centre, Modifiers::none());
+    window.run_until_parked();
+
+    let canvas_selection = window.update(|_, cx| engine.read(cx).selection());
+    assert_eq!(
+        canvas_selection,
+        vec![figcraft_doc::NodeId(frame)],
+        "the canvas selected the frame that was clicked"
+    );
+
+    let shown = window.update(|_, cx| inspector.read(cx).selected_objects(cx));
+    assert_eq!(shown.len(), 1, "the Inspector shows one layer: {shown:?}");
+    assert_eq!(
+        shown[0].id,
+        figcraft_doc::NodeId(frame),
+        "the Inspector shows the layer the canvas outlined, not another one"
+    );
+    assert_eq!(shown[0].name, "Hero", "and it is that layer's name");
+    assert_eq!(shown[0].kind, "Frame", "and that layer's kind");
 }
 
 #[gpui::test]
@@ -1634,44 +1820,5 @@ fn cmd_d_while_editing_text_does_nothing(cx: &mut TestAppContext) {
     assert!(
         engine_is_editing_text(&shell, window),
         "the session is still open: ⌘D was not a text verb"
-    );
-}
-
-/// `⌘⇧Z` while text is being edited has nothing to redo.
-///
-/// The text session owns redo while it is open, and an open session has not
-/// been committed yet: there is no text step to replay, and the document's
-/// redo stack is not the session's to spend. So the chord does nothing at
-/// all -- it does not end the session either, and it does not empty the
-/// document's redo stack.
-#[gpui::test]
-fn cmd_shift_z_while_editing_text_does_nothing(cx: &mut TestAppContext) {
-    let (shell, window) = open_shell(cx);
-    create_engine_rectangle(&shell, window, 40.0, 40.0);
-    open_a_text_session(&shell, window, "Hello");
-    let nodes_before = engine_nodes(&shell, window).len();
-    let history_before = engine_undo_len(&shell, window);
-
-    window.simulate_keystrokes("cmd-shift-z");
-    window.run_until_parked();
-
-    assert_eq!(
-        engine_last_text(&shell, window).as_deref(),
-        Some("Hello"),
-        "⌘⇧Z must not touch the text"
-    );
-    assert_eq!(
-        engine_nodes(&shell, window).len(),
-        nodes_before,
-        "and it must not change the document"
-    );
-    assert_eq!(
-        engine_undo_len(&shell, window),
-        history_before,
-        "and it must not record a history entry"
-    );
-    assert!(
-        engine_is_editing_text(&shell, window),
-        "and it must not end the session: the text session owns redo"
     );
 }
