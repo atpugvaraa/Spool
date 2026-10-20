@@ -164,7 +164,9 @@ pub fn gpui_keystrokes(spec: &str) -> Vec<String> {
         // Backspace and forward-delete are the same verb in figcraft, and in
         // every product it was copied from.
         "Delete" => vec![format!("{prefix}delete"), format!("{prefix}backspace")],
-        other => gpui_key(other).map(|key| vec![format!("{prefix}{key}")]).unwrap_or_default(),
+        other => gpui_key(other)
+            .map(|key| vec![format!("{prefix}{key}")])
+            .unwrap_or_default(),
     }
 }
 
@@ -270,6 +272,19 @@ pub fn shortcuts(platform: Platform) -> Vec<Shortcut> {
         .collect()
 }
 
+/// The commands Spool's own shell answers, whose chords are not installed.
+///
+/// `file.save` is Spool's save. It writes the engine's document back to the
+/// authored source — HTML and CSS, through [`crate::engine::source_edits`] —
+/// while the engine's `file.save` writes the engine's own document format to
+/// a path of its own. They are two different files, so the engine's chord is
+/// not installed: `⌘S` means one thing, and the shell's `save_project` is
+/// what it means.
+///
+/// The same shape as Escape below, and for the same reason: two owners of one
+/// chord is the defect, not the fix.
+const SHELL_OWNS: &[&str] = &["file.save"];
+
 /// The GPUI key bindings to install for `platform`.
 ///
 /// Only the canvas-side table: a `Text`-only binding belongs to the text editing layer, which
@@ -301,6 +316,9 @@ pub fn bindings(platform: Platform) -> Vec<KeyBinding> {
                 // calls back into the engine for the ones that are the engine's
                 // business. `select.none` is still reachable as a command.
                 .filter(|chord| !chord.ends_with("escape"))
+                // A CHORD THE SHELL OWNS IS NOT INSTALLED, for the same reason:
+                // two owners of one chord is the defect.
+                .filter(|_| !SHELL_OWNS.contains(&b.id))
                 .filter_map(|chord| {
                     KeyBinding::load(
                         &chord,
@@ -315,6 +333,30 @@ pub fn bindings(platform: Platform) -> Vec<KeyBinding> {
                 .collect::<Vec<_>>()
         })
         .collect()
+}
+
+/// Whether a command is live while text is being edited.
+///
+/// figcraft's table says where each shortcut is live: `Context::Text` is
+/// "only while editing text" and `Context::Both` is live in both, while
+/// `Context::Canvas` is "on the canvas (not while editing text)". The GPUI
+/// bindings Spool installs carry no context, so the shell asks the engine's
+/// own table rather than keeping a second one.
+///
+/// A command the table does not describe is not a shortcut at all, so nothing
+/// is said about it: it is live.
+///
+/// THE SKIPPED CHORD IS NOT A DEAD CHORD. `edit.undo`, `edit.redo`,
+/// `select.all` and `edit.duplicate` are canvas chords, so this says they are
+/// not live while a text session is open — and the canvas answers them there
+/// instead: `⌘Z` undoes the text, `⌘A` selects the text, `⌘D` does nothing
+/// (see [`crate::engine::canvas::EngineCanvas`]). The document's history and
+/// duplicate are not reachable from inside a text session.
+pub fn live_while_editing_text(id: &str) -> bool {
+    match KEYS.iter().find(|b| b.id == id) {
+        Some(binding) => binding.context != Context::Canvas,
+        None => true,
+    }
 }
 
 /// The chords in figcraft's table that Spool cannot spell as GPUI key bindings.
@@ -441,9 +483,11 @@ mod tests {
         // Counted in GPUI chords, not in figcraft specs: `Delete` is one spec
         // and two chords, because figcraft means Backspace or forward-delete by
         // it and GPUI has two key names for those. Escape is not counted,
-        // because the shell's ladder owns it and it is not installed.
+        // because the shell's ladder owns it and it is not installed, and
+        // neither is `file.save`, because the shell's save owns it.
         KEYS.iter()
             .filter(|b| b.context != Context::Text)
+            .filter(|b| !SHELL_OWNS.contains(&b.id))
             .map(|b| {
                 b.keys(Platform::Mac)
                     .iter()
@@ -474,8 +518,10 @@ mod tests {
         // 165 chords before `Delete` was expanded to Backspace and forward
         // delete; the three Delete chords in the table account for the three.
         // Escape is not installed -- the shell's ladder owns it -- so it is
-        // not counted: 167.
-        assert_eq!(expected_count(), 167);
+        // not counted: 167. `file.save` is not installed either -- the
+        // shell's save owns it, and the engine's would write a different file
+        // -- so it is not counted: 166.
+        assert_eq!(expected_count(), 166);
         for platform in PLATFORMS {
             let built = bindings(platform);
             assert_eq!(built.len(), expected_count(), "{platform:?}");
@@ -484,6 +530,48 @@ mod tests {
                 "{platform:?}"
             );
         }
+    }
+
+    /// The engine's save is not installed, so `⌘S` has exactly one owner.
+    ///
+    /// The engine's `file.save` writes the engine's own document format to a
+    /// path of its own; Spool's save writes the engine's document back to the
+    /// authored source. Installing both would run both, and the engine's would
+    /// be a save into a file nothing reads.
+    #[test]
+    fn the_engines_save_is_not_installed() {
+        for platform in PLATFORMS {
+            for binding in bindings(platform) {
+                let action = binding.action().as_any().downcast_ref::<RunCommand>();
+                let action = action.unwrap_or_else(|| panic!("a menu binding is not a RunCommand"));
+                assert_ne!(
+                    action.id, "file.save",
+                    "{platform:?}: the engine's save must not be installed"
+                );
+            }
+        }
+    }
+
+    /// The text context says what is live while a text session is open.
+    ///
+    /// figcraft's own rule: the canvas context is "on the canvas (not while
+    /// editing text)", the text context is live only while editing text, and
+    /// "both" is live in both. The shell enforces it, because the GPUI
+    /// bindings carry no context of their own.
+    #[test]
+    fn the_text_context_says_what_is_live_while_typing() {
+        // Text-only and "both" are live while typing.
+        assert!(live_while_editing_text("text.link"));
+        assert!(live_while_editing_text("text.bold"));
+        // Canvas-only is not: a letter that is a tool shortcut is a character
+        // in a text box, and Enter is a line break rather than a descent.
+        assert!(!live_while_editing_text("tool.hand"));
+        assert!(!live_while_editing_text("tool.line"));
+        assert!(!live_while_editing_text("select.children"));
+        assert!(!live_while_editing_text("edit.undo"));
+        // A command the table does not describe is not a shortcut, so nothing
+        // is said about it.
+        assert!(live_while_editing_text("text.edit.insert"));
     }
 
     /// `KeyBinding::new` panics on a bad keystroke; building the table must not, whatever the

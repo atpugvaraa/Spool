@@ -1413,6 +1413,45 @@ impl Mods {
             ctrl: m.control,
         }
     }
+
+    /// The command modifier, the way the engine's keymap means it.
+    ///
+    /// figcraft writes `Cmd` for the platform's command key in every spec, and
+    /// resolves it to Control off macOS — which is why its Windows and Linux
+    /// column reads `Ctrl` where the macOS one reads `Cmd`. GPUI reports the
+    /// two separately, so the platform's rule is applied here rather than in
+    /// every caller: on macOS the command key is the platform modifier, and
+    /// everywhere else it is Control.
+    ///
+    /// [`Self::cmd`] stays the physical platform modifier, because the
+    /// pointer path passes it to the engine as the deep-select modifier, and
+    /// that convention is a separate question from this one.
+    pub fn command(&self) -> bool {
+        self.cmd
+            || (figcraft_engine::keymap::Platform::current()
+                != figcraft_engine::keymap::Platform::Mac
+                && self.ctrl)
+    }
+}
+
+/// How far a text editing key moves or deletes, as the engine's `(word, line)`.
+///
+/// The engine's own rule, read for the platform this is running on: macOS
+/// moves by word with `⌥` and to the line's ends with `⌘`; Windows and Linux
+/// move by word with `Ctrl` and to the text's ends with `Ctrl`+`Home`/`End`.
+/// The engine says so in one place, so the canvas asks it rather than
+/// deciding which modifier means what.
+fn text_motion(name: &str, m: Mods) -> (bool, bool) {
+    figcraft_engine::keymap::text_motion(
+        figcraft_engine::keymap::Platform::current(),
+        name,
+        figcraft_engine::keymap::Mods {
+            shift: m.shift,
+            alt: m.alt,
+            cmd: m.cmd,
+            ctrl: m.ctrl,
+        },
+    )
 }
 
 /// A wheel event's delta in window pixels, whatever the platform reported.
@@ -1799,12 +1838,27 @@ impl EngineCanvas {
     }
 
     /// Undo, if there is anything to undo.
+    ///
+    /// A text session owns undo while it is open: the session's own step is
+    /// undone, and the document's history is not reached. See
+    /// [`Self::undo_text`].
     pub fn undo(&mut self, cx: &mut gpui::Context<Self>) -> bool {
+        if self.is_editing_text() {
+            return self.undo_text(cx);
+        }
         self.with_session_mut(cx, |s| s.undo()).unwrap_or(false)
     }
 
     /// Redo, if there is anything to redo.
+    ///
+    /// A text session owns redo while it is open, and an open session has
+    /// nothing to redo: it has not been committed yet, so there is no text
+    /// step to replay, and the document's redo stack is not the session's to
+    /// spend.
     pub fn redo(&mut self, cx: &mut gpui::Context<Self>) -> bool {
+        if self.is_editing_text() {
+            return false;
+        }
         self.with_session_mut(cx, |s| s.redo()).unwrap_or(false)
     }
 
@@ -1934,35 +1988,87 @@ impl EngineCanvas {
     ///
     /// Text editing first (the engine's own `textedit::key`), then the engine's `tool_key`, then
     /// Escape, which is the one key that means something at both levels.
+    ///
+    /// A CHARACTER is not written here at all: the platform's text input is
+    /// the one writer, and it carries the character the user meant where the
+    /// key event carries only the key that was pressed. See
+    /// [`EntityInputHandler::replace_text_in_range`].
     fn handle_key(&mut self, keystroke: &Keystroke, cx: &mut gpui::Context<Self>) {
         let m = Mods::of(&keystroke.modifiers);
-        // Select all has no key of its own: it is the platform's select-all chord.
-        if self.is_editing_text() && m.cmd && keystroke.key == "a" {
-            let _ = textedit::key(
-                &mut self.session.borrow_mut(),
-                "SelectAll",
-                m.shift,
-                false,
-                false,
-            );
-            cx.notify();
-            return;
+        if self.is_editing_text() {
+            // A TEXT SESSION OWNS UNDO, REDO AND SELECT-ALL.
+            //
+            // The engine's own keymap is the authority on this: `edit.undo`,
+            // `edit.redo`, `select.all` and `edit.duplicate` are CANVAS
+            // chords, so they are not live while text is being edited — the
+            // text session is above the canvas. The shell enforces that half
+            // (see [`crate::engine::keymap::live_while_editing_text`]), which
+            // is what lets these chords reach the session here.
+            //
+            //   * `⌘A` selects the TEXT. The layers are not selected.
+            //   * `⌘Z` undoes the TEXT: the session's own edit, which is one
+            //     history step, because a whole editing session is one undo
+            //     step. The document's own history is not reachable from
+            //     here.
+            //   * `⌘⇧Z` has nothing to redo: the session has not been
+            //     committed yet, so there is no text step to replay, and the
+            //     document's redo stack is not this session's to spend.
+            //   * `⌘D` is not a text verb at all. It does nothing.
+            //
+            // `⌘⇧A` is inverse selection, which is a canvas chord too, so it
+            // does nothing here either.
+            if m.command() {
+                match keystroke.key.as_str() {
+                    "a" if !m.shift => {
+                        let _ = textedit::key(
+                            &mut self.session.borrow_mut(),
+                            "SelectAll",
+                            false,
+                            false,
+                            false,
+                        );
+                        cx.notify();
+                        return;
+                    }
+                    "z" if !m.shift => {
+                        self.undo_text(cx);
+                        return;
+                    }
+                    "z" => return,
+                    _ => {}
+                }
+            }
         }
         let name = match engine_key_name(&keystroke.key) {
             Some(name) => name,
             None => {
                 // No named key: it is a character to type.
-                if self.is_editing_text() {
-                    if let Some(typed) = keystroke.key_char.as_deref().map(str::to_owned) {
-                        let _ = textedit::insert(&mut self.session.borrow_mut(), &typed);
-                        cx.notify();
-                    }
-                }
+                //
+                // THE CHARACTER IS NOT WRITTEN HERE. The platform's text input
+                // is the one writer: `replace_text_in_range` carries the
+                // character the user meant — an IME's committed text, a dead
+                // key's composition, a paste — where the key event carries
+                // only the key that was pressed.
+                //
+                // Writing from both would type every character twice, because
+                // GPUI delivers the key event and the text input for the same
+                // keystroke: the key event first on a plain keyboard, and the
+                // text input first under an IME. One writer, one character.
+                //
+                // So the key is left alone here, and it keeps travelling: the
+                // character arrives as the input event, which the platform
+                // only sends when the key event was not consumed.
+                cx.propagate();
                 return;
             }
         };
         if self.is_editing_text() {
-            let _ = textedit::key(&mut self.session.borrow_mut(), name, m.shift, m.cmd, m.ctrl);
+            // How far the key moves or deletes is the engine's own rule, read
+            // for the platform this is running on: macOS moves by word with
+            // `⌥` and to the line's ends with `⌘`, Windows and Linux move by
+            // word with `Ctrl`.
+            let (word, line) = text_motion(name, m);
+            let _ = textedit::key(&mut self.session.borrow_mut(), name, m.shift, word, line);
             cx.notify();
             return;
         }
@@ -1988,6 +2094,40 @@ impl EngineCanvas {
             .ds()
             .ok()
             .is_some_and(|ds| ds.text_edit.is_some())
+    }
+
+    /// Undo the text being edited: the text session's own step, and nothing else.
+    ///
+    /// The engine's text editing has no history of its own. A whole editing
+    /// session is ONE undo step — figcraft's rule, and the rule the corpus in
+    /// `docs/research/interaction/text-editing.md` settled — so the only way
+    /// to undo the text is to end the session, which commits that one step,
+    /// and then undo the step.
+    ///
+    /// The order matters, and it is figcraft's order (`textedit::end` and then
+    /// `edit.undo`): the engine's own undo DROPS an open interaction without
+    /// committing it, so undoing with the session still open would throw the
+    /// typed text away *and* undo the step before it.
+    ///
+    /// A session that committed nothing has nothing to undo, and the
+    /// document's own history is not reachable from here: while a text session
+    /// is open, the text session owns undo.
+    ///
+    /// Whether anything was undone.
+    fn undo_text(&mut self, cx: &mut gpui::Context<Self>) -> bool {
+        let mut session = self.session.borrow_mut();
+        let before = session.ds().map(|ds| ds.history.undo.len()).unwrap_or(0);
+        let _ = textedit::end(&mut session);
+        let after = session.ds().map(|ds| ds.history.undo.len()).unwrap_or(0);
+        let undone = after > before;
+        if undone {
+            if let Err(error) = session.execute("edit.undo", &serde_json::json!({})) {
+                eprintln!("spool_text_undo_failed error={error}");
+            }
+        }
+        drop(session);
+        cx.notify();
+        undone
     }
 
     fn on_key_down(
@@ -3536,6 +3676,16 @@ fn utf16_range_to_utf8(text: &str, range: Range<usize>) -> Range<usize> {
     utf16_to_utf8(text, start)..utf16_to_utf8(text, end)
 }
 
+/// The character index a UTF-16 offset names.
+///
+/// GPUI's input protocol counts UTF-16 code units and the engine counts
+/// `char`s, so an offset that crosses the boundary has to be converted
+/// rather than reused. The byte offset [`utf16_to_utf8`] finds is the way
+/// into the string; the character count is the way into the engine.
+fn utf16_to_char(text: &str, offset: usize) -> usize {
+    text[..utf16_to_utf8(text, offset)].chars().count()
+}
+
 fn utf8_range_to_utf16(text: &str, range: Range<usize>) -> Range<usize> {
     utf8_to_utf16(text, range.start)..utf8_to_utf16(text, range.end)
 }
@@ -3706,9 +3856,22 @@ impl EntityInputHandler for EngineCanvas {
         _window: &mut Window,
         cx: &mut gpui::Context<Self>,
     ) {
+        // THE ONE WRITER OF CHARACTERS.
+        //
+        // Everything that puts text into the document comes through here: a
+        // typed character, an IME's committed composition, and a paste (the
+        // default `paste` routes through this method too). The key event
+        // writes nothing, so a character lands once — see `handle_key`.
+        if !self.is_editing_text() {
+            return;
+        }
         if let Some(range) = range {
-            let (_, len) = self.edited_text().unwrap_or_default();
-            let (a, b) = (range.start.min(len), range.end.min(len));
+            // The range is in UTF-16 code units and the engine's text is
+            // indexed in `char`s, which are not the same thing for anything
+            // outside ASCII.
+            let (characters, len) = self.edited_text().unwrap_or_default();
+            let a = utf16_to_char(&characters, range.start).min(len);
+            let b = utf16_to_char(&characters, range.end).min(len);
             self.select_chars(a, b);
         }
         let owned = text.to_owned();

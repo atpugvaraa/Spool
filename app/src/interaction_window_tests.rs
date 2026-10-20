@@ -177,7 +177,7 @@ fn create_engine_rectangle(
     window.run_until_parked();
 }
 
-/// A point on the engine's page that is not on any node.
+/// A point on the engine's page, in page coordinates.
 ///
 /// The engine's own geometry: the page's bounds, in screen space, and a corner
 /// of it. A click there is a click on empty page, which is what the creation
@@ -186,20 +186,25 @@ fn empty_engine_point(
     shell: &Entity<AppShell>,
     window: &mut VisualTestContext,
 ) -> gpui::Point<gpui::Pixels> {
+    engine_page_point(shell, window, 0.0, 0.0)
+}
+
+/// A point on the engine's page, named in the page's own coordinates.
+///
+/// The view's centre is the page's origin by default, so `(0, 0)` is the
+/// middle of the canvas and a page coordinate is a position in the document
+/// rather than a position on the screen — which is what a test that wants to
+/// click "somewhere else on the page" needs.
+fn engine_page_point(
+    shell: &Entity<AppShell>,
+    window: &mut VisualTestContext,
+    x: f64,
+    y: f64,
+) -> gpui::Point<gpui::Pixels> {
     window.update(|_, cx| {
         shell.read_with(cx, |shell, _| {
             let canvas = shell.engine_canvas().read(cx);
-            let session = canvas.session_handle();
-            let session = session.borrow();
-            let Ok(doc) = session.doc() else {
-                panic!("the engine should have a document");
-            };
-            let _ = doc;
-            // The page's own origin. The view's centre is the page's origin by
-            // default, so this is the middle of the canvas -- and on an empty
-            // page it is empty space, which is what a creation test needs.
-            let at =
-                crate::engine::canvas::page_to_screen(&canvas.view(), canvas.viewport(), 0.0, 0.0);
+            let at = crate::engine::canvas::page_to_screen(&canvas.view(), canvas.viewport(), x, y);
             gpui::Point::new(px(at.x), px(at.y))
         })
     })
@@ -588,7 +593,6 @@ fn a_text_tool_click_opens_a_session_and_hands_the_tool_back(cx: &mut TestAppCon
 }
 
 #[gpui::test]
-#[ignore = "the engine's text session writes into the node as you type, so the first half of this test -- that typing edits the session and not the document -- has no counterpart; and GPUI's test harness delivers every keystroke twice (the key event, and the character input the window synthesises from it), so the typed text comes out doubled and asserting either form would assert a defect rather than a behaviour. Kept, NOT deleted: the coverage it provided is genuinely missing until the canvas consumes a character exactly once."]
 fn typing_after_a_text_click_is_committed_when_the_session_ends(cx: &mut TestAppContext) {
     // Typing reaches the object, and ending the session is what commits it to
     // the history.
@@ -608,8 +612,16 @@ fn typing_after_a_text_click_is_committed_when_the_session_ends(cx: &mut TestApp
         "typing reaches the object the session opened"
     );
 
-    // Click another object, which ends the session.
-    click_engine_node(&shell, window, 0, Modifiers::none());
+    // Click away from the text, which ends the session.
+    //
+    // Away, and not on the text itself: the text object was created at the
+    // page's origin, which is where the view's centre is, so a click at the
+    // origin would land on the text and move the caret rather than end
+    // anything. The starter scene holds nothing else to click, so this is
+    // empty page, well clear of the object.
+    let away = engine_page_point(&shell, window, 150.0, 0.0);
+    window.simulate_click(away, Modifiers::none());
+    window.run_until_parked();
 
     assert!(
         !engine_is_editing_text(&shell, window),
@@ -622,12 +634,19 @@ fn typing_after_a_text_click_is_committed_when_the_session_ends(cx: &mut TestApp
     );
 }
 
+/// Escape ends the text session, and what was typed stays.
+///
+/// The engine's real semantics, asserted through the real event path so that
+/// the rung that answers Escape — the text rung, ahead of the tool rung — is
+/// what is being tested.
+///
+/// The engine writes into the node as you type, so there is nothing for
+/// Escape to discard: ending the session COMMITS it, as one history entry,
+/// and the characters stay in the object. That is the engine's rule rather
+/// than a gap in it, so the test says what the rule is instead of asserting a
+/// discard that has no counterpart.
 #[gpui::test]
-#[ignore = "the engine's text session writes into the node as you type, so there is nothing for Escape to discard: the engine's cancel gives up the caret, not the characters, and this test's assertion -- that what was typed is thrown away -- has no counterpart. Kept, NOT deleted: the coverage it provided is genuinely missing until the engine's text session can be cancelled."]
-fn escape_discards_a_text_session_and_leaves_the_object_alone(cx: &mut TestAppContext) {
-    // The other end of the session: Escape is a cancel, not a commit. Asserted
-    // through the real event path so that the rung that answers it — the text
-    // rung, ahead of the tool rung — is what is being tested.
+fn escape_ends_the_text_session_and_keeps_what_was_typed(cx: &mut TestAppContext) {
     let (shell, window) = open_shell(cx);
     choose_tool(window, "Text");
 
@@ -637,6 +656,11 @@ fn escape_discards_a_text_session_and_leaves_the_object_alone(cx: &mut TestAppCo
     flush_frame(window, &spot);
     window.simulate_input("Hello");
     window.run_until_parked();
+    assert_eq!(
+        engine_last_text(&shell, window).as_deref(),
+        Some("Hello"),
+        "precondition: the text reached the object"
+    );
 
     let undo_before = engine_undo_len(&shell, window);
     window.simulate_keystrokes("escape");
@@ -647,9 +671,14 @@ fn escape_discards_a_text_session_and_leaves_the_object_alone(cx: &mut TestAppCo
         "Escape should end the session"
     );
     assert_eq!(
+        engine_last_text(&shell, window).as_deref(),
+        Some("Hello"),
+        "the engine writes into the node as you type, so ending the session keeps it"
+    );
+    assert_eq!(
         engine_undo_len(&shell, window),
-        undo_before,
-        "a discarded session is not a history entry"
+        undo_before + 1,
+        "ending the session commits it, as one history entry"
     );
 }
 
@@ -858,6 +887,29 @@ fn escape_walks_back_through_the_rungs_to_the_tool(cx: &mut TestAppContext) {
         vec!["Select".to_string()],
         "and the toolbar highlight should have followed"
     );
+}
+
+/// The engine's id for the node with this name.
+///
+/// The name is the authored one, so a test says which object it means
+/// instead of counting through the engine's node list.
+fn engine_node_named(
+    shell: &Entity<AppShell>,
+    window: &mut VisualTestContext,
+    name: &str,
+) -> figcraft_doc::NodeId {
+    window.update(|_, cx| {
+        shell.read_with(cx, |shell, _| {
+            let canvas = shell.engine_canvas().read(cx);
+            canvas.with_session(|session| {
+                let doc = session.doc().expect("the engine should have a document");
+                doc.nodes()
+                    .find(|node| node.name == name)
+                    .map(|node| node.id)
+                    .unwrap_or_else(|| panic!("the document should have a node named {name}"))
+            })
+        })
+    })
 }
 
 // ── Persistence: the whole chain, from a keypress to the file on disk ──────────
@@ -1224,4 +1276,402 @@ fn a_refused_rename_is_reported_in_the_status_line(cx: &mut TestAppContext) {
     assert!(message.contains("taken"), "and says why: {message}");
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+// ── The keyboard: one character, one writer ─────────────────────────────────
+
+/// A typed character lands once, and the whole word arrives.
+///
+/// The double-typing this covers was two writers for one character: the
+/// canvas wrote it from the key event AND from the platform's text input,
+/// which GPUI synthesises from the same keystroke, so every character landed
+/// twice.
+///
+/// The exact string is asserted rather than a count, because the letters of
+/// "Hello" are the ones the engine's own shortcuts are bound to — `H` flips
+/// horizontally, `L` is the line tool, `O` is the ellipse tool — so a text
+/// session that let a shortcut eat a character would type "He" and a count
+/// alone would not say which.
+#[gpui::test]
+fn typing_into_a_text_object_types_each_character_once(cx: &mut TestAppContext) {
+    let (shell, window) = open_shell(cx);
+    choose_tool(window, "Text");
+
+    let spot = empty_engine_point(&shell, window);
+    window.simulate_click(spot, Modifiers::none());
+    window.run_until_parked();
+    flush_frame(window, &spot);
+    assert!(
+        engine_is_editing_text(&shell, window),
+        "precondition: the click opened a text session"
+    );
+
+    window.simulate_input("Hello");
+    window.run_until_parked();
+
+    assert_eq!(
+        engine_last_text(&shell, window).as_deref(),
+        Some("Hello"),
+        "each character must land exactly once, and in order"
+    );
+}
+
+/// `⌘S` writes the open project back to its authored source.
+///
+/// The whole point of the chord is the file on disk, so the file is what is
+/// asserted. The canvas holds the focus while it happens, because that is the
+/// case that used to lose the save: the shell's key handler gave the keyboard
+/// back to the engine, and the engine's `file.save` writes the engine's own
+/// document format rather than the authored source Spool keeps.
+#[gpui::test]
+fn cmd_s_writes_the_engine_document_back_to_the_authored_source(cx: &mut TestAppContext) {
+    let root = scratch_project("cmd-s-save");
+
+    let (shell, window) = cx.add_window_view({
+        let root = root.clone();
+        move |_, cx| AppShell::new_with_project(Some(root), cx)
+    });
+    redraw(&shell, window);
+
+    // The canvas takes the focus, the way a click on it does.
+    let canvas_bounds = window
+        .debug_bounds("engine-canvas")
+        .expect("the engine canvas is on screen");
+    window.simulate_click(canvas_bounds.center(), Modifiers::none());
+    window.run_until_parked();
+    assert!(
+        engine_canvas_holds_focus(&shell, window),
+        "the canvas must hold the focus: that is the case the save used to lose"
+    );
+
+    // Change the document through the engine, the way an edit does.
+    let headline = engine_node_named(&shell, window, "Headline");
+    window.update(|_, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.engine_canvas().update(cx, |canvas, cx| {
+                canvas.run_engine_command(
+                    "text.set",
+                    serde_json::json!({"id": headline, "characters": "Shipped"}),
+                    cx,
+                );
+            });
+        });
+    });
+    window.run_until_parked();
+
+    let page = root.join("pages/index.html");
+    let before = std::fs::read_to_string(&page).expect("the authored page");
+    assert!(
+        before.contains("Design in source, structure in Spool"),
+        "precondition: the authored text is still the fixture's"
+    );
+
+    window.simulate_keystrokes("cmd-s");
+    window.run_until_parked();
+
+    let after = std::fs::read_to_string(&page).expect("the authored page");
+    assert_ne!(
+        after, before,
+        "the save must have written the authored file"
+    );
+    assert!(
+        after.contains("Shipped"),
+        "and it must be the editor's change that is on disk: {after}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ── While a text session is open: who owns undo, redo and select-all ──────────
+//
+// The engine's own keymap is the authority on this. `edit.undo`, `edit.redo`,
+// `select.all` and `edit.duplicate` are CANVAS chords, so they are not live
+// while text is being edited: the text session is above the canvas, and the
+// canvas answers those chords itself.
+//
+// The tests below drive the real chords through the real dispatch path and
+// assert what the DOCUMENT says afterwards: the characters of the layer, the
+// layers themselves, and the depth of the history.
+
+/// The text session's own selection: the caret and its anchor, in characters.
+///
+/// The caret is where the next character would land and the anchor is where
+/// the selection began, so a selection over the whole of "Hello" is `(5, 0)`.
+fn engine_text_selection(
+    shell: &Entity<AppShell>,
+    window: &mut VisualTestContext,
+) -> Option<(usize, usize)> {
+    window.update(|_, cx| shell.read_with(cx, |shell, _| shell.engine_canvas().read(cx).caret()))
+}
+
+/// The engine's id for the last text node in the document.
+fn engine_last_text_id(
+    shell: &Entity<AppShell>,
+    window: &mut VisualTestContext,
+) -> figcraft_doc::NodeId {
+    window.update(|_, cx| {
+        shell.read_with(cx, |shell, _| {
+            let canvas = shell.engine_canvas().read(cx);
+            canvas.with_session(|session| {
+                let doc = session.doc().expect("the engine should have a document");
+                doc.nodes()
+                    .filter_map(|node| node.kind.text().map(|_| node.id))
+                    .last()
+                    .expect("the document should have a text node")
+            })
+        })
+    })
+}
+
+/// A text session with `text` typed into it, on a new text layer.
+///
+/// The Text tool's own path: the tool is chosen from the toolbar, a click on
+/// the page creates the layer and opens the session, and the characters
+/// arrive through the platform's text input.
+fn open_a_text_session(shell: &Entity<AppShell>, window: &mut VisualTestContext, text: &str) {
+    choose_tool(window, "Text");
+    let spot = empty_engine_point(shell, window);
+    window.simulate_click(spot, Modifiers::none());
+    window.run_until_parked();
+    flush_frame(window, &spot);
+    assert!(
+        engine_is_editing_text(shell, window),
+        "precondition: the click opened a text session"
+    );
+    window.simulate_input(text);
+    window.run_until_parked();
+    assert_eq!(
+        engine_last_text(shell, window).as_deref(),
+        Some(text),
+        "precondition: the text reached the layer"
+    );
+}
+
+/// `⌘Z` while text is being edited undoes the TEXT, not the document.
+///
+/// A whole editing session is one undo step — figcraft's rule, and the rule
+/// the corpus settled — so the undo removes the session's own edit: the
+/// characters that were typed. The document's own earlier step is not
+/// reached, which is what the rectangle in this test is for.
+///
+/// The assertions are about the DOCUMENT: the characters of the layer, the
+/// layers themselves, and the depth of the history.
+#[gpui::test]
+fn cmd_z_while_editing_text_undoes_the_text_and_not_the_document(cx: &mut TestAppContext) {
+    let (shell, window) = open_shell(cx);
+    // A rectangle, so the document's own history has a step in it that the
+    // text session's undo must not reach.
+    let nodes_at_the_start = engine_nodes(&shell, window).len();
+    create_engine_rectangle(&shell, window, 40.0, 40.0);
+    let nodes_before = engine_nodes(&shell, window).len();
+    let history_before = engine_undo_len(&shell, window);
+
+    open_a_text_session(&shell, window, "Hello");
+
+    window.simulate_keystrokes(UNDO);
+    window.run_until_parked();
+
+    assert_eq!(
+        engine_last_text(&shell, window).as_deref(),
+        Some(""),
+        "⌘Z must undo the characters that were typed"
+    );
+    assert_eq!(
+        engine_nodes(&shell, window).len(),
+        nodes_before + 1,
+        "the layer the session created is still there: ⌘Z undid the text, not the layer"
+    );
+    assert_eq!(
+        engine_undo_len(&shell, window),
+        history_before,
+        "and the document's own history is untouched: the session's one step was undone, not added"
+    );
+    assert!(
+        !engine_is_editing_text(&shell, window),
+        "the session is over: the step it was going to commit is the step that was undone"
+    );
+    // And the document's earlier step is still there to be undone itself: the
+    // text session's undo did not spend it. Taking it back now that the
+    // session is over puts the document where it was before the rectangle —
+    // the engine's history is whole-document snapshots, not differences.
+    window.simulate_keystrokes(UNDO);
+    window.run_until_parked();
+    assert_eq!(
+        engine_nodes(&shell, window).len(),
+        nodes_at_the_start,
+        "the document's own history is still reachable now that the session is over"
+    );
+}
+
+/// `⌘Z` puts the text back to what it was before the session.
+///
+/// The sharpest statement of the contract: the layer survives, the text it
+/// held before the session survives, and only the characters typed during the
+/// session are gone. An undo that reached past the session would have taken
+/// the layer with it.
+#[gpui::test]
+fn cmd_z_while_editing_text_puts_the_text_back_to_what_it_was(cx: &mut TestAppContext) {
+    let (shell, window) = open_shell(cx);
+    open_a_text_session(&shell, window, "Hello");
+    let nodes_before = engine_nodes(&shell, window).len();
+
+    // End the session, so the text is committed and the layer is there.
+    let away = engine_page_point(&shell, window, 150.0, 0.0);
+    window.simulate_click(away, Modifiers::none());
+    window.run_until_parked();
+    assert!(
+        !engine_is_editing_text(&shell, window),
+        "precondition: the session ended"
+    );
+    assert_eq!(engine_last_text(&shell, window).as_deref(), Some("Hello"));
+
+    // Back into it: the Text tool and a click on the text itself.
+    choose_tool(window, "Text");
+    let layer = engine_last_text_id(&shell, window);
+    let on_the_text = engine_node_centre(&shell, window, layer);
+    window.simulate_click(on_the_text, Modifiers::none());
+    window.run_until_parked();
+    flush_frame(window, &on_the_text);
+    assert!(
+        engine_is_editing_text(&shell, window),
+        "precondition: the click opened a session on the text"
+    );
+    // The caret goes to the end of the text, so what is typed is appended.
+    // The click's own index depends on the text layout, which is not what
+    // this test is about.
+    window.update(|_, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.engine_canvas().update(cx, |canvas, cx| {
+                canvas.run_engine_command("text.edit.caret", serde_json::json!({ "index": 5 }), cx);
+            });
+        });
+    });
+    window.run_until_parked();
+    window.simulate_input(" world");
+    window.run_until_parked();
+    assert_eq!(
+        engine_last_text(&shell, window).as_deref(),
+        Some("Hello world"),
+        "precondition: the session added to the text"
+    );
+
+    window.simulate_keystrokes(UNDO);
+    window.run_until_parked();
+
+    assert_eq!(
+        engine_last_text(&shell, window).as_deref(),
+        Some("Hello"),
+        "⌘Z must put the text back to what it was before this session"
+    );
+    assert_eq!(
+        engine_nodes(&shell, window).len(),
+        nodes_before,
+        "and the layer must still be there: the undo is the text's, not the document's"
+    );
+}
+
+/// `⌘A` while text is being edited selects the TEXT, not the layers.
+///
+/// The text session owns select-all, so the document's selection does not
+/// change: the rectangle in this test is what `select.all` would have taken.
+#[gpui::test]
+fn cmd_a_while_editing_text_selects_the_text_and_not_the_layers(cx: &mut TestAppContext) {
+    let (shell, window) = open_shell(cx);
+    create_engine_rectangle(&shell, window, 40.0, 40.0);
+    open_a_text_session(&shell, window, "Hello");
+
+    window.simulate_keystrokes("cmd-a");
+    window.run_until_parked();
+
+    assert_eq!(
+        engine_text_selection(&shell, window),
+        Some((5, 0)),
+        "⌘A must select the whole of the text"
+    );
+    assert_eq!(
+        engine_selection(&shell, window).len(),
+        1,
+        "and it must not select the layers: the text session owns select-all"
+    );
+    assert_eq!(
+        engine_last_text(&shell, window).as_deref(),
+        Some("Hello"),
+        "and it must not change the text"
+    );
+}
+
+/// `⌘D` while text is being edited does nothing.
+///
+/// Duplicate is a canvas chord, so it is not live while a text session is
+/// open, and a text buffer has nothing to duplicate. The assertions are about
+/// the DOCUMENT: no new layer, no new history entry, and the text as it was.
+#[gpui::test]
+fn cmd_d_while_editing_text_does_nothing(cx: &mut TestAppContext) {
+    let (shell, window) = open_shell(cx);
+    create_engine_rectangle(&shell, window, 40.0, 40.0);
+    open_a_text_session(&shell, window, "Hello");
+    let nodes_before = engine_nodes(&shell, window).len();
+    let history_before = engine_undo_len(&shell, window);
+
+    window.simulate_keystrokes("cmd-d");
+    window.run_until_parked();
+
+    assert_eq!(
+        engine_nodes(&shell, window).len(),
+        nodes_before,
+        "⌘D must not duplicate anything"
+    );
+    assert_eq!(
+        engine_last_text(&shell, window).as_deref(),
+        Some("Hello"),
+        "and it must not touch the text"
+    );
+    assert_eq!(
+        engine_undo_len(&shell, window),
+        history_before,
+        "and it must not record a history entry"
+    );
+    assert!(
+        engine_is_editing_text(&shell, window),
+        "the session is still open: ⌘D was not a text verb"
+    );
+}
+
+/// `⌘⇧Z` while text is being edited has nothing to redo.
+///
+/// The text session owns redo while it is open, and an open session has not
+/// been committed yet: there is no text step to replay, and the document's
+/// redo stack is not the session's to spend. So the chord does nothing at
+/// all -- it does not end the session either, and it does not empty the
+/// document's redo stack.
+#[gpui::test]
+fn cmd_shift_z_while_editing_text_does_nothing(cx: &mut TestAppContext) {
+    let (shell, window) = open_shell(cx);
+    create_engine_rectangle(&shell, window, 40.0, 40.0);
+    open_a_text_session(&shell, window, "Hello");
+    let nodes_before = engine_nodes(&shell, window).len();
+    let history_before = engine_undo_len(&shell, window);
+
+    window.simulate_keystrokes("cmd-shift-z");
+    window.run_until_parked();
+
+    assert_eq!(
+        engine_last_text(&shell, window).as_deref(),
+        Some("Hello"),
+        "⌘⇧Z must not touch the text"
+    );
+    assert_eq!(
+        engine_nodes(&shell, window).len(),
+        nodes_before,
+        "and it must not change the document"
+    );
+    assert_eq!(
+        engine_undo_len(&shell, window),
+        history_before,
+        "and it must not record a history entry"
+    );
+    assert!(
+        engine_is_editing_text(&shell, window),
+        "and it must not end the session: the text session owns redo"
+    );
 }

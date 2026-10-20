@@ -628,22 +628,32 @@ impl AppShell {
             self.escape_topmost(cx);
             return;
         }
-        // While the engine canvas owns the keyboard, the engine is the
-        // authority: its own keymap dispatches figcraft command ids, and its
-        // gesture handling answers the keys that are not commands. The shell's
-        // command table must not answer the same chord as well, or one Cmd+Z
-        // would undo twice -- once in each runtime.
-        if self.engine_canvas.read(cx).has_focus(window) {
-            return;
-        }
         let scope = if self.engine_canvas.read(cx).is_editing_text() {
             commands::Scope::TextEditing
         } else {
             commands::Scope::Editor
         };
-        if let Some(command) = commands::resolve(key, modifiers, scope) {
-            self.run_command(command, cx);
+        let Some(command) = commands::resolve(key, modifiers, scope) else {
+            return;
+        };
+        // While the engine canvas owns the keyboard, the engine is the
+        // authority: its own keymap dispatches figcraft command ids, and its
+        // gesture handling answers the keys that are not commands. The shell's
+        // command table must not answer the same chord as well, or one Cmd+Z
+        // would undo twice -- once in each runtime.
+        //
+        // THE SAVE IS THE EXCEPTION. Spool's save writes the engine's document
+        // back to the authored source, and the engine has no path there: its
+        // own `file.save` writes the engine's document format, which is a
+        // different file, and its binding is deliberately not installed (see
+        // `engine::keymap`). So the shell answers the save chord itself,
+        // whether or not the canvas holds the focus.
+        if self.engine_canvas.read(cx).has_focus(window)
+            && !matches!(command, commands::Command::Save)
+        {
+            return;
         }
+        self.run_command(command, cx);
     }
 
     /// Choose a tool, on the engine.
@@ -1619,6 +1629,29 @@ impl Render for AppShell {
                 move |action: &crate::engine::keymap::RunCommand, _window, cx| {
                     let id = action.id.clone();
                     let params = action.params.clone();
+                    // A TEXT SESSION IS ABOVE THE CANVAS.
+                    //
+                    // figcraft's own keymap says where each shortcut is live:
+                    // the canvas context is "on the canvas (not while editing
+                    // text)" and the text context is live only while editing
+                    // text. The GPUI bindings Spool installs carry no context,
+                    // so the shell enforces the engine's own rule here.
+                    //
+                    // Without it, typing a letter that is also a shortcut
+                    // switches tools instead of typing: `L` is the line tool
+                    // and `O` is the ellipse, `H` flips horizontally, and
+                    // `Enter` descends the selection instead of ending a line.
+                    //
+                    // The key keeps travelling when the shortcut is skipped,
+                    // because the character the user typed arrives as the
+                    // platform's text input, and the key event is what tells
+                    // the platform to send it.
+                    if engine_canvas.read(cx).is_editing_text()
+                        && !crate::engine::keymap::live_while_editing_text(&id)
+                    {
+                        cx.propagate();
+                        return;
+                    }
                     engine_canvas.update(cx, |canvas, cx| {
                         canvas.run_engine_command(&id, params, cx);
                     });
