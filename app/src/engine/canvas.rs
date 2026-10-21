@@ -1590,11 +1590,29 @@ impl Default for CanvasState {
 /// An ordinary GPUI entity. Put it in a `div().flex_1()` and it fills the space it is given; hand
 /// [`EngineCanvas::session_handle`] to the panels so they read and act through the same session.
 pub struct EngineCanvas {
+    /// The Prototype tab is open, so the canvas draws the prototype's
+    /// connections.
+    prototype_mode: bool,
+    /// The Dev Mode tab is open, so the canvas draws the annotations' callouts
+    /// and the engine measures distances on hover.
+    dev_mode: bool,
+    /// Which annotations the canvas's callouts show.
+    dev_filter: crate::engine::panel_devmode::CategoryFilter,
     /// The engine. Shared with the panels through [`EngineCanvas::session_handle`].
     session: Rc<RefCell<Session>>,
     /// The retained render, on its own thread.
     renderer: CanvasRenderer,
     focus: FocusHandle,
+    /// Whether another surface owns the keyboard.
+    ///
+    /// A text field in the Inspector is a text field: a character typed into
+    /// it is a character, not a canvas gesture. The canvas is the only
+    /// surface that takes the keyboard for itself, so it is the only one that
+    /// has to be told when a field wants it instead.
+    ///
+    /// The Inspector decides, because it is the surface that knows which of
+    /// its fields are open.
+    keyboard_claimed: bool,
     state: CanvasState,
     palette: Palette,
     /// The hitbox the last prepaint inserted: the cursor style needs it by reference.
@@ -1626,6 +1644,10 @@ impl EngineCanvas {
             session,
             renderer: CanvasRenderer::new(),
             focus: cx.focus_handle(),
+            keyboard_claimed: false,
+            prototype_mode: false,
+            dev_mode: false,
+            dev_filter: crate::engine::panel_devmode::CategoryFilter::All,
             state: CanvasState::default(),
             palette: Palette::new(),
             hitbox: Rc::new(RefCell::new(None)),
@@ -1723,6 +1745,46 @@ impl EngineCanvas {
                 eprintln!("spool_engine_command_failed id={id} error={error}");
                 false
             }
+        }
+    }
+
+    /// Turn the prototype's connections on and off.
+    ///
+    /// The Prototype tab is a mode as well as a panel: while it is open the
+    /// canvas draws the noodles between the layers that act on one another.
+    pub fn set_prototype_mode(&mut self, active: bool, cx: &mut gpui::Context<Self>) {
+        if self.prototype_mode != active {
+            self.prototype_mode = active;
+            cx.notify();
+        }
+    }
+
+    /// Turn Dev Mode on and off.
+    ///
+    /// Dev Mode is a MODE as well as a panel: while it is open the canvas
+    /// draws the annotations' callouts, and the engine measures distances on
+    /// hover without Alt held -- `tool.redlines`, which is what
+    /// `figcraft_engine::distance::hover_lines` answers.
+    pub fn set_dev_mode(&mut self, active: bool, cx: &mut gpui::Context<Self>) {
+        if self.dev_mode != active {
+            self.dev_mode = active;
+            self.session.borrow_mut().tool.redlines = active;
+            cx.notify();
+        }
+    }
+
+    /// Which annotations the canvas's callouts show.
+    ///
+    /// The Inspector owns the filter and the canvas draws the callouts it
+    /// selects, so the two have to agree.
+    pub fn set_dev_category_filter(
+        &mut self,
+        filter: crate::engine::panel_devmode::CategoryFilter,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if self.dev_filter != filter {
+            self.dev_filter = filter;
+            cx.notify();
         }
     }
 
@@ -1947,6 +2009,28 @@ impl EngineCanvas {
     /// Give the canvas keyboard focus.
     pub fn focus(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) {
         self.focus.focus(window, cx);
+    }
+
+    /// Say whether another surface owns the keyboard.
+    ///
+    /// The canvas takes the focus for itself on every click and answers keys
+    /// as the engine's gestures, so it is the one surface that has to be told
+    /// when a text field wants the keyboard instead: `z` typed into a colour
+    /// code is not the zoom tool, a space typed into one is not a pan, and a
+    /// click on the canvas does not take the field's focus away.
+    ///
+    /// The Inspector decides, because it is the surface that knows which of
+    /// its fields are open.
+    pub fn set_keyboard_claimed(&mut self, claimed: bool, cx: &mut gpui::Context<Self>) {
+        if self.keyboard_claimed != claimed {
+            self.keyboard_claimed = claimed;
+            cx.notify();
+        }
+    }
+
+    /// Whether another surface owns the keyboard.
+    pub fn keyboard_claimed(&self) -> bool {
+        self.keyboard_claimed
     }
 
     // --- rendering ----------------------------------------------------------
@@ -2242,6 +2326,20 @@ impl EngineCanvas {
         _window: &mut Window,
         cx: &mut gpui::Context<Self>,
     ) {
+        // A TEXT FIELD OWNS THE KEYBOARD, so the canvas does not answer keys.
+        //
+        // The canvas is the engine's own key handling, and the engine's keys
+        // are gestures: `z` is the zoom tool, a space is a pan, Enter places
+        // a shape. Typed into a field, those are characters. So while a field
+        // is open the canvas steps aside and lets the key travel up to the
+        // surface that has the field.
+        //
+        // The key still travels: `cx.propagate()` is what carries it to the
+        // shell, which routes it to the field's own handler.
+        if self.keyboard_claimed {
+            cx.propagate();
+            return;
+        }
         if !event.is_held {
             match event.keystroke.key.as_str() {
                 "space" => {
@@ -2298,7 +2396,20 @@ impl EngineCanvas {
         window: &mut Window,
         cx: &mut gpui::Context<Self>,
     ) {
-        self.focus.focus(window, cx);
+        // A FIELD OWNS THE KEYBOARD, SO THE CANVAS DOES NOT TAKE IT.
+        //
+        // The canvas takes the focus on every click, which is right while the
+        // canvas is the surface the user is on. It is wrong while a text
+        // field is open: the field owns the keyboard, and the next click on
+        // the canvas does not take it away.
+        //
+        // The default is prevented as well as the focus skipped: GPUI focuses
+        // a focusable element on the mouse-down, and the canvas is one.
+        if self.keyboard_claimed {
+            window.prevent_default();
+        } else {
+            self.focus.focus(window, cx);
+        }
         let at = f32_point(event.position);
         let m = Mods::of(&event.modifiers);
         match event.button {
@@ -2636,6 +2747,39 @@ impl EngineCanvas {
         let pal = self.palette;
 
         self.paint_pixel_grid(ov, s);
+
+        // The Dev Mode callouts, when the Dev Mode tab is open.
+        if self.dev_mode {
+            let viewport = ov.viewport;
+            crate::engine::panel_devmode::paint_dev_mode_overlay(
+                &mut *ov.window,
+                &mut *ov.app,
+                view,
+                viewport,
+                doc,
+                s.page,
+                &s.selection,
+                &pal,
+                &self.dev_filter,
+            );
+        }
+
+        // The prototype's connections, when the Prototype tab is open.
+        //
+        // The viewport is read first: `ov.window` is borrowed mutably by the
+        // call, so the viewport has to be copied out before it.
+        if self.prototype_mode {
+            let viewport = ov.viewport;
+            crate::engine::panel_prototyping::paint_proto_connections(
+                ov.window,
+                view,
+                viewport,
+                doc,
+                s.page,
+                &s.selection,
+                &pal,
+            );
+        }
 
         // Layout grids and frame labels for top-level frames.
         for c in boards(doc, s.page) {
@@ -3395,6 +3539,16 @@ impl EngineCanvas {
             world * Point::new(0.0, 0.0),
         ];
         self.state.labels.push((id, quad));
+        // The Dev Mode status badge, beside the frame's name.
+        crate::engine::panel_devmode::paint_dev_status_badge(
+            &mut *ov.window,
+            &mut *ov.app,
+            n,
+            GPoint {
+                x: at.x + w + 6.0,
+                y: at.y - height as f32 + LABEL_PT * LABEL_LINE / 2.0,
+            },
+        );
     }
 
     /// Text editing: the box, the selection, the composition underline and the caret.

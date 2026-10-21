@@ -36,6 +36,19 @@
 //! `fill`, grid auto-layout and everything else Figma-specific stays Owner B in
 //! `lamine.yaml`. This is the decision recorded in `docs/02`.
 //!
+//! # A shorthand is expanded before the cascade runs
+//!
+//! CSS expands a shorthand into its longhands first, so `gap` and `row-gap`
+//! compete under one name and an inline `padding` beats a stylesheet's
+//! `padding-top`. The stylesheet cascade already does that — it reports the
+//! computed longhands — and the element's own `style` attribute is expanded the
+//! same way, so the two cannot disagree about which declaration wins.
+//!
+//! The two gap axes are named by direction in CSS and by role in the engine,
+//! and they agree in one direction only: a horizontal layout separates its
+//! items with `column-gap` and its rows with `row-gap`, and a vertical one is
+//! the other way round.
+//!
 //! # Scope, stated so it can be widened deliberately
 //!
 //! - Markup is scanned for the facts the cascade matches on — tag, classes,
@@ -142,6 +155,19 @@ const LAYOUT_PROPERTIES: &[&str] = &[
     "row-gap",
 ];
 
+/// The declarations that make up the padding.
+///
+/// The shorthand and the four longhands are one property: CSS expands the
+/// shorthand into the longhands, so `padding-top` on its own is a padding just
+/// as much as `padding` is.
+const PADDING_PROPERTIES: &[&str] = &[
+    "padding",
+    "padding-bottom",
+    "padding-left",
+    "padding-right",
+    "padding-top",
+];
+
 /// Elements that never have a closing tag.
 ///
 /// Treating one of these as an open element would make everything after it read
@@ -175,7 +201,11 @@ pub enum ReadError {
     #[error(
         "node {id} binds with selector {selector:?}, which is outside the supported form `[data-spool-id=\"…\"]`"
     )]
-    UnsupportedSelector { id: u64, file: String, selector: String },
+    UnsupportedSelector {
+        id: u64,
+        file: String,
+        selector: String,
+    },
 
     #[error("node {id} binds with selector {selector:?}, which matches nothing in {file}")]
     UnresolvedBinding {
@@ -184,7 +214,9 @@ pub enum ReadError {
         selector: String,
     },
 
-    #[error("node {id} binds with selector {selector:?}, which matches {count} elements in {file}")]
+    #[error(
+        "node {id} binds with selector {selector:?}, which matches {count} elements in {file}"
+    )]
     AmbiguousBinding {
         id: u64,
         file: String,
@@ -201,7 +233,9 @@ pub enum ReadError {
     #[error("node {id} is not listed among the children of its parent {parent}")]
     UnlistedChild { id: u64, parent: u64 },
 
-    #[error("node {id} is listed among the children of {listed} but names {parent:?} as its parent")]
+    #[error(
+        "node {id} is listed among the children of {listed} but names {parent:?} as its parent"
+    )]
     MismatchedParent {
         id: u64,
         listed: u64,
@@ -293,7 +327,9 @@ impl Read {
     ) -> impl Iterator<Item = &'a Unresolved> + 'a {
         // The needle is owned so the returned iterator borrows only `self`.
         let property = property.to_owned();
-        self.unresolved.iter().filter(move |u| u.property == property)
+        self.unresolved
+            .iter()
+            .filter(move |u| u.property == property)
     }
 }
 
@@ -680,7 +716,9 @@ fn tag_extent(source: &str, at: usize) -> Option<(usize, bool)> {
     let close = find_outside(source, name_start + name_end, b'>')?;
     Some((
         close + 1,
-        source[name_start + name_end..close].trim_end().ends_with('/')
+        source[name_start + name_end..close]
+            .trim_end()
+            .ends_with('/')
             || VOID_ELEMENTS.contains(&tag.as_str()),
     ))
 }
@@ -766,8 +804,8 @@ fn attribute<'a>(attributes: &'a [(String, String)], name: &str) -> Option<Vec<&
 /// Declarations authored on an element's own `style` attribute.
 ///
 /// Later declarations override earlier ones, including across a shorthand, and
-/// `background` is expanded to `background-color` so the two spellings compete
-/// the way they do inside a stylesheet rule.
+/// a shorthand is expanded into the longhands it stands for, so the two
+/// spellings compete the way they do inside a stylesheet rule.
 fn inline_declarations(style: &str) -> BTreeMap<String, String> {
     let mut inline = BTreeMap::new();
     for part in style.split(';') {
@@ -779,13 +817,51 @@ fn inline_declarations(style: &str) -> BTreeMap<String, String> {
         if property.is_empty() || raw.is_empty() {
             continue;
         }
-        let property = match property.as_str() {
-            "background" => "background-color".to_owned(),
-            other => other.to_owned(),
-        };
-        inline.insert(property, raw.to_owned());
+        match expand_shorthand(&property, raw) {
+            Some(longhands) => {
+                for (longhand, value) in longhands {
+                    inline.insert(longhand, value);
+                }
+            }
+            None => {
+                inline.insert(property, raw.to_owned());
+            }
+        }
     }
     inline
+}
+
+/// The longhands a shorthand stands for, or `None` for a property that is one.
+///
+/// CSS expands a shorthand into its longhands *before* the cascade runs, so a
+/// shorthand and a longhand compete under the same name: an inline
+/// `padding: 4px` beats a stylesheet's `padding-top: 9px`, and an inline
+/// `gap: 4px` beats a stylesheet's `row-gap`. A reader that kept the two
+/// spellings apart would let the lower-precedence declaration win, which is the
+/// opposite of what the author wrote.
+///
+/// The expansion happens where the declaration is read rather than where it is
+/// authored, so the stylesheet cascade and the inline style expand the same way
+/// and the two cannot disagree.
+fn expand_shorthand(property: &str, value: &str) -> Option<Vec<(String, String)>> {
+    match property {
+        "background" => Some(vec![("background-color".to_owned(), value.to_owned())]),
+        "gap" => Some(vec![
+            ("row-gap".to_owned(), value.to_owned()),
+            ("column-gap".to_owned(), value.to_owned()),
+        ]),
+        "padding" => {
+            let sides = read_box_value(value)?;
+            Some(
+                ["top", "right", "bottom", "left"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, side)| (format!("padding-{side}"), format!("{}px", sides[index])))
+                    .collect(),
+            )
+        }
+        _ => None,
+    }
 }
 
 /// The `data-spool-id` a binding selector names, or `None` if it is not in the
@@ -944,13 +1020,13 @@ impl<'a> Builder<'a> {
         for record in &manifest.nodes {
             let file = record.binding.file.clone();
             if !self.files.contains_key(&file) {
-                let contents =
-                    self.sources
-                        .get(&file)
-                        .ok_or_else(|| ReadError::MissingSource {
-                            id: record.id,
-                            file: file.clone(),
-                        })?;
+                let contents = self
+                    .sources
+                    .get(&file)
+                    .ok_or_else(|| ReadError::MissingSource {
+                        id: record.id,
+                        file: file.clone(),
+                    })?;
                 let scanned = scan_markup(&file, contents)?;
                 let stylesheets = self.sheets_for(&file, &scanned);
                 self.files.insert(
@@ -1012,13 +1088,17 @@ impl<'a> Builder<'a> {
     fn element_for(&self, record: &NodeRecord) -> Result<Element, ReadError> {
         let file = record.binding.file.clone();
         let selector = record.binding.selector.clone();
-        let key = parse_identity_selector(&selector).ok_or_else(|| ReadError::UnsupportedSelector {
-            id: record.id,
-            file: file.clone(),
-            selector: selector.clone(),
-        })?;
+        let key =
+            parse_identity_selector(&selector).ok_or_else(|| ReadError::UnsupportedSelector {
+                id: record.id,
+                file: file.clone(),
+                selector: selector.clone(),
+            })?;
         let Some(parsed) = self.files.get(&file) else {
-            return Err(ReadError::MissingSource { id: record.id, file });
+            return Err(ReadError::MissingSource {
+                id: record.id,
+                file,
+            });
         };
         let mut found = parsed
             .elements
@@ -1866,7 +1946,14 @@ fn apply_layout(
         }
     }
 
-    if declarations.contains_key("padding") {
+    // The padding is read when the source says anything about it. A per-side
+    // longhand on its own is a padding: `padding-top: 9px` is what the author
+    // wrote, and reading only the shorthand would report the padding as
+    // unauthored and leave the engine's own default in place.
+    if PADDING_PROPERTIES
+        .iter()
+        .any(|property| declarations.contains_key(*property))
+    {
         match read_box(declarations, "padding") {
             Some(padding) => layout.padding = padding,
             None => unresolved.push(Unresolved::new(
@@ -2001,8 +2088,7 @@ fn apply_owner_b(record: &NodeRecord, node: &mut Node) {
     }
     // `PassThrough` is a container's own default blend, so an isolation flag that
     // names it needs nothing written. Anything else is not pass-through.
-    if record.blend_isolation.is_some()
-        && record.blend_isolation.as_deref() != Some("passThrough")
+    if record.blend_isolation.is_some() && record.blend_isolation.as_deref() != Some("passThrough")
     {
         node.blend = BlendMode::Normal;
     }
@@ -2186,17 +2272,7 @@ fn read_radii(value: &str) -> Option<[f64; 4]> {
 fn read_box(declarations: &BTreeMap<String, String>, property: &str) -> Option<[f64; 4]> {
     let mut sides = [0.0; 4];
     if let Some(value) = declarations.get(property) {
-        let lengths: Vec<f64> = split_value_parts(value)
-            .into_iter()
-            .map(read_length_value)
-            .collect::<Option<Vec<f64>>>()?;
-        sides = match lengths.as_slice() {
-            [all] => [*all; 4],
-            [vertical, horizontal] => [*vertical, *horizontal, *vertical, *horizontal],
-            [top, horizontal, bottom] => [*top, *horizontal, *bottom, *horizontal],
-            [top, right, bottom, left] => [*top, *right, *bottom, *left],
-            _ => return None,
-        };
+        sides = read_box_value(value)?;
     }
     for (index, edge) in ["top", "right", "bottom", "left"].into_iter().enumerate() {
         if let Some(value) = declarations.get(&format!("{property}-{edge}")) {
@@ -2204,6 +2280,25 @@ fn read_box(declarations: &BTreeMap<String, String>, property: &str) -> Option<[
         }
     }
     Some(sides)
+}
+
+/// A box value as `[top, right, bottom, left]`, in the four forms CSS allows.
+///
+/// The shorthand and the per-side longhands are read apart on purpose: the
+/// shorthand carries one, two, three or four lengths, and each form means a
+/// different set of sides.
+fn read_box_value(value: &str) -> Option<[f64; 4]> {
+    let lengths: Vec<f64> = split_value_parts(value)
+        .into_iter()
+        .map(read_length_value)
+        .collect::<Option<Vec<f64>>>()?;
+    match lengths.as_slice() {
+        [all] => Some([*all; 4]),
+        [vertical, horizontal] => Some([*vertical, *horizontal, *vertical, *horizontal]),
+        [top, horizontal, bottom] => Some([*top, *horizontal, *bottom, *horizontal]),
+        [top, right, bottom, left] => Some([*top, *right, *bottom, *left]),
+        _ => None,
+    }
 }
 
 /// `flex-direction`, and whether it reverses the order.
@@ -2261,11 +2356,9 @@ fn read_align_h(value: &str) -> Option<TextAlignH> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use figcraft_color::ColorProfile;
-    use figcraft_doc::{
-        BoolOp, Constraints, DevStatus, HConstraint, MaskType, VConstraint,
-    };
     use crate::manifest::SourceBinding;
+    use figcraft_color::ColorProfile;
+    use figcraft_doc::{BoolOp, Constraints, DevStatus, HConstraint, MaskType, VConstraint};
 
     fn record(id: u64, key: &str, parent: Option<u64>, children: Vec<u64>) -> NodeRecord {
         NodeRecord {
@@ -2792,6 +2885,46 @@ mod tests {
     }
 
     #[test]
+    fn an_inline_shorthand_beats_the_stylesheets_longhand() {
+        // CSS expands a shorthand into its longhands before the cascade runs,
+        // so the element's own `gap` beats the stylesheet's `row-gap`, and its
+        // own `padding` beats the stylesheet's `padding-top`.
+        let (manifest, sources) = styled(
+            ".row { display: flex; row-gap: 9px; padding-top: 9px; }",
+            "row",
+            "Frame",
+        );
+        let html = "<link rel=\"stylesheet\" href=\"styles.css\">\n\
+             <div class=\"row\" data-spool-id=\"row\" style=\"gap: 4px; padding: 2px\"></div>";
+        let mut sources = sources;
+        sources.insert("index.html".to_owned(), html.to_owned());
+
+        let read = read_with_diagnostics(&manifest, &sources).expect("compiles");
+        let layout = node_of(&read.document, 1).layout.clone().expect("layout");
+        assert_eq!(
+            (layout.gap, layout.cross_gap),
+            (4.0, 4.0),
+            "the inline gap sets both axes"
+        );
+        assert_eq!(
+            layout.padding,
+            [2.0, 2.0, 2.0, 2.0],
+            "the inline padding beats the stylesheet's padding-top"
+        );
+    }
+
+    #[test]
+    fn a_per_side_padding_on_its_own_is_a_padding() {
+        // `padding-top` is what the author wrote, and reading only the
+        // shorthand would leave the engine's own default in place.
+        let (manifest, sources) =
+            styled(".row { display: flex; padding-top: 9px; }", "row", "Frame");
+        let read = read_with_diagnostics(&manifest, &sources).expect("compiles");
+        let layout = node_of(&read.document, 1).layout.clone().expect("layout");
+        assert_eq!(layout.padding, [9.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
     fn a_node_without_display_flex_has_no_auto_layout() {
         let (manifest, sources) = styled(".row { gap: 6px; }", "row", "Frame");
         let read = read_with_diagnostics(&manifest, &sources).expect("compiles");
@@ -2804,7 +2937,11 @@ mod tests {
                 .unresolved_property(property)
                 .next()
                 .unwrap_or_else(|| panic!("{property} is reported"));
-            assert!(entry.detail.contains("not a flex container"), "{property}: {}", entry.detail);
+            assert!(
+                entry.detail.contains("not a flex container"),
+                "{property}: {}",
+                entry.detail
+            );
         }
     }
 
@@ -2849,7 +2986,10 @@ mod tests {
             .cloned()
             .expect("the leaf is a text node");
         assert_eq!(leaf.characters, "Deep", "its own text, not its wrappers'");
-        assert_eq!(leaf.style.font_size, 32.0, "inherited through the middle node");
+        assert_eq!(
+            leaf.style.font_size, 32.0,
+            "inherited through the middle node"
+        );
         assert_eq!(
             leaf.style
                 .fills
@@ -2869,7 +3009,13 @@ mod tests {
         assert_eq!(node.width, 0.0, "the engine's own default stands");
         assert_eq!(node.opacity, 1.0);
         assert!(!read.is_complete());
-        for property in ["width", "height", "background-color", "border-radius", "opacity"] {
+        for property in [
+            "width",
+            "height",
+            "background-color",
+            "border-radius",
+            "opacity",
+        ] {
             let found: Vec<&Unresolved> = read.unresolved_property(property).collect();
             assert_eq!(found.len(), 1, "{property} is reported once: {found:?}");
             assert_eq!(found[0].node, NodeId(1));
@@ -2899,7 +3045,11 @@ mod tests {
             .unresolved_property("background-color")
             .next()
             .expect("the gradient is reported");
-        assert!(background.detail.contains("gradient"), "{}", background.detail);
+        assert!(
+            background.detail.contains("gradient"),
+            "{}",
+            background.detail
+        );
         assert_eq!(
             node_of(&read.document, 1).width,
             0.0,
@@ -2978,7 +3128,10 @@ mod tests {
             nodes: vec![record],
             ..Default::default()
         };
-        let sources = files(&[("index.html", "<div id=\"card\" data-spool-id=\"card\"></div>")]);
+        let sources = files(&[(
+            "index.html",
+            "<div id=\"card\" data-spool-id=\"card\"></div>",
+        )]);
         assert_eq!(
             read(&manifest, &sources),
             Err(ReadError::UnsupportedSelector {
@@ -3044,7 +3197,11 @@ mod tests {
                 .map(|element| element.text.clone())
                 .unwrap_or_default()
         };
-        assert_eq!(text("outer"), "Lead tail", "the child's words are not the parent's");
+        assert_eq!(
+            text("outer"),
+            "Lead tail",
+            "the child's words are not the parent's"
+        );
         assert_eq!(text("inner"), "inner words");
     }
 
@@ -3078,7 +3235,11 @@ mod tests {
                 .unwrap_or_default()
         };
         assert_eq!(text("b"), "two");
-        assert_eq!(text("a"), "one", "and the parent's own text is not its child's");
+        assert_eq!(
+            text("a"),
+            "one",
+            "and the parent's own text is not its child's"
+        );
     }
 
     #[test]
@@ -3129,14 +3290,33 @@ mod tests {
             Some("ModeId:dark")
         );
         assert!(node.overrides.contains("fills"));
-        assert_eq!(node.prop_refs.get("visible").map(String::as_str), Some("show"));
+        assert_eq!(
+            node.prop_refs.get("visible").map(String::as_str),
+            Some("show")
+        );
         assert_eq!(node.bool_op, Some(BoolOp::Subtract));
-        assert_eq!(node.kind, NodeKind::BooleanOp { op: BoolOp::Subtract });
-        assert_eq!(node.plugin_data.get("agent").map(String::as_str), Some("yes"));
-        assert_eq!(node.corners.radii, [4.0; 4], "the radius is CSS, not metadata");
+        assert_eq!(
+            node.kind,
+            NodeKind::BooleanOp {
+                op: BoolOp::Subtract
+            }
+        );
+        assert_eq!(
+            node.plugin_data.get("agent").map(String::as_str),
+            Some("yes")
+        );
+        assert_eq!(
+            node.corners.radii, [4.0; 4],
+            "the radius is CSS, not metadata"
+        );
         assert_eq!(read.document.color_profile, ColorProfile::DisplayP3);
         // A flow start has no compiled form yet, and saying so beats holding it.
-        assert_eq!(read.unresolved_property("flow").count(), 1, "{:?}", read.unresolved);
+        assert_eq!(
+            read.unresolved_property("flow").count(),
+            1,
+            "{:?}",
+            read.unresolved
+        );
     }
 
     #[test]
@@ -3199,7 +3379,8 @@ mod tests {
             ..Default::default()
         };
         let html = "<div data-spool-id=\"root\"><p data-spool-id=\"child\"></p></div>";
-        let read = read_with_diagnostics(&manifest, &files(&[("index.html", html)])).expect("compiles");
+        let read =
+            read_with_diagnostics(&manifest, &files(&[("index.html", html)])).expect("compiles");
         // It is still compiled — each child's own `parent` is the authority — but
         // the paint order it ended up with was stated nowhere.
         assert_eq!(node_of(&read.document, 1).children, vec![NodeId(2)]);
@@ -3221,8 +3402,10 @@ mod tests {
             ],
             ..Default::default()
         };
-        let html = "<p data-spool-id=\"a\"></p><p data-spool-id=\"b\"></p><p data-spool-id=\"c\"></p>";
-        let read = read_with_diagnostics(&manifest, &files(&[("index.html", html)])).expect("compiles");
+        let html =
+            "<p data-spool-id=\"a\"></p><p data-spool-id=\"b\"></p><p data-spool-id=\"c\"></p>";
+        let read =
+            read_with_diagnostics(&manifest, &files(&[("index.html", html)])).expect("compiles");
         assert_eq!(
             node_of(&read.document, PAGE_ID.0).children,
             vec![NodeId(1), NodeId(2), NodeId(3)],
@@ -3247,7 +3430,8 @@ mod tests {
         };
         let html = "<div data-spool-id=\"root\"><p data-spool-id=\"a\"></p>\
              <p data-spool-id=\"b\"></p></div>";
-        let read = read_with_diagnostics(&manifest, &files(&[("index.html", html)])).expect("compiles");
+        let read =
+            read_with_diagnostics(&manifest, &files(&[("index.html", html)])).expect("compiles");
         assert_eq!(
             node_of(&read.document, 1).children,
             vec![NodeId(3), NodeId(2)],
@@ -3264,7 +3448,8 @@ mod tests {
             nodes: vec![record(1, "card", None, vec![])],
             ..Default::default()
         };
-        let read = read_with_diagnostics(&manifest, &files(&[("index.html", html)])).expect("compiles");
+        let read =
+            read_with_diagnostics(&manifest, &files(&[("index.html", html)])).expect("compiles");
         assert!(read
             .unresolved_property("stylesheet")
             .any(|u| u.detail.contains("missing.css")));
@@ -3277,7 +3462,11 @@ mod tests {
             "[data-spool-id='card']",
             "  [data-spool-id=\"card\"]  ",
         ] {
-            assert_eq!(parse_identity_selector(selector), Some("card"), "{selector}");
+            assert_eq!(
+                parse_identity_selector(selector),
+                Some("card"),
+                "{selector}"
+            );
         }
         for selector in [
             "#card",
@@ -3307,7 +3496,10 @@ mod tests {
 
     #[test]
     fn a_value_splits_into_components_without_tearing_a_function() {
-        assert_eq!(split_value_parts("1px solid #16161d"), vec!["1px", "solid", "#16161d"]);
+        assert_eq!(
+            split_value_parts("1px solid #16161d"),
+            vec!["1px", "solid", "#16161d"]
+        );
         assert_eq!(
             split_value_parts("rgb(22, 22, 29)"),
             vec!["rgb(22, 22, 29)"],
@@ -3342,7 +3534,12 @@ mod tests {
         );
         assert_eq!(read_border("none").map(|b| b.none), Some(true));
         // A dashed border is not a solid one, and is refused rather than drawn.
-        for value in ["1px dashed #16161d", "2px dotted red", "1px double red", "1px solid"] {
+        for value in [
+            "1px dashed #16161d",
+            "2px dotted red",
+            "1px double red",
+            "1px solid",
+        ] {
             assert_eq!(read_border(value), None, "{value}");
         }
     }
@@ -3352,7 +3549,15 @@ mod tests {
         for (value, expected) in [("10", 10.0), ("10px", 10.0), (" 10px ", 10.0), ("0", 0.0)] {
             assert_eq!(read_length_value(value), Some(expected), "{value}");
         }
-        for value in ["50%", "auto", "2em", "calc(10px + 2px)", "var(--x)", "", "nonsense"] {
+        for value in [
+            "50%",
+            "auto",
+            "2em",
+            "calc(10px + 2px)",
+            "var(--x)",
+            "",
+            "nonsense",
+        ] {
             assert_eq!(read_length_value(value), None, "{value}");
         }
     }

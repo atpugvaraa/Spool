@@ -54,8 +54,8 @@
 //! lives in [`Inspector::availability`], not in each row.
 
 use gpui::{
-    div, prelude::*, px, rgb, AnyElement, Context, Div, Entity, FontWeight, IntoElement,
-    MouseButton, Render, SharedString, Stateful, Window,
+    div, prelude::*, px, rgb, AnyElement, App, Context, Div, Entity, FontWeight, IntoElement,
+    Modifiers, MouseButton, Render, SharedString, Stateful, Window,
 };
 use serde_json::Value as JsonValue;
 
@@ -64,13 +64,41 @@ use std::rc::Rc;
 
 use crate::engine::canvas::EngineCanvas;
 use crate::engine::inspector_model as model;
+use crate::engine::panel_a11y::{
+    self as panel_a11y, A11yAction, A11yHost, A11yModel, A11yPanelState,
+};
+use crate::engine::panel_assets::{
+    self as panel_assets, AssetsAction, AssetsHost, AssetsModel, AssetsPanelState,
+};
+use crate::engine::panel_colorpicker::{
+    self as panel_colorpicker, ColorAction, ColorHost, ColorPickerState,
+};
+use crate::engine::panel_comments::{
+    self as panel_comments, CommentsAction, CommentsHost, CommentsModel, CommentsPanelState,
+};
 use crate::engine::panel_components::{
     self as panel_components, ComponentAction, ComponentsHost, ComponentsModel,
     ComponentsPanelState,
 };
+use crate::engine::panel_devmode::{
+    self as panel_devmode, CategoryFilter, DevAction, DevHost, DevModeModel, DevPanelState,
+};
 use crate::engine::panel_effects::EffectsPanel;
 use crate::engine::panel_export::{
     self as panel_export, ExportAction, ExportHost, ExportModel, ExportPanelState,
+};
+use crate::engine::panel_prototyping::{
+    self as panel_prototyping, ProtoAction, ProtoHost, ProtoModel, ProtoPanelState,
+};
+use crate::engine::panel_styles::{
+    self as panel_styles, StylesAction, StylesHost, StylesModel, StylesPanelState,
+};
+use crate::engine::panel_typography::{
+    self as panel_typography, TypographyAction, TypographyHost, TypographyModel,
+    TypographyPanelState,
+};
+use crate::engine::panel_variables::{
+    self as panel_variables, VariablesAction, VariablesHost, VariablesModel, VariablesPanelState,
 };
 use crate::theme;
 
@@ -120,7 +148,7 @@ const NO_STROKE: &str = "No stroke to be wide";
 ///
 /// Fixed rather than growable, so a section's slot can be baked into the click
 /// closure that toggles it.
-pub const SECTION_COUNT: usize = 6;
+pub const SECTION_COUNT: usize = 10;
 
 /// A collapsible section, addressed by a slot.
 ///
@@ -139,6 +167,10 @@ impl SectionSlot {
     pub const TYPOGRAPHY: Self = Self(3);
     pub const EFFECTS: Self = Self(4);
     pub const EXPORT: Self = Self(5);
+    pub const STYLES: Self = Self(6);
+    pub const VARIABLES: Self = Self(7);
+    pub const ASSETS: Self = Self(8);
+    pub const A11Y: Self = Self(9);
 
     fn index(self) -> usize {
         self.0
@@ -1404,7 +1436,12 @@ impl RenameSession {
 ///
 /// Labels only; the chrome is [`segmented`], which is also what a paint's
 /// on/off uses, so the two cannot drift into two looks for one gesture.
-const TABS: [(&str, bool); 3] = [("Design", true), ("Prototype", true), ("AI", true)];
+const TABS: [(&str, bool); 4] = [
+    ("Design", true),
+    ("Prototype", true),
+    ("Dev Mode", true),
+    ("AI", true),
+];
 
 /// Swatches offered by every colour control.
 ///
@@ -1447,6 +1484,31 @@ pub struct Inspector {
     /// The export section's state: which row is being edited, and what is being
     /// typed into it.
     export_state: Rc<RefCell<ExportPanelState>>,
+    /// The styles section's state: which slot's browser is open, what is being
+    /// typed into it, and which folders are folded away.
+    styles_state: Rc<RefCell<StylesPanelState>>,
+    /// The assets section's state: which image is being edited and what is
+    /// being typed into it.
+    assets_state: Rc<RefCell<AssetsPanelState>>,
+    /// The Comments section's state: which menu is open, what the list is
+    /// filtered by, and what is being typed into the search field.
+    comments_state: Rc<RefCell<CommentsPanelState>>,
+    /// The Dev Mode tab's own state: which menu is open, what is being typed
+    /// into it, and which annotations the canvas shows.
+    devmode_state: Rc<RefCell<DevPanelState>>,
+    /// The Accessibility section's state: what is being typed into the name.
+    a11y_state: Rc<RefCell<A11yPanelState>>,
+    /// The Prototype tab's own state: which menu is open, what is being typed
+    /// into it, and which interaction's editor is open.
+    prototyping_state: Rc<RefCell<ProtoPanelState>>,
+    /// The variables section's state: which collection and group the table
+    /// shows, what is being typed into it, and which menu is open.
+    variables_state: Rc<RefCell<VariablesPanelState>>,
+    /// The typography section's state: which menu is open and what is being
+    /// typed into it.
+    typography_state: Rc<RefCell<TypographyPanelState>>,
+    /// The colour picker's state: the colour being edited and the draft.
+    color_state: Rc<RefCell<ColorPickerState>>,
     tab: usize,
     sections: Sections,
     /// The property the arrow keys move, once a field has been touched.
@@ -1486,6 +1548,15 @@ impl Inspector {
             effects: None,
             components_state: Rc::new(RefCell::new(ComponentsPanelState::default())),
             export_state: Rc::new(RefCell::new(ExportPanelState::default())),
+            styles_state: Rc::new(RefCell::new(StylesPanelState::default())),
+            variables_state: Rc::new(RefCell::new(VariablesPanelState::default())),
+            prototyping_state: Rc::new(RefCell::new(ProtoPanelState::new())),
+            devmode_state: Rc::new(RefCell::new(DevPanelState::new())),
+            comments_state: Rc::new(RefCell::new(CommentsPanelState::new())),
+            a11y_state: Rc::new(RefCell::new(A11yPanelState::default())),
+            assets_state: Rc::new(RefCell::new(AssetsPanelState::default())),
+            typography_state: Rc::new(RefCell::new(TypographyPanelState::default())),
+            color_state: Rc::new(RefCell::new(ColorPickerState::default())),
             tab: 0,
             sections: Sections::new(),
             focus: None,
@@ -1514,7 +1585,14 @@ impl Inspector {
         // The effects section is an ENTITY, because a field being typed into
         // needs a focus handle and the keyboard. It is built here, once, from the
         // same engine canvas this panel reads.
-        self.effects = Some(cx.new(|cx| EffectsPanel::new(engine.clone(), cx)));
+        let effects = cx.new(|cx| EffectsPanel::new(engine.clone(), cx));
+        // The effects section is its own entity, so a field opening in it is
+        // not a change this panel is told about — unless it observes it. The
+        // claim on the keyboard is read from this panel's own state, so the
+        // panel has to know when the effects section opens a field.
+        let observation = cx.observe(&effects, |_, _, cx| cx.notify());
+        self.observations.push(observation);
+        self.effects = Some(effects);
         self.engine = Some(engine);
         cx.notify();
     }
@@ -1531,10 +1609,26 @@ impl Inspector {
     /// to name it by, and a request in a form the engine cannot answer is not
     /// a rename of some other layer.
     pub fn open_rename(&mut self, id: model::EngineObjectId, cx: &mut Context<Self>) {
+        // Closing the others first is what makes the interaction states
+        // mutually exclusive: a rename, a typed number and a panel's field are
+        // different things to be doing, and the Escape ladder above them is
+        // simpler when at most one of them can be true.
+        self.cancel_in_flight(cx);
         let Some(name) = self.name_of(id, cx) else {
             return;
         };
         self.rename = Some(RenameSession::replacing(id, name));
+    }
+
+    /// Open a rename on the layer the engine has selected.
+    ///
+    /// The engine's selection is the only selection there is, so a rename
+    /// asked for from the keyboard names the layer the user is looking at.
+    pub fn open_rename_for_the_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.selection(cx).first().copied() else {
+            return;
+        };
+        self.open_rename(id, cx);
     }
 
     /// Which layer the engine is renaming, if any.
@@ -1551,7 +1645,69 @@ impl Inspector {
     /// it. Two separate questions, so the ladder can be decided from state
     /// rather than from whatever happened to be cancelled first.
     pub fn is_busy(&self) -> bool {
-        self.edit.is_some() || self.rename.is_some() || self.scrub.is_some()
+        self.edit.is_some()
+            || self.rename.is_some()
+            || self.scrub.is_some()
+            // The Export section's own fields: a size, a suffix or a bleed
+            // being typed. It is a text buffer like any other, and the editor's
+            // Escape ladder has to know it is open.
+            || self.export_state.borrow().is_busy()
+            || self.styles_state.borrow().is_busy()
+            || self.typography_state.borrow().is_busy()
+            || self.color_state.borrow().is_busy()
+            || self.assets_state.borrow().is_busy()
+            || self.devmode_state.borrow().is_busy()
+            || self.a11y_state.borrow().is_busy()
+            // The Variables section's field and the Prototype tab's. They are
+            // text buffers like any other, and the ladder has to know.
+            || self.variables_state.borrow().is_busy()
+            || self.prototyping_state.borrow().is_busy()
+    }
+
+    /// Whether a text field is open somewhere in the Inspector.
+    ///
+    /// The question the keyboard asks. A character typed into an open field is
+    /// a character and not an editor shortcut, and the engine's keymap binds
+    /// letters that are tool shortcuts — so the shell's key gate asks this
+    /// before it lets a shortcut run, and the canvas asks it before it
+    /// answers a key as a gesture.
+    ///
+    /// Every panel that owns a field answers it, and it is one question so
+    /// that the gate and the canvas cannot disagree about what "a field is
+    /// open" means. A panel with a field of its own — the Effects section, the
+    /// Comments search — answers through the surface that holds it.
+    pub fn has_text_field(&self, window: &Window, cx: &App) -> bool {
+        self.edit.is_some()
+            || self.rename.is_some()
+            || self.export_state.borrow().is_busy()
+            || self.styles_state.borrow().is_busy()
+            || self.typography_state.borrow().is_busy()
+            || self.color_state.borrow().is_busy()
+            || self.assets_state.borrow().is_busy()
+            || self.devmode_state.borrow().is_busy()
+            || self.a11y_state.borrow().is_busy()
+            || self.variables_state.borrow().is_busy()
+            || self.prototyping_state.borrow().is_busy()
+            || self.comments_state.borrow().is_searching(window)
+            || self
+                .effects
+                .as_ref()
+                .is_some_and(|effects| effects.read(cx).is_editing())
+    }
+
+    /// Tell the canvas who owns the keyboard.
+    ///
+    /// The canvas answers keys as the engine's gestures, so it is the one
+    /// surface that has to be told when a text field wants the keyboard
+    /// instead. The render is where the answer is known: every panel that
+    /// owns a field notifies the Inspector when it opens one, and the
+    /// Inspector is what draws them.
+    fn claim_the_keyboard(&self, window: &Window, cx: &mut Context<Self>) {
+        let Some(engine) = self.engine.clone() else {
+            return;
+        };
+        let claimed = self.has_text_field(window, cx);
+        engine.update(cx, |canvas, cx| canvas.set_keyboard_claimed(claimed, cx));
     }
 
     /// Give up whatever the Inspector is part-way through.
@@ -1575,6 +1731,63 @@ impl Inspector {
             cx.notify();
             return true;
         }
+        // The Export section's draft. The read and the write are SEPARATE
+        // statements: a RefCell borrow alive across the `if` body would panic.
+        let export_cancelled = self.export_state.borrow_mut().cancel();
+        if export_cancelled {
+            cx.notify();
+            return true;
+        }
+        // The styles, typography and colour sections' own drafts. The read and
+        // the write are SEPARATE statements: a RefCell borrow alive across the
+        // body would panic.
+        let styles_cancelled = self.styles_state.borrow_mut().cancel();
+        if styles_cancelled {
+            cx.notify();
+            return true;
+        }
+        let typography_cancelled = self.typography_state.borrow_mut().cancel();
+        if typography_cancelled {
+            cx.notify();
+            return true;
+        }
+        let colour_cancelled = self.color_state.borrow_mut().cancel();
+        if colour_cancelled {
+            cx.notify();
+            return true;
+        }
+        let assets_cancelled = self.assets_state.borrow_mut().cancel();
+        if assets_cancelled {
+            cx.notify();
+            return true;
+        }
+        let devmode_cancelled = self.devmode_state.borrow_mut().cancel();
+        if devmode_cancelled {
+            cx.notify();
+            return true;
+        }
+        let a11y_cancelled = self.a11y_state.borrow_mut().cancel();
+        if a11y_cancelled {
+            cx.notify();
+            return true;
+        }
+        // The Variables section's draft and the Prototype tab's. Guarded, so
+        // that giving up a field that was never open does not close a menu
+        // the user opened on purpose.
+        if self.variables_state.borrow().is_busy() {
+            let cancelled = self.variables_state.borrow_mut().cancel();
+            if cancelled {
+                cx.notify();
+                return true;
+            }
+        }
+        if self.prototyping_state.borrow().is_busy() {
+            let cancelled = self.prototyping_state.borrow_mut().cancel();
+            if cancelled {
+                cx.notify();
+                return true;
+            }
+        }
         false
     }
 
@@ -1589,9 +1802,98 @@ impl Inspector {
     /// belongs to the editor's ladder, which walks down from the topmost thing,
     /// and a text buffer that answered it first would make the rung it belongs
     /// to depend on which listener saw the key first.
-    pub fn handle_key(&mut self, key: &str, shift: bool, cx: &mut Context<Self>) -> bool {
+    pub fn handle_key(&mut self, key: &str, modifiers: Modifiers, cx: &mut Context<Self>) -> bool {
         if key == "escape" {
             return false;
+        }
+        // A CHORD IS NOT A CHARACTER.
+        //
+        // `⌘Z` is undo and `⌘B` is bold: they are editor chords, and a field
+        // that took one as text would type a `z` into a colour code. So a
+        // keystroke with a command, control or alt key on it is not claimed
+        // here — it belongs to whatever answers chords, and the editor's own
+        // table is the one that does.
+        if modifiers.platform || modifiers.control || modifiers.alt {
+            return false;
+        }
+        let shift = modifiers.shift;
+        // The Export section's own text fields: a size, a suffix or a bleed
+        // being typed. The section owns the buffer; the Inspector routes the key
+        // to it and runs the change it asks for.
+        if self.export_state.borrow().is_busy() {
+            let action = self.export_state.borrow_mut().handle_key(key);
+            if let Some(action) = action {
+                self.run_export_action(action, cx);
+            }
+            cx.notify();
+            return true;
+        }
+        if self.styles_state.borrow().is_busy() {
+            let action = self.styles_state.borrow_mut().handle_key(key);
+            if let Some(action) = action {
+                self.run_styles_action(action, cx);
+            }
+            cx.notify();
+            return true;
+        }
+        if self.typography_state.borrow().is_busy() {
+            let action = self.typography_state.borrow_mut().handle_key(key);
+            if let Some(action) = action {
+                self.run_typography_action(action, cx);
+            }
+            cx.notify();
+            return true;
+        }
+        if self.devmode_state.borrow().is_busy() {
+            let action = self.devmode_state.borrow_mut().handle_key(key);
+            if let Some(action) = action {
+                self.run_dev_action(action, cx);
+            }
+            cx.notify();
+            return true;
+        }
+        if self.a11y_state.borrow().is_busy() {
+            let action = self.a11y_state.borrow_mut().handle_key(key);
+            if let Some(action) = action {
+                self.run_a11y_action(action, cx);
+            }
+            cx.notify();
+            return true;
+        }
+        if self.assets_state.borrow().is_busy() {
+            let action = self.assets_state.borrow_mut().handle_key(key);
+            if let Some(action) = action {
+                self.run_assets_action(action, cx);
+            }
+            cx.notify();
+            return true;
+        }
+        if self.color_state.borrow().is_busy() {
+            let action = self.color_state.borrow_mut().handle_key(key);
+            if let Some(action) = action {
+                self.run_color_action(action, cx);
+            }
+            cx.notify();
+            return true;
+        }
+        // The Variables section's own field, and the Prototype tab's. They are
+        // text buffers like any other, and the key the user types has to reach
+        // them rather than the editor's shortcuts.
+        if self.variables_state.borrow().is_busy() {
+            let action = self.variables_state.borrow_mut().handle_key(key);
+            if let Some(action) = action {
+                self.run_variables_action(action, cx);
+            }
+            cx.notify();
+            return true;
+        }
+        if self.prototyping_state.borrow().is_busy() {
+            let action = self.prototyping_state.borrow_mut().handle_key(key);
+            if let Some(action) = action {
+                self.run_proto_action(action, cx);
+            }
+            cx.notify();
+            return true;
         }
         if self.rename.is_some() {
             return self.rename_key(key, cx);
@@ -1745,6 +2047,21 @@ impl Inspector {
         ]
     }
 
+    /// The text in the colour picker's open field, if one is open.
+    ///
+    /// For the window-level tests: the buffer the user is typing into, read the
+    /// way the user reads it — the characters, in order. A field that shows
+    /// `d9770` because the last keystroke was eaten is a field that lost a
+    /// character, and no other reading of the state would show it.
+    #[cfg(test)]
+    pub fn test_color_draft(&self) -> Option<String> {
+        self.color_state
+            .borrow()
+            .draft
+            .as_ref()
+            .map(|draft| draft.text.clone())
+    }
+
     /// The box of one layer, in the frame the layer is in.
     fn geometry_of(
         &self,
@@ -1787,7 +2104,7 @@ impl Inspector {
     ///
     /// It is an entity, so the section's own state -- which row is open, which
     /// field is being typed into -- lives with it and keeps its focus.
-    fn effects_section(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn effects_section(&self, _cx: &mut Context<Self>) -> AnyElement {
         match self.effects.clone() {
             Some(panel) => panel.into_any_element(),
             None => empty_note("No effects yet.").into_any_element(),
@@ -1826,6 +2143,197 @@ impl Inspector {
         });
         let state = self.components_state.clone();
         panel_components::components_section(&model, &state, cx)
+    }
+
+    /// The styles section: the selected layers' style links, and the browser
+    /// of the styles a slot offers.
+    fn styles_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(engine) = self.engine.clone() else {
+            return empty_note("No styles yet.").into_any_element();
+        };
+        let model: StylesModel = engine.read(cx).with_session(|session| {
+            let Ok(doc) = session.doc() else {
+                return StylesModel::default();
+            };
+            StylesModel::read(doc, &session.selection())
+        });
+        let state = self.styles_state.clone();
+        panel_styles::styles_section(&model, &state, cx).into_any_element()
+    }
+
+    /// The assets section: the document's images, and the selection's own image
+    /// fill.
+    fn assets_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(engine) = self.engine.clone() else {
+            return empty_note("No images yet.").into_any_element();
+        };
+        let model: AssetsModel = engine.read(cx).with_session(|session| {
+            let Ok(doc) = session.doc() else {
+                return AssetsModel::default();
+            };
+            AssetsModel::read(doc, &session.selection())
+        });
+        let state = self.assets_state.clone();
+        panel_assets::assets_section(&model, &state, cx).into_any_element()
+    }
+
+    /// Open one of the Inspector's tabs.
+    ///
+    /// The Prototype tab is a MODE as well as a panel: the canvas draws the
+    /// prototype's connections while it is open, so the canvas is told.
+    pub fn open_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.tab = index;
+        if let Some(engine) = self.engine.clone() {
+            engine.update(cx, |canvas, cx| {
+                canvas.set_prototype_mode(index == 1, cx);
+                canvas.set_dev_mode(index == panel_devmode::TAB_DEV_MODE, cx);
+            });
+        }
+        cx.notify();
+    }
+
+    /// Dev Mode on and off.
+    ///
+    /// figcraft's `view.devMode` switches the right-hand tab between Inspect
+    /// and Design; this is the same answer.
+    pub fn toggle_dev_mode(&mut self, cx: &mut Context<Self>) {
+        let next = panel_devmode::dev_mode_tab(self.tab);
+        self.open_tab(next, cx);
+    }
+
+    /// The Dev Mode tab: the layer's handoff status, its annotations, its dev
+    /// resources, its inspected properties and its assets -- or, with nothing
+    /// selected, what is ready for dev.
+    fn dev_mode_body(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(engine) = self.engine.clone() else {
+            return empty_note("No Dev Mode yet.").into_any_element();
+        };
+        let state = self.devmode_state.clone();
+        let color_format = state.borrow().color_format;
+        let model: DevModeModel = engine.read(cx).with_session(|session| {
+            let Ok(doc) = session.doc() else {
+                return DevModeModel::default();
+            };
+            let Ok(page) = session.page() else {
+                return DevModeModel::default();
+            };
+            let focused = session.ds().ok().and_then(|ds| ds.focused());
+            DevModeModel::read(doc, page, &session.selection(), focused, color_format)
+        });
+        panel_devmode::dev_mode_panel(&model, &state, cx).into_any_element()
+    }
+
+    /// The Comments section: the document's comment threads, and the selected
+    /// layers' own comment.
+    fn comments_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(engine) = self.engine.clone() else {
+            return empty_note("No comments yet.").into_any_element();
+        };
+        let model: CommentsModel = engine.read(cx).with_session(|session| {
+            let Ok(doc) = session.doc() else {
+                return CommentsModel::default();
+            };
+            let page = session.page().ok();
+            let user = figcraft_engine::cmd::comment::user_name(session);
+            CommentsModel::read(doc, &session.selection(), page, &user)
+        });
+        let state = self.comments_state.clone();
+        panel_comments::comments_section(&model, &state, cx).into_any_element()
+    }
+
+    /// The Accessibility section: what a screen reader reads of the selection.
+    fn a11y_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(engine) = self.engine.clone() else {
+            return empty_note("Select an object on the canvas or in Layers.").into_any_element();
+        };
+        let model: A11yModel = engine.read(cx).with_session(|session| {
+            let Ok(doc) = session.doc() else {
+                return A11yModel::default();
+            };
+            A11yModel::read(doc, &session.selection())
+        });
+        let state = self.a11y_state.clone();
+        panel_a11y::a11y_section(&model, &state, cx).into_any_element()
+    }
+
+    /// The Prototype tab: the page's flows, the selected layers' interactions
+    /// and the prototype's settings.
+    fn prototype_body(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(engine) = self.engine.clone() else {
+            return empty_note("No prototype yet.").into_any_element();
+        };
+        let model: ProtoModel = engine.read(cx).with_session(|session| {
+            let Ok(doc) = session.doc() else {
+                return ProtoModel::default();
+            };
+            let Ok(page) = session.page() else {
+                return ProtoModel::default();
+            };
+            ProtoModel::read(doc, page, &session.selection())
+        });
+        let state = self.prototyping_state.clone();
+        panel_prototyping::proto_panel(&model, &state, cx).into_any_element()
+    }
+
+    /// The variables section: the document's variables, and the selected
+    /// layers' own bindings and modes.
+    fn variables_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(engine) = self.engine.clone() else {
+            return empty_note("No variables yet.").into_any_element();
+        };
+        let model: VariablesModel = engine.read(cx).with_session(|session| {
+            let Ok(doc) = session.doc() else {
+                return VariablesModel::default();
+            };
+            VariablesModel::read(doc, &session.selection())
+        });
+        let state = self.variables_state.clone();
+        panel_variables::variables_section(&model, &state, cx).into_any_element()
+    }
+
+    /// The typography section: the selection's text layers and their type.
+    fn typography_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(engine) = self.engine.clone() else {
+            return empty_note("This layer has no text").into_any_element();
+        };
+        // The model reads the EDITED RANGE: a selected range's styles are what
+        // the panel shows, not the whole layer's.
+        let model: TypographyModel = engine.read(cx).with_session(TypographyModel::from_session);
+        if !model.has_text {
+            return empty_note("This layer has no text").into_any_element();
+        }
+        let state = self.typography_state.clone();
+        panel_typography::section(&model, &state, cx).into_any_element()
+    }
+
+    /// Run a Dev Mode change through the engine.
+    fn run_dev_action(&mut self, action: DevAction, cx: &mut Context<Self>) {
+        let (command, params) = action.command();
+        self.run(&command, params, cx);
+    }
+
+    /// Run an accessibility change through the engine.
+    fn run_a11y_action(&mut self, action: A11yAction, cx: &mut Context<Self>) {
+        let (command, params) = action.command();
+        self.run(&command, params, cx);
+    }
+
+    /// Run a styles change through the engine.
+    fn run_styles_action(&mut self, action: StylesAction, cx: &mut Context<Self>) {
+        let (command, params) = action.command();
+        self.run(&command, params, cx);
+    }
+
+    /// Run a typography change through the engine.
+    fn run_typography_action(&mut self, action: TypographyAction, cx: &mut Context<Self>) {
+        let (command, params) = action.command();
+        self.run(&command, params, cx);
+    }
+
+    /// Run a colour change through the engine.
+    fn run_color_action(&mut self, action: ColorAction, cx: &mut Context<Self>) {
+        let (command, params) = action.command();
+        self.run(&command, params, cx);
     }
 
     /// Run a component change through the engine.
@@ -2089,6 +2597,94 @@ impl Inspector {
     }
 }
 
+impl AssetsHost for Inspector {
+    /// Run an assets change through the engine.
+    fn run_assets_action(&mut self, action: AssetsAction, cx: &mut Context<Self>) {
+        let (command, params) = action.command();
+        self.run(&command, params, cx);
+    }
+}
+
+impl CommentsHost for Inspector {
+    /// Run a comments change through the engine.
+    fn run_comments_action(&mut self, action: CommentsAction, cx: &mut Context<Self>) {
+        let (command, params) = action.command();
+        self.run(&command, params, cx);
+    }
+}
+
+impl DevHost for Inspector {
+    /// Run a Dev Mode change through the engine.
+    fn run_dev_action(&mut self, action: DevAction, cx: &mut Context<Self>) {
+        Inspector::run_dev_action(self, action, cx);
+    }
+
+    /// The canvas draws the callouts the filter selects, so the canvas is told.
+    fn set_dev_category_filter(&mut self, filter: CategoryFilter, cx: &mut Context<Self>) {
+        if let Some(engine) = self.engine.clone() {
+            engine.update(cx, |canvas, cx| canvas.set_dev_category_filter(filter, cx));
+        }
+    }
+}
+
+impl A11yHost for Inspector {
+    /// Run an accessibility change through the engine.
+    fn run_a11y_action(&mut self, action: A11yAction, cx: &mut Context<Self>) {
+        Inspector::run_a11y_action(self, action, cx);
+    }
+}
+
+impl ProtoHost for Inspector {
+    /// Run a prototype change through the engine.
+    fn run_proto_action(&mut self, action: ProtoAction, cx: &mut Context<Self>) {
+        let (command, params) = action.command();
+        self.run(&command, params, cx);
+    }
+}
+
+impl StylesHost for Inspector {
+    /// Run a styles change through the engine.
+    fn run_styles_action(&mut self, action: StylesAction, cx: &mut Context<Self>) {
+        Inspector::run_styles_action(self, action, cx);
+    }
+}
+
+impl VariablesHost for Inspector {
+    /// Run a variables change through the engine.
+    fn run_variables_action(&mut self, action: VariablesAction, cx: &mut Context<Self>) {
+        let (command, params) = action.command();
+        self.run(&command, params, cx);
+    }
+}
+
+impl TypographyHost for Inspector {
+    /// Run a typography change through the engine.
+    fn run_typography_action(&mut self, action: TypographyAction, cx: &mut Context<Self>) {
+        Inspector::run_typography_action(self, action, cx);
+    }
+}
+
+impl ColorHost for Inspector {
+    /// Run a colour change through the engine.
+    fn run_color_action(&mut self, action: ColorAction, cx: &mut Context<Self>) {
+        Inspector::run_color_action(self, action, cx);
+    }
+
+    /// Open a gesture: the engine holds ONE undo step open for it.
+    ///
+    /// A drag on the colour square is one operation, not one per pointer
+    /// movement, and the engine's own canvas drags work the same way -- so the
+    /// history reads the same either way.
+    fn begin_color_gesture(&mut self, label: &str, cx: &mut Context<Self>) -> bool {
+        self.begin_gesture(label, cx)
+    }
+
+    /// Close a gesture as one undo step.
+    fn commit_color_gesture(&mut self, cx: &mut Context<Self>) {
+        self.commit_gesture(cx);
+    }
+}
+
 impl ExportHost for Inspector {
     /// Run an export change through the engine.
     fn run_export_action(&mut self, action: ExportAction, cx: &mut Context<Self>) {
@@ -2104,17 +2700,21 @@ impl ComponentsHost for Inspector {
 }
 
 impl Render for Inspector {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::diagnostics::count("inspector_build", 1);
         let start = crate::diagnostics::start();
         let selected = self.selected(cx);
         crate::diagnostics::record("inspector_projection", start);
         crate::diagnostics::count("inspector_objects_copied", selected.len() as u64);
         self.reconcile(&selected);
+        // The canvas answers keys as the engine's gestures, so it is the one
+        // surface that has to be told when a field wants the keyboard.
+        self.claim_the_keyboard(window, cx);
 
         let body = match self.tab {
-            1 => prototype_body(),
-            2 => ai_body(),
+            1 => self.prototype_body(cx),
+            2 => self.dev_mode_body(cx),
+            3 => ai_body(),
             _ => self.design_body(&selected, cx),
         };
 
@@ -2151,7 +2751,7 @@ impl Inspector {
             None,
             true,
             |index, this: &mut Inspector, cx: &mut Context<Inspector>| {
-                this.tab = index;
+                this.open_tab(index, cx);
                 cx.notify();
             },
             cx,
@@ -2249,6 +2849,7 @@ impl Inspector {
                         .text_color(rgb(theme::TEXT_MUTED))
                         .child("Select an object on the canvas or in Layers."),
                 )
+                .child(self.variables_section(cx))
                 .into_any_element(),
             [object] => {
                 let selection = std::slice::from_ref(object);
@@ -2262,6 +2863,7 @@ impl Inspector {
                         column()
                             .child(text_block(&text))
                             .child(self.typography_fields(selection, cx))
+                            .child(self.typography_section(cx))
                     }
                     None => section_body().child(empty_note("This layer has no text")),
                 };
@@ -2293,7 +2895,32 @@ impl Inspector {
                         self.export_section(cx),
                         cx,
                     ))
+                    .child(self.inspector_section(
+                        "Styles",
+                        SectionSlot::STYLES,
+                        self.styles_section(cx),
+                        cx,
+                    ))
+                    .child(self.inspector_section(
+                        "Assets",
+                        SectionSlot::ASSETS,
+                        self.assets_section(cx),
+                        cx,
+                    ))
+                    .child(self.inspector_section(
+                        "Accessibility",
+                        SectionSlot::A11Y,
+                        self.a11y_section(cx),
+                        cx,
+                    ))
+                    .child(self.inspector_section(
+                        "Variables",
+                        SectionSlot::VARIABLES,
+                        self.variables_section(cx),
+                        cx,
+                    ))
                     .child(self.components_section(cx))
+                    .child(self.comments_section(cx))
                     .into_any_element()
             }
             _ => {
@@ -2314,13 +2941,35 @@ impl Inspector {
                 // mixed selection of shapes and words still has words in it, and
                 // setting one colour applies to all of them at once.
                 if selected.iter().any(|object| object.text_content.is_some()) {
-                    sections = sections.child(self.inspector_section(
-                        "Typography",
-                        SectionSlot::TYPOGRAPHY,
-                        self.typography_fields(selected, cx),
-                        cx,
-                    ));
+                    sections = sections.child(
+                        self.inspector_section(
+                            "Typography",
+                            SectionSlot::TYPOGRAPHY,
+                            column()
+                                .child(self.typography_fields(selected, cx))
+                                .child(self.typography_section(cx)),
+                            cx,
+                        ),
+                    );
                 }
+                // The Effects section is here for the MULTI-selection, and that
+                // is the whole point of the per-property fold: this is where
+                // "Mixed" is reachable. A single selection can never disagree
+                // with itself.
+                sections = sections.child(self.inspector_section(
+                    "Effects",
+                    SectionSlot::EFFECTS,
+                    self.effects_section(cx),
+                    cx,
+                ));
+                // The Accessibility section is here for the MULTI-selection too:
+                // that is where "Mixed" is reachable.
+                sections = sections.child(self.inspector_section(
+                    "Accessibility",
+                    SectionSlot::A11Y,
+                    self.a11y_section(cx),
+                    cx,
+                ));
                 sections.into_any_element()
             }
         }
@@ -3080,17 +3729,11 @@ impl Inspector {
     }
 
     fn typography_fields(&self, selected: &[model::DesignObject], cx: &mut Context<Self>) -> Div {
+        // Only the text colour. The SIZE row moved into the typography panel, in
+        // figcraft's position -- and it moved rather than being copied, because
+        // two number widgets for one property is two owners of one value.
         let color = Paint::read(selected, |object| object.text_color);
-        section_body()
-            .child(self.paint_block(StyleProperty::TextColor, color, theme::TEXT, cx))
-            .child(self.preset_row(
-                "Size",
-                Property::FontSize,
-                selected_value(selected, Property::FontSize),
-                selected.len(),
-                &["12", "16", "24", "32"],
-                cx,
-            ))
+        section_body().child(self.paint_block(StyleProperty::TextColor, color, theme::TEXT, cx))
     }
 
     // ── Numbers ─────────────────────────────────────────────────────────────
@@ -3311,8 +3954,9 @@ impl Inspector {
             .flex_col()
             .gap_1()
             .child(self.paint_row(property, paint, fallback, cx));
-        if self.palette == Some(property) {
-            block = block.child(self.palette_rows(property, cx));
+        // The engine's colour picker, under the row that opened it.
+        if let Some(picker) = self.color_picker(property, cx) {
+            block = block.child(picker);
         }
         block
     }
@@ -3374,6 +4018,9 @@ impl Inspector {
                         "{}-color-trigger",
                         property.slug()
                     )))
+                    // A test looks the trigger up by name, the way it looks the
+                    // picker's fields up. A no-op in a release build.
+                    .debug_selector(|| format!("{}-color-trigger", property.slug()))
                     .flex()
                     .items_center()
                     .gap_1()
@@ -3386,11 +4033,16 @@ impl Inspector {
                     .hover(|style| style.bg(rgb(theme::SURFACE_HOVER)))
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.palette = if this.palette == Some(property) {
-                            None
-                        } else {
-                            Some(property)
+                        // The engine's colour picker, not the old static
+                        // palette: it edits the colour the engine draws, and
+                        // its drag is one undo step.
+                        let target = match property {
+                            StyleProperty::Fill => panel_colorpicker::ColorTarget::Fill,
+                            StyleProperty::Stroke => panel_colorpicker::ColorTarget::Stroke,
+                            StyleProperty::TextColor => panel_colorpicker::ColorTarget::TextColor,
                         };
+                        this.palette = None;
+                        this.color_state.borrow_mut().toggle(target);
                         cx.notify();
                     }))
                     .child(div().size(px(12.0)).rounded_sm().bg(rgb(color.to_rgb())))
@@ -3403,50 +4055,17 @@ impl Inspector {
             )
     }
 
-    fn palette_rows(&self, property: StyleProperty, cx: &mut Context<Self>) -> Div {
-        let mut palette = div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .p(px(7.0))
-            .rounded_md()
-            .bg(rgb(theme::WINDOW))
-            .border_1()
-            .border_color(rgb(theme::BORDER));
-        for chunk in PALETTE.chunks(3) {
-            let mut row = div().flex().gap_1();
-            for (name, value) in chunk {
-                let name = *name;
-                let color = model::Color::from_rgb(*value);
-                row = row.child(
-                    div()
-                        .id(SharedString::from(format!("style-color-{name}")))
-                        .flex()
-                        .flex_1()
-                        .items_center()
-                        .gap_1()
-                        .px(px(4.0))
-                        .py(px(5.0))
-                        .rounded_sm()
-                        .hover(|style| style.bg(rgb(theme::SURFACE_HOVER)))
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.commit_paint(property, Some(color), cx);
-                            this.palette = None;
-                            cx.notify();
-                        }))
-                        .child(div().size(px(10.0)).rounded_sm().bg(rgb(*value)))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(theme::TEXT_SECONDARY))
-                                .child(name),
-                        ),
-                );
-            }
-            palette = palette.child(row);
-        }
-        palette
+    /// The engine's colour picker for one paint, if it is open.
+    fn color_picker(&self, property: StyleProperty, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let Some(engine) = self.engine.clone() else {
+            return None;
+        };
+        let target = match property {
+            StyleProperty::Fill => panel_colorpicker::ColorTarget::Fill,
+            StyleProperty::Stroke => panel_colorpicker::ColorTarget::Stroke,
+            StyleProperty::TextColor => panel_colorpicker::ColorTarget::TextColor,
+        };
+        panel_colorpicker::picker(&engine, target, self.color_state.clone(), cx)
     }
 }
 
@@ -3668,38 +4287,6 @@ fn segmented(
 // The other two tabs
 // ═══════════════════════════════════════════════════════════════════════════
 
-fn prototype_body() -> AnyElement {
-    column()
-        .gap_3()
-        .p(px(15.0))
-        .child(
-            div()
-                .text_sm()
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(rgb(theme::TEXT))
-                .child("Prototype connections"),
-        )
-        .child(
-            div()
-                .text_xs()
-                .text_color(rgb(theme::TEXT_SECONDARY))
-                .child("Link this frame to another screen to start a flow."),
-        )
-        .child(
-            div()
-                .px(px(10.0))
-                .py(px(9.0))
-                .rounded_md()
-                .bg(rgb(theme::WINDOW))
-                .border_1()
-                .border_color(rgb(theme::BORDER))
-                .text_xs()
-                .text_color(rgb(theme::TEXT_MUTED))
-                .child("＋  Add interaction"),
-        )
-        .into_any_element()
-}
-
 fn ai_body() -> AnyElement {
     column()
         .gap_3()
@@ -3735,6 +4322,16 @@ fn ai_body() -> AnyElement {
 // ═══════════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════
+
+/// The Inspector's text fields, in a real window.
+///
+/// A field is a keyboard thing, and a keyboard thing is only visible in a
+/// window: whether a keystroke reaches the field depends on which node holds
+/// the focus and on whether a key binding claimed the key before any
+/// `on_key_down` ran. A unit test holds the `Window` that would do that work
+/// and never lets it, so it cannot see the defect.
+#[cfg(test)]
+mod field_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3801,6 +4398,10 @@ mod tests {
             SectionSlot::TYPOGRAPHY,
             SectionSlot::EFFECTS,
             SectionSlot::EXPORT,
+            SectionSlot::STYLES,
+            SectionSlot::VARIABLES,
+            SectionSlot::ASSETS,
+            SectionSlot::A11Y,
         ];
         assert_eq!(slots.len(), SECTION_COUNT, "every slot is accounted for");
         for (index, slot) in slots.iter().enumerate() {

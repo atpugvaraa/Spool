@@ -1186,6 +1186,15 @@ impl EffectsPanel {
         }
     }
 
+    /// Whether a field is open, waiting for a value to be typed into it.
+    ///
+    /// The panel's field is a text field like any other, and the keyboard
+    /// needs to know: a character typed into it is a character, not an editor
+    /// shortcut, so the shortcut has to be skipped while it is open.
+    pub fn is_editing(&self) -> bool {
+        self.state.edit.is_some()
+    }
+
     /// The engine canvas the panel reads and writes through.
     pub fn canvas(&self) -> &Entity<EngineCanvas> {
         &self.canvas
