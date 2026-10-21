@@ -1265,8 +1265,13 @@ pub struct ProtoPanelState {
     pub open: Option<ProtoMenu>,
     /// The text being typed, if any.
     pub draft: Option<ProtoDraft>,
-    /// The interaction whose editor is open, if any.
-    pub editing: Option<usize>,
+    /// The interaction whose editor is open, if any: the layer it belongs to
+    /// and its index.
+    ///
+    /// The layer is part of it because the editor is about one layer's
+    /// interaction: when the selection moves to another layer, the editor
+    /// closes rather than showing that layer's interaction of the same index.
+    pub editing: Option<(NodeId, usize)>,
 }
 
 impl ProtoPanelState {
@@ -1704,9 +1709,13 @@ fn interactions<T: ProtoHost>(
         section = section.child(interaction_row(model, row, state, cx));
     }
     let editing = state.borrow().editing;
-    if let Some(index) = editing {
-        if let Some(row) = model.interactions.iter().find(|row| row.index == index) {
-            section = section.child(interaction_editor(model, row, state, cx));
+    if let Some((node, index)) = editing {
+        // The editor is about one layer: it closes when the selection moves
+        // to another one.
+        if model.ids.first().copied() == Some(node) {
+            if let Some(row) = model.interactions.iter().find(|row| row.index == index) {
+                section = section.child(interaction_editor(model, row, state, cx));
+            }
         }
     }
     section = section.child(note(SAVE_PATH_NOTE));
@@ -1752,7 +1761,10 @@ fn interaction_row<T: ProtoHost>(
     cx: &mut Context<T>,
 ) -> impl IntoElement {
     let index = row.index;
-    let open = state.borrow().editing == Some(index);
+    // The layer the row is about, when there is one: a row without a layer
+    // cannot be opened, so it is never the open one.
+    let node = model.ids.first().copied();
+    let open = node.is_some_and(|node| state.borrow().editing == Some((node, index)));
     let trigger = match &row.trigger {
         ProtoValue::Set(text) => text.clone(),
         ProtoValue::Unset => NOT_SET.to_owned(),
@@ -1775,10 +1787,11 @@ fn interaction_row<T: ProtoHost>(
         .on_click(cx.listener(move |_host, _event, _window, cx| {
             {
                 let mut state = shared.borrow_mut();
-                state.editing = if state.editing == Some(index) {
+                let here = node.map(|node| (node, index));
+                state.editing = if here.is_some() && state.editing == here {
                     None
                 } else {
-                    Some(index)
+                    here
                 };
                 state.open = None;
                 state.draft = None;
@@ -4013,6 +4026,81 @@ mod tests {
         assert!(
             row.origin.y >= panel.origin.y && row.bottom() <= panel.bottom(),
             "the row is drawn inside the panel: row {row:?} panel {panel:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn the_editor_is_about_one_layer_and_closes_when_the_selection_moves(cx: &mut TestAppContext) {
+        let mut fixture = fixture();
+        fixture.with_navigation();
+        // A second layer with an interaction of its own.
+        let other = created_id(
+            &fixture
+                .session
+                .execute(
+                    "node.create",
+                    &json!({
+                        "type": "rectangle",
+                        "parent": fixture.first,
+                        "x": 10.0,
+                        "y": 50.0,
+                        "width": 80.0,
+                        "height": 30.0,
+                        "name": "Other",
+                    }),
+                )
+                .expect("a rectangle"),
+        );
+        fixture
+            .session
+            .execute(
+                "proto.interaction.add",
+                &json!({
+                    "ids": [other],
+                    "trigger": { "type": "onClick" },
+                    "action": { "type": "navigate", "dest": fixture.second },
+                }),
+            )
+            .expect("the second layer gets an interaction");
+        let doc = fixture.doc();
+
+        let model = ProtoModel::read(&doc, fixture.page, &[fixture.button]);
+        let (host, window) = cx.add_window_view(|_window, _cx| TestHost::new(model));
+        // The editor is open for the button.
+        window.update(|_, cx| {
+            host.update(cx, |host, _cx| {
+                host.state.borrow_mut().editing = Some((fixture.button, 0));
+            });
+        });
+        window.draw(
+            point(px(0.0), px(0.0)),
+            size(px(300.0), px(720.0)),
+            |_, _| host.clone().into_any_element(),
+        );
+        window.run_until_parked();
+        assert!(
+            window.debug_bounds("proto-interaction-editor-0").is_some(),
+            "the editor is drawn for the layer it is about"
+        );
+
+        // The selection moves to the other layer: the editor is about the
+        // first one, so it closes rather than showing the other layer's
+        // interaction of the same index.
+        let moved = ProtoModel::read(&doc, fixture.page, &[other]);
+        window.update(|_, cx| {
+            host.update(cx, |host, _cx| {
+                host.model = moved;
+            });
+        });
+        window.draw(
+            point(px(0.0), px(0.0)),
+            size(px(300.0), px(720.0)),
+            |_, _| host.clone().into_any_element(),
+        );
+        window.run_until_parked();
+        assert!(
+            window.debug_bounds("proto-interaction-editor-0").is_none(),
+            "the editor closed when the selection moved to another layer"
         );
     }
 
