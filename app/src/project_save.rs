@@ -78,6 +78,7 @@ use crate::source_document::{
     LamineStructure, ModelError, NodeId, PersistentDocument, StructuralNode,
 };
 use spool_source::css::Stylesheet;
+use spool_source::manifest::Manifest;
 
 // # MUTATION HARNESS
 //
@@ -281,16 +282,31 @@ struct SavePlan {
     html: BTreeMap<String, BTreeMap<NodeId, ElementWrite>>,
     /// Stylesheet -> the declaration value spans to replace.
     css: BTreeMap<String, Vec<CssWrite>>,
-    /// Markup file -> parent node -> the children to author inside it.
+    /// Markup file -> the host element -> the children to author inside it.
     ///
-    /// Keyed by the *parent*, not the new node, because every child of one
-    /// parent is written as a single splice. Two insertions into the same parent
-    /// share one offset; as separate splices they would collapse into one, and
-    /// only one of the two objects would be authored.
-    creates: BTreeMap<String, BTreeMap<NodeId, PlannedInsertion>>,
+    /// Keyed by the *host* — the element the new markup goes inside — not by
+    /// the new node, because every child of one host is written as a single
+    /// splice. Two insertions into the same host share one offset; as
+    /// separate splices they would collapse into one, and only one of the two
+    /// objects would be authored.
+    creates: BTreeMap<String, BTreeMap<Host, PlannedInsertion>>,
     /// Markup file -> the authored elements to take back out.
     removes: BTreeMap<String, Vec<PlannedRemoval>>,
     unsupported: Vec<UnsupportedEdit>,
+}
+
+/// The element a new node's markup goes inside.
+///
+/// The nearest ancestor that has an element of its own: a node whose
+/// ancestors are all new has nowhere to go yet, so the host is the one above
+/// them. A node on the page has no ancestor at all, and its host is the
+/// document's body.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Host {
+    /// An authored element, and the node it belongs to.
+    Node(NodeId),
+    /// The document's body: a page-level element has no managed parent.
+    Body,
 }
 
 /// The new children of one parent element, as a single splice.
@@ -425,6 +441,33 @@ fn structure_on_disk(root: &Path, format: MetadataFormat) -> Result<LamineStruct
     }
 }
 
+/// The metadata to write for a version 2 project, and whether the file had
+/// to be written out again whole.
+///
+/// The file is **edited** when it can be: the author's own comments and
+/// formatting stay, and only the records that changed are written out again.
+/// A file that cannot be merged into — one that is not shaped like a
+/// sequence of records — is written out again whole instead, which loses the
+/// author's formatting. The second return value says which happened, so the
+/// save can say so out loud.
+fn version_two_metadata(root: &Path, merged: &Manifest) -> Result<(String, bool), BundleError> {
+    let path = root.join(crate::project_bundle::METADATA_FILE);
+    let text = std::fs::read_to_string(&path).map_err(|source| BundleError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    if let Ok(edited) = Manifest::merge_into(&text, merged) {
+        return Ok((edited, false));
+    }
+    let encoded = merged
+        .to_yaml()
+        .map_err(|source| BundleError::MalformedMetadata {
+            path: path.clone(),
+            source: ModelError::InvalidYaml(source.to_string()),
+        })?;
+    Ok((encoded, true))
+}
+
 /// Apply edits to the project on disk and persist metadata.
 ///
 /// Returns what was written and what was not, so a caller never has to guess
@@ -433,10 +476,35 @@ fn structure_on_disk(root: &Path, format: MetadataFormat) -> Result<LamineStruct
 /// A multi-file save is not atomic — see [`SaveError`] — so the failure case
 /// carries the files that did land rather than reporting only that something
 /// broke.
+#[allow(
+    dead_code,
+    reason = "the version 1 save, kept for the callers that have no manifest"
+)]
 pub fn save_project(
     root: &Path,
     document: &PersistentDocument,
     edits: &[SourceEdit],
+) -> Result<SaveOutcome, SaveError> {
+    save_project_with(root, document, edits, None)
+}
+
+/// The save, with the version 2 manifest the caller merged.
+///
+/// `manifest` is the metadata to write when the project's own metadata is a
+/// version 2 file. The caller supplies it because the caller is the one that
+/// knows which model id each node has — the engine's own node id *is* the
+/// manifest's id — and the version 2 schema is the only one that can say so.
+/// A version 1 project is written from the document's structure, as it
+/// always was, and `manifest` is not consulted.
+///
+/// Without a manifest a version 2 project cannot be given a new node or lose
+/// one: the metadata would not describe the source, and the project would not
+/// open. Such an edit is reported instead of applied.
+pub fn save_project_with(
+    root: &Path,
+    document: &PersistentDocument,
+    edits: &[SourceEdit],
+    manifest: Option<&Manifest>,
 ) -> Result<SaveOutcome, SaveError> {
     // The metadata's format, read before anything is decided. It decides
     // whether the structure can be written at all, and which edits are safe to
@@ -447,9 +515,24 @@ pub fn save_project(
     // Phase 1 — resolve every edit against the bytes on disk right now.
     let mut files = AuthoredFiles::from_disk(root, document);
     let mut plan = SavePlan::default();
+    // The creations are resolved together, after every other edit: an
+    // element's markup can hold the elements of the nodes created inside it,
+    // and those are not all known until every edit has been read.
+    let mut creations: Vec<(NodeId, NewElement)> = Vec::new();
+    // Whether the metadata can describe a node that arrives or leaves. A
+    // version 1 file is written from the document's structure, which knows
+    // about the node either way; a version 2 file can only be written when
+    // the caller merged a manifest that describes it.
+    let describes = format != MetadataFormat::VersionTwo || manifest.is_some();
     for edit in edits {
-        plan.resolve(&mut files, document, edit, format);
+        match edit {
+            SourceEdit::Create { node, element } => {
+                creations.push((node.clone(), element.clone()));
+            }
+            other => plan.resolve(&mut files, document, other, format, describes),
+        }
     }
+    plan.resolve_creations(&mut files, document, &creations, describes);
 
     // Phase 2 — render. A file's new contents come from the very bytes its
     // ranges were resolved against, so a splice cannot drift onto a different
@@ -504,21 +587,69 @@ pub fn save_project(
     updated.sources.clear();
     let on_disk = structure_on_disk(root, format)?;
     let mut notes: Vec<String> = Vec::new();
+    // The source as it will be once this save has written it. The structure
+    // about to be written is checked against this, not against what is on
+    // disk now, because both are about to change.
+    let mut after: BTreeMap<String, String> = document
+        .sources
+        .iter()
+        .map(|(file, contents)| (file.clone(), contents.clone()))
+        .collect();
+    for (file, contents) in &rewritten {
+        after.insert(file.clone(), contents.clone());
+    }
     let metadata = if on_disk == updated.structure {
         None
     } else if format == MetadataFormat::VersionTwo {
-        // The structure changed and the metadata is a format this writer does
-        // not produce. The authored source is still written below — that is
-        // what the author sees and what the editor drew — but the metadata is
-        // left exactly as it is rather than replaced by a smaller encoding of
-        // the same project, which would lose every constraint, lock, mask and
-        // variable binding it carried.
-        notes.push(
-            "the project's metadata is version 2, which this editor reads but does not \
-             rewrite, so it was left as it is; a structural change to it is not saved"
-                .to_owned(),
-        );
-        None
+        match manifest {
+            Some(manifest) => {
+                // The version 2 schema, written with the editor's identity
+                // and hierarchy laid over the author's own records. Every
+                // Owner B value the author wrote survives.
+                let (encoded, re_encoded) = version_two_metadata(root, manifest)?;
+                if re_encoded {
+                    // The file could not be edited, so it was written out
+                    // again whole, and the author's formatting went with it.
+                    // Said out loud, because a save that quietly did less than
+                    // it was asked to is the failure this whole module exists
+                    // to prevent.
+                    notes.push(
+                        "the project's metadata was re-encoded to record the change; its \
+                         comments and formatting are not preserved"
+                            .to_owned(),
+                    );
+                }
+                // A save must not be able to leave a project that cannot be
+                // opened: the structure about to be written has to bind
+                // against the source about to be written.
+                source_binding::reconcile(&updated.structure, &after).map_err(|errors| {
+                    BundleError::UnsavableStructure {
+                        path: metadata_path.clone(),
+                        detail: errors
+                            .iter()
+                            .map(|error| error.to_string())
+                            .collect::<Vec<_>>()
+                            .join("; "),
+                    }
+                })?;
+                Some(encoded)
+            }
+            None => {
+                // The structure changed and the metadata is a format this writer
+                // does not produce. The authored source is still written below —
+                // that is what the author sees and what the editor drew — but the
+                // metadata is left exactly as it is rather than replaced by a
+                // smaller encoding of the same project, which would lose every
+                // constraint, lock, mask and variable binding it carried.
+                notes.push(
+                    "the project's metadata is version 2, which this editor reads but does \
+                     not rewrite, so it was left as it is; a structural change to it is not \
+                     saved"
+                        .to_owned(),
+                );
+                None
+            }
+        }
     } else {
         let bundle = ProjectBundle::from_document(root, updated)?;
         let encoded = bundle.metadata_yaml()?;
@@ -528,14 +659,6 @@ pub fn save_project(
         // to change. Renaming a node is a name change and always passes; adding
         // or removing one has to bring its authored element with it, and this is
         // where that is required rather than assumed.
-        let mut after: BTreeMap<String, String> = document
-            .sources
-            .iter()
-            .map(|(file, contents)| (file.clone(), contents.clone()))
-            .collect();
-        for (file, contents) in &rewritten {
-            after.insert(file.clone(), contents.clone());
-        }
         source_binding::reconcile(&bundle.document.structure, &after).map_err(|errors| {
             BundleError::UnsavableStructure {
                 path: metadata_path.clone(),
@@ -596,6 +719,7 @@ impl SavePlan {
         document: &PersistentDocument,
         edit: &SourceEdit,
         format: MetadataFormat,
+        can_describe: bool,
     ) {
         let (node_id, kind) = match edit {
             SourceEdit::Text { node, .. } => (node, "text"),
@@ -609,6 +733,7 @@ impl SavePlan {
         // source (or arrive in it) while the metadata kept naming the old
         // structure, and the project would not open. Reported, not applied.
         if format == MetadataFormat::VersionTwo
+            && !can_describe
             && matches!(edit, SourceEdit::Remove { .. } | SourceEdit::Create { .. })
         {
             let reason = match edit {
@@ -736,36 +861,198 @@ impl SavePlan {
             // Unreachable: every removal returned above, before the document was
             // consulted. Present only so the match is total.
             SourceEdit::Remove { .. } => {}
-            SourceEdit::Create { element, .. } => {
-                match files.insertion_point(&file, node) {
-                    Ok(Some(plan)) => {
-                        let parent = node.parent.clone().expect("a plan implies a parent");
-                        let group = self.creates.entry(file.clone()).or_default();
-                        let insertion = group.entry(parent).or_insert_with(|| PlannedInsertion {
-                            at: plan.at,
-                            replaces: plan.replaces.clone(),
-                            markup: String::new(),
-                        });
-                        // No newline before the first child: the one already in
-                        // the file leads up to the replaced indent, and adding
-                        // another would leave a blank line above every new element.
-                        insertion.markup.push_str(&plan.indent);
-                        insertion
-                            .markup
-                            .push_str(&render_new_element(node_id, element));
-                    }
-                    // The node has no authored element yet — that is what this
-                    // edit is for — so there is nothing to report and nowhere to
-                    // report it to.
-                    Ok(None) => self.report(
-                        node_id,
-                        kind,
+            // The creations are resolved together, after every other edit:
+            // an element's markup can hold the elements of the nodes created
+            // inside it, and those are not all known until every edit has
+            // been read. See `resolve_creations`.
+            SourceEdit::Create { .. } => {}
+        }
+    }
+
+    /// Resolve the elements a save authors, into the spans they will be
+    /// written at.
+    ///
+    /// The creations are resolved together because one can hold another: a
+    /// shape drawn inside a shape the editor made is written inside that
+    /// shape's own element, which does not exist on disk yet. The markup is
+    /// therefore assembled from the whole set, outermost first, and each
+    /// element is written into the nearest ancestor that has an element of
+    /// its own.
+    fn resolve_creations(
+        &mut self,
+        files: &mut AuthoredFiles,
+        document: &PersistentDocument,
+        creations: &[(NodeId, NewElement)],
+        can_describe: bool,
+    ) {
+        if !can_describe {
+            // The metadata would not describe the new element, so the source
+            // and the metadata would disagree about what the project holds.
+            for (node, _) in creations {
+                self.report(
+                    node,
+                    "create",
+                    "the project's metadata is version 2, which this editor reads but does \
+                     not rewrite, so authoring this element would leave the metadata not \
+                     describing it"
+                        .into(),
+                );
+            }
+            return;
+        }
+        let by_node: BTreeMap<&NodeId, &NewElement> = creations
+            .iter()
+            .map(|(node, element)| (node, element))
+            .collect();
+        for (node, element) in creations {
+            let Some(structural) = document.structure.nodes.iter().find(|n| &n.id == node) else {
+                self.report(
+                    node,
+                    "create",
+                    "no such node in the persistent document".into(),
+                );
+                continue;
+            };
+            // A node whose ancestor is being created as well is written
+            // inside that ancestor's own markup, not beside it.
+            if self.has_created_ancestor(node, document, &by_node) {
+                continue;
+            }
+            let file = structural.source.file.clone();
+            // The node has no authored element yet — that is what this edit is
+            // for — so there is nothing to report and nowhere to report it to.
+            match files.has_element(&file, node) {
+                Ok(true) => {
+                    self.report(
+                        node,
+                        "create",
                         "this node already has an authored element".into(),
-                    ),
-                    Err(reason) => self.report(node_id, kind, reason),
+                    );
+                    continue;
+                }
+                Ok(false) => {}
+                Err(reason) => {
+                    self.report(node, "create", reason);
+                    continue;
                 }
             }
+            // The element the new markup goes inside: the nearest ancestor
+            // that has an element of its own, or the document's body for a
+            // node on the page.
+            let host = match files.host_of(&file, node, document) {
+                Ok(host) => host,
+                Err(reason) => {
+                    self.report(node, "create", reason);
+                    continue;
+                }
+            };
+            let plan = match files.insertion_point(&file, &host) {
+                Ok(Some(plan)) => plan,
+                // The node has no authored element yet — that is what this edit
+                // is for — so there is nothing to report and nowhere to report
+                // it to.
+                Ok(None) => {
+                    self.report(
+                        node,
+                        "create",
+                        "this node already has an authored element".into(),
+                    );
+                    continue;
+                }
+                Err(reason) => {
+                    self.report(node, "create", reason);
+                    continue;
+                }
+            };
+            let markup = self.markup_for(node, element, document, &by_node, &plan.indent);
+            let group = self.creates.entry(file.clone()).or_default();
+            let insertion = group
+                .entry(host.clone())
+                .or_insert_with(|| PlannedInsertion {
+                    at: plan.at,
+                    replaces: plan.replaces.clone(),
+                    markup: String::new(),
+                });
+            // No newline before the first child: the one already in the file
+            // leads up to the replaced indent, and adding another would leave
+            // a blank line above every new element.
+            insertion.markup.push_str(&plan.indent);
+            insertion.markup.push_str(&markup);
         }
+    }
+
+    /// Whether a node has an ancestor that is being created as well.
+    ///
+    /// Such a node is written inside that ancestor's own markup, because the
+    /// ancestor does not exist in the source yet: there is nowhere else for
+    /// it to go.
+    fn has_created_ancestor(
+        &self,
+        node: &NodeId,
+        document: &PersistentDocument,
+        created: &BTreeMap<&NodeId, &NewElement>,
+    ) -> bool {
+        let mut cursor = document
+            .structure
+            .nodes
+            .iter()
+            .find(|n| &n.id == node)
+            .and_then(|n| n.parent.clone());
+        while let Some(parent) = cursor {
+            if created.contains_key(&parent) {
+                return true;
+            }
+            cursor = document
+                .structure
+                .nodes
+                .iter()
+                .find(|n| n.id == parent)
+                .and_then(|n| n.parent.clone());
+        }
+        false
+    }
+
+    /// The markup for one authored element, with the elements created inside
+    /// it.
+    ///
+    /// A node the editor made can hold another one, and the inner element is
+    /// written inside the outer element's own markup — the outer element does
+    /// not exist on disk yet, so there is nowhere else for it to go.
+    fn markup_for(
+        &self,
+        node: &NodeId,
+        element: &NewElement,
+        document: &PersistentDocument,
+        by_node: &BTreeMap<&NodeId, &NewElement>,
+        indent: &str,
+    ) -> String {
+        let children: Vec<&NodeId> = document
+            .structure
+            .nodes
+            .iter()
+            .find(|n| &n.id == node)
+            .map(|n| {
+                n.children
+                    .iter()
+                    .filter(|child| by_node.contains_key(*child))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if children.is_empty() {
+            return render_new_element(node, element);
+        }
+        let child_indent = format!("{indent}  ");
+        let content = children
+            .iter()
+            .map(|child| {
+                format!(
+                    "{child_indent}{}",
+                    self.markup_for(child, by_node[child], document, by_node, &child_indent)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        render_element(node, element, &content, indent)
     }
 
     /// The element's writable spans, or the reason there are none.
@@ -1105,55 +1392,114 @@ impl<'a> AuthoredFiles<'a> {
         Ok(self.indexes.get(file))
     }
 
-    /// Where a new element for `node` should be spliced into `file`.
+    /// The element a new node's markup goes inside.
     ///
-    /// `Ok(None)` when the node already has an element, because then it needs no
-    /// new one. An error carries the reason it cannot be placed.
+    /// The nearest ancestor with an element of its own: a node whose
+    /// ancestors are all new has nowhere to go yet, so the host is the one
+    /// above them. A node on the page has no ancestor at all, and its host is
+    /// the body's.
+    fn host_of(
+        &mut self,
+        file: &str,
+        node: &NodeId,
+        document: &PersistentDocument,
+    ) -> Result<Host, String> {
+        let mut cursor = document
+            .structure
+            .nodes
+            .iter()
+            .find(|n| &n.id == node)
+            .and_then(|n| n.parent.clone());
+        while let Some(parent_id) = cursor {
+            let Some(parent) = document.structure.nodes.iter().find(|n| n.id == parent_id) else {
+                break;
+            };
+            // The ancestor has an element of its own?
+            if let Some(index) = self.index(&parent.source.file)? {
+                if index.find(&parent.id).is_some() {
+                    if parent.source.file != file {
+                        return Err(format!(
+                            "{} is bound to {} but the new element is written into {file}",
+                            parent.id.as_str(),
+                            parent.source.file
+                        ));
+                    }
+                    return Ok(Host::Node(parent.id.clone()));
+                }
+            }
+            cursor = parent.parent.clone();
+        }
+        Ok(Host::Body)
+    }
+
+    /// Whether a node already has an element in a file.
+    fn has_element(&mut self, file: &str, node: &NodeId) -> Result<bool, String> {
+        let Some(index) = self.index(file)? else {
+            return Ok(false);
+        };
+        Ok(index.find(node).is_some())
+    }
+
+    /// Where a new element should be spliced into `file`.
     ///
-    /// The insertion point is the inside of the parent's content, and the
+    /// `Ok(None)` when the host already has an authored element, because
+    /// then it needs no new one. An error carries the reason it cannot be
+    /// placed.
+    ///
+    /// The insertion point is the inside of the host's content, and the
     /// whitespace immediately before it is replaced rather than kept, so a new
-    /// child takes the parent's indentation and leaves no blank line above the
+    /// child takes the host's indentation and leaves no blank line above the
     /// close tag. That is what keeps the authored diff to one added line.
     fn insertion_point(
         &mut self,
         file: &str,
-        node: &StructuralNode,
+        host: &Host,
     ) -> Result<Option<InsertionPoint>, String> {
-        // Already authored: this edit would give one element two identities.
-        if let Some(index) = self.index(file)? {
-            if index.find(&node.id).is_some() {
-                return Ok(None);
-            }
-        }
-        let Some(parent_id) = node.parent.clone() else {
-            return Err(format!(
-                "{file} has no parent element to write into: a created object needs a \
-                 container, because a project with nowhere to put an element cannot \
-                 be reopened"
-            ));
-        };
         let Some(index) = self.index(file)? else {
             return Err(unreadable(file, "this creation"));
         };
-        // The parent must live in the same file. Authoring a child into another
-        // page would mean inventing a cross-file reference, so it is reported.
-        let Some(parent) = index.find(&parent_id) else {
-            return Err(format!(
-                "{file} has no element for the parent {}",
-                parent_id.as_str()
-            ));
+        let (at, outer) = match host {
+            Host::Node(id) => {
+                let Some(binding) = index.find(id) else {
+                    return Err(format!("{file} has no element for {}", id.as_str()));
+                };
+                (binding.content_end, binding.element_range.clone())
+            }
+            Host::Body => {
+                // The body: a node on the page has no managed parent, and the
+                // body is the element every other page-level element is a
+                // child of.
+                let body = index
+                    .element_ranges()
+                    .iter()
+                    .find(|range| {
+                        index
+                            .source
+                            .get(range.start..range.end)
+                            .map(|fragment| tag_name(fragment) == "body")
+                            .unwrap_or(false)
+                    })
+                    .map(|range| range.start..range.end);
+                let Some(body) = body else {
+                    return Err(format!(
+                        "{file} has no <body> element to write a page-level element into"
+                    ));
+                };
+                let fragment = index.source.get(body.clone()).unwrap_or_default();
+                // Just inside the closing tag: the content of the body ends
+                // where its close tag begins.
+                let close = closing_tag_at(fragment, "body").unwrap_or(fragment.len());
+                (body.start + close, body.clone())
+            }
         };
-        let at = parent.content_end;
         let (indent_start, indent) = source_binding::trailing_indent(&index.source, at);
-        // Line up with the parent's existing children when it has any, so the new
-        // element is a sibling in the author's own layout rather than at some
-        // indentation the writer invented.
+        // Line up with the host's existing children when it has any, so the
+        // new element is a sibling in the author's own layout rather than at
+        // some indentation the writer invented.
         let child_indent = index
             .element_ranges()
             .iter()
-            .find(|range| {
-                range.start > parent.element_range.start && range.end <= parent.element_range.end
-            })
+            .find(|range| range.start > outer.start && range.end <= outer.end)
             .map(|first_child| line_indent(&index.source, first_child.start))
             .filter(|candidate| !candidate.is_empty())
             .unwrap_or_else(|| format!("{indent}  "));
@@ -1805,7 +2151,7 @@ fn geometry_writes(
 fn render_html(
     original: &str,
     writes: &BTreeMap<NodeId, ElementWrite>,
-    creates: Option<&BTreeMap<NodeId, PlannedInsertion>>,
+    creates: Option<&BTreeMap<Host, PlannedInsertion>>,
     removes: Option<&Vec<PlannedRemoval>>,
 ) -> String {
     let mut replacements: Vec<(ByteRange, String)> = Vec::new();
@@ -4244,6 +4590,104 @@ mod tests {
     }
 
     #[test]
+    fn a_page_level_element_is_written_into_the_body() {
+        // A node on the page has no managed parent, and the body is the
+        // element every other page-level element is a child of.
+        let root = wide_indent_project("page-level");
+        let mut document = open_project(&root).expect("opens").document;
+        document.structure.nodes.push(StructuralNode {
+            id: node("spool-new"),
+            name: "Created".to_owned(),
+            kind: "rectangle".to_owned(),
+            parent: None,
+            children: Vec::new(),
+            source: crate::source_document::SourceBinding {
+                file: "index.html".to_owned(),
+                selector: "[data-spool-id=\"spool-new\"]".to_owned(),
+            },
+        });
+
+        let outcome =
+            save_project(&root, &document, &[new_rectangle("spool-new")]).expect("save succeeds");
+        assert!(outcome.unsupported.is_empty(), "{:?}", outcome.unsupported);
+
+        let html = std::fs::read_to_string(root.join("index.html")).expect("html");
+        let created = html.find("spool-new").expect("the element was authored");
+        let body = html.find("</body>").expect("the body closes");
+        assert!(created < body, "the element is inside the body: {html}");
+        assert!(
+            html.find("</main>").expect("the main closes") < created,
+            "and it is a sibling of the main, not a child of it: {html}"
+        );
+    }
+
+    #[test]
+    fn an_element_created_inside_another_created_element_is_written_inside_it() {
+        // A shape drawn inside a shape the editor made. The inner element is
+        // written inside the outer element's own markup, because the outer
+        // element does not exist in the source yet: there is nowhere else for
+        // the inner one to go.
+        let root = wide_indent_project("nested");
+        let mut document = open_project(&root).expect("opens").document;
+        for (id, parent) in [
+            ("spool-outer", "spool-frame-root"),
+            ("spool-inner", "spool-outer"),
+        ] {
+            document.structure.nodes.push(StructuralNode {
+                id: node(id),
+                name: id.to_owned(),
+                kind: "rectangle".to_owned(),
+                parent: Some(node(parent)),
+                children: Vec::new(),
+                source: crate::source_document::SourceBinding {
+                    file: "index.html".to_owned(),
+                    selector: format!("[data-spool-id=\"{id}\"]"),
+                },
+            });
+        }
+        let outer = document
+            .structure
+            .nodes
+            .iter_mut()
+            .find(|n| n.id == node("spool-outer"))
+            .expect("the outer node is there");
+        outer.children.push(node("spool-inner"));
+
+        let outcome = save_project(
+            &root,
+            &document,
+            &[new_rectangle("spool-outer"), new_rectangle("spool-inner")],
+        )
+        .expect("save succeeds");
+        assert!(outcome.unsupported.is_empty(), "{:?}", outcome.unsupported);
+
+        let html = std::fs::read_to_string(root.join("index.html")).expect("html");
+        let outer_at = html
+            .find("spool-outer")
+            .expect("the outer element was authored");
+        let inner_at = html
+            .find("spool-inner")
+            .expect("the inner element was authored");
+        assert!(
+            outer_at < inner_at,
+            "the inner element follows the outer one: {html}"
+        );
+        let outer_close = html[outer_at..]
+            .find("</div>")
+            .map(|at| at + outer_at)
+            .expect("the outer element closes");
+        assert!(
+            inner_at < outer_close,
+            "the inner element is inside the outer element, not beside it: {html}"
+        );
+        assert_eq!(
+            html.matches("data-spool-id=").count(),
+            4,
+            "the inner element is written once, not twice: {html}"
+        );
+    }
+
+    #[test]
     fn written_lengths_are_readable_rather_than_binary_noise() {
         // Layout runs in f32, so the editor's own geometry arrives as
         // `22.399994`. Authoring that into the document is accurate, ugly, and
@@ -4666,6 +5110,14 @@ fn line_indent(source: &str, offset: usize) -> String {
 /// declarations are the ones the editor will read back, and text is escaped so
 /// what the user typed cannot become markup.
 fn render_new_element(node: &NodeId, element: &NewElement) -> String {
+    render_element(node, element, "", "")
+}
+
+/// The markup for one authored element, with the content it owns.
+///
+/// `content` is the markup of the elements created inside this one. It is
+/// empty for an element that holds nothing but its own text.
+fn render_element(node: &NodeId, element: &NewElement, content: &str, indent: &str) -> String {
     let style = merge_inline_declarations("", &element.declarations);
     let mut markup = format!(
         "<{tag} data-spool-id=\"{id}\"",
@@ -4676,9 +5128,45 @@ fn render_new_element(node: &NodeId, element: &NewElement) -> String {
         markup.push_str(&format!(" style=\"{style}\""));
     }
     markup.push('>');
+    if !content.is_empty() {
+        markup.push('\n');
+        markup.push_str(content);
+        markup.push('\n');
+        markup.push_str(indent);
+        markup.push_str(&format!("</{}>", element.tag));
+        return markup;
+    }
     if let Some(text) = &element.text {
         markup.push_str(&escape_text(text));
     }
     markup.push_str(&format!("</{}>", element.tag));
     markup
+}
+
+/// The tag name an element's markup opens with.
+fn tag_name(fragment: &str) -> String {
+    let rest = fragment.strip_prefix('<').unwrap_or(fragment);
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
+        .unwrap_or(rest.len());
+    rest[..end].to_ascii_lowercase()
+}
+
+/// Where an element's own closing tag starts.
+///
+/// The last one in the element's markup, so an element that holds another
+/// one is not mistaken for one that ends at its child's close tag.
+fn closing_tag_at(fragment: &str, tag: &str) -> Option<usize> {
+    let mut end = fragment.len();
+    while let Some(offset) = fragment[..end].rfind("</") {
+        let rest = fragment.get(offset + 2..)?;
+        if rest
+            .get(..tag.len())
+            .is_some_and(|name| name.eq_ignore_ascii_case(tag))
+        {
+            return Some(offset);
+        }
+        end = offset;
+    }
+    None
 }

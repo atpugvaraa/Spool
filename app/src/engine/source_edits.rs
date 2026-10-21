@@ -33,9 +33,17 @@
 //!
 //! A node the *engine* created has a fresh id above every id the manifest
 //! uses, so the manifest has no record for it. Such a node has no source
-//! binding and therefore nowhere to be authored: it is reported as an
-//! unsupported edit, never invented into the source. That is the old runtime's
-//! rule — "reported rather than invented" — and it is kept here.
+//! binding — and that used to be the end of it: it was reported as an
+//! unsupported edit and nothing was written, which is why drawing a shape
+//! left no trace at all.
+//!
+//! It is not the end of it any more. A node the user drew is new content, and
+//! the only honest thing to do with new content is to give it a source
+//! binding: mint an identity, author an element for it, and record it in the
+//! metadata. That is what [`Plan`] is. The old runtime's rule is kept, aimed
+//! the other way: nothing is invented, and a node that cannot be authored —
+//! a kind with no HTML spelling, a fill that is not one colour — is reported
+//! rather than approximated, while the rest of the document is still written.
 //!
 //! # The baseline: what the source says
 //!
@@ -146,9 +154,11 @@
 //!
 //! Three cases, each for its own reason:
 //!
-//! - **A node the engine created.** It has no manifest record, so it has no
-//!   key, no file and no selector: there is nowhere to author it. It is
-//!   reported, never invented.
+//! - **A node the engine created.** It is new content rather than a changed
+//!   one, so it is not compared: it is *authored*. The plan gives it an
+//!   identity, an element and a record in the metadata. A node that cannot
+//!   be authored is reported, and every other node in the document is still
+//!   written.
 //! - **A node whose element the source does not carry**, while the metadata
 //!   does describe it. That is a created node — an identity without its
 //!   authored half — and it is the one case where the save writes an element
@@ -158,7 +168,7 @@
 //!   nodes it does not back are still authorable, and the reason is said out
 //!   loud.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use figcraft_doc::color::{Color, Paint};
@@ -295,9 +305,28 @@ pub fn read_project(root: &Path) -> Result<SourceProject, EditError> {
 /// caller never has to guess whether an edit survived.
 pub fn save_engine_document(root: &Path, live: &Document) -> Result<SaveOutcome, SaveError> {
     let project = read_project(root).map_err(|error| SaveError::from(BundleError::from(error)))?;
-    let mut edits = edits(live, &project);
-    let document = persistent_document(live, &project);
-    let mut outcome = project_save::save_project(root, &document, &edits.edits)?;
+    // A document that was never compiled has no trustworthy answer about the
+    // project, and writing one would empty the metadata. Nothing is written.
+    if live.pages.is_empty() {
+        return Ok(SaveOutcome {
+            written: Vec::new(),
+            unsupported: Vec::new(),
+            notes: vec![
+                "the engine's document holds no page, so it was never compiled from this \
+                 project and nothing was written"
+                    .to_owned(),
+            ],
+        });
+    }
+    let baseline = compile_baseline(&project.manifest, &project.sources);
+    let plan = Plan::new(live, &project);
+    let mut edits = edits_with(live, &project, &baseline, &plan);
+    let document = plan.persistent_document(&project);
+    // The metadata the project should hold: the authored manifest with the
+    // editor's identity and hierarchy laid over it.
+    let manifest = plan.manifest(live, &project, &removed_ids(&baseline, live));
+    let mut outcome =
+        project_save::save_project_with(root, &document, &edits.edits, Some(&manifest))?;
     outcome.unsupported.append(&mut edits.unsupported);
     outcome.notes.append(&mut edits.notes);
     Ok(outcome)
@@ -308,6 +337,19 @@ pub fn save_engine_document(root: &Path, live: &Document) -> Result<SaveOutcome,
 /// `live` is the engine's document as the user has it; `project` is the
 /// project it belongs to, read from disk.
 pub fn edits(live: &Document, project: &SourceProject) -> EngineSourceEdits {
+    let baseline = compile_baseline(&project.manifest, &project.sources);
+    let plan = Plan::new(live, project);
+    edits_with(live, project, &baseline, &plan)
+}
+
+/// The edits, given the baseline the comparison is made against and the plan
+/// that says what to do with the nodes the editor made.
+fn edits_with(
+    live: &Document,
+    project: &SourceProject,
+    baseline: &Baseline,
+    plan: &Plan,
+) -> EngineSourceEdits {
     let mut out = EngineSourceEdits::default();
 
     // A document that was never compiled has nothing to compare against, and
@@ -322,9 +364,40 @@ pub fn edits(live: &Document, project: &SourceProject) -> EngineSourceEdits {
         return out;
     }
 
-    let baseline = compile_baseline(&project.manifest, &project.sources);
-    let read = match baseline {
-        Baseline::Compiled(read) => read,
+    match baseline {
+        Baseline::Compiled(read) => {
+            let mut comparison = Comparison {
+                live,
+                base: &read.document,
+                read: Some(read),
+                project,
+                out: &mut out,
+            };
+
+            for record in &project.manifest.nodes {
+                let id = NodeId(record.id);
+                let Some(live_node) = live.node(id) else {
+                    // The node was in the project and is no longer in the document: it
+                    // has to leave the source too, or a reopen brings it back.
+                    //
+                    // Only if the source still has it. A node the *compile* would not
+                    // accept is in neither document, and taking its element out would
+                    // delete a layer the editor never had.
+                    if read.document.node(id).is_some() {
+                        comparison.removed(record);
+                    } else {
+                        comparison.report(
+                            record,
+                            "node",
+                            "the engine's model would not accept this node, so it is in neither \
+                             document and its element was left alone",
+                        );
+                    }
+                    continue;
+                };
+                comparison.compared(record, live_node);
+            }
+        }
         Baseline::Broken { unbound, reason } => {
             // The source does not compile, so there is no trustworthy answer
             // about the values it holds and nothing is compared. The nodes it
@@ -351,55 +424,26 @@ pub fn edits(live: &Document, project: &SourceProject) -> EngineSourceEdits {
                 };
                 comparison.created(record, live_node);
             }
-            return out;
         }
-    };
-
-    let mut comparison = Comparison {
-        live,
-        base: &read.document,
-        read: Some(&read),
-        project,
-        out: &mut out,
-    };
-
-    for record in &project.manifest.nodes {
-        let id = NodeId(record.id);
-        let Some(live_node) = live.node(id) else {
-            // The node was in the project and is no longer in the document: it
-            // has to leave the source too, or a reopen brings it back.
-            //
-            // Only if the source still has it. A node the *compile* would not
-            // accept is in neither document, and taking its element out would
-            // delete a layer the editor never had.
-            if read.document.node(id).is_some() {
-                comparison.removed(record);
-            } else {
-                comparison.report(
-                    record,
-                    "node",
-                    "the engine's model would not accept this node, so it is in neither \
-                     document and its element was left alone",
-                );
-            }
-            continue;
-        };
-        comparison.compared(record, live_node);
     }
 
-    // A node the engine created has no manifest record, and therefore no
-    // source binding and nowhere to be authored.
-    for id in live.ids() {
-        let Some(node) = live.node(id) else {
+    // The nodes the editor made are new content, and new content is authored
+    // rather than reported: each one gets an identity, an element and a
+    // record in the metadata.
+    out.edits.extend(plan.creates());
+
+    // A node that cannot be authored is reported, and the rest of the
+    // document is still written. One shape the editor cannot express is one
+    // shape that does not open, not a project that does not open.
+    for (label, reason) in &plan.refused {
+        let Ok(node) = SourceNodeId::new(label.clone()) else {
             continue;
         };
-        if matches!(node.kind, figcraft_doc::NodeKind::Page { .. }) {
-            continue;
-        }
-        if project.manifest.node(id).is_some() {
-            continue;
-        }
-        comparison.unbound(id);
+        out.unsupported.push(UnsupportedEdit {
+            node,
+            kind: "object",
+            reason: reason.clone(),
+        });
     }
 
     out
@@ -468,50 +512,601 @@ fn compile_baseline(manifest: &Manifest, sources: &BTreeMap<String, String>) -> 
 /// The order is the manifest's, and the kind is the manifest's: both are
 /// spelled by the metadata, and reproducing them exactly is what lets a save
 /// notice that nothing structural changed and leave `lamine.yaml` alone.
+/// The nodes the editor made come after them, because they are new.
 pub fn persistent_document(live: &Document, project: &SourceProject) -> PersistentDocument {
-    let mut nodes = Vec::new();
-    for record in &project.manifest.nodes {
-        let Some(node) = live.node(NodeId(record.id)) else {
-            continue;
-        };
-        let Some(id) = source_id(record) else {
-            continue;
-        };
-        let parent = node
-            .parent
-            .and_then(|parent| project.manifest.node(parent))
-            .and_then(source_id);
-        let children = node
-            .children
-            .iter()
-            .filter_map(|child| project.manifest.node(*child))
-            .filter_map(source_id)
-            .collect();
-        nodes.push(StructuralNode {
-            id,
-            name: if node.name.trim().is_empty() {
-                record.name.clone()
-            } else {
-                node.name.clone()
-            },
-            kind: record.kind.clone(),
-            parent,
-            children,
-            source: SourceBinding {
-                file: record.binding.file.clone(),
-                selector: record.binding.selector.clone(),
-            },
-        });
-    }
-    PersistentDocument {
-        structure: LamineStructure { nodes },
-        sources: project.document.sources.clone(),
-    }
+    Plan::new(live, project).persistent_document(project)
 }
 
 /// The editor's node id for a manifest record: the authored key.
 fn source_id(record: &NodeRecord) -> Option<SourceNodeId> {
     SourceNodeId::new(record.key.clone()).ok()
+}
+
+// ---------------------------------------------------------------------------
+// The plan: what a save does with the nodes the editor made
+// ---------------------------------------------------------------------------
+
+/// A node of the editor's document, as the save will write it.
+///
+/// One entry per node, holding everything the three things a save writes
+/// need: the edits that author the element, the structure the editor's own
+/// model holds, and the record the metadata carries. One source for all
+/// three, so they cannot disagree about a node's identity.
+#[derive(Clone, Debug)]
+struct Planned {
+    /// The engine's node.
+    id: NodeId,
+    /// The authored identity: the `data-spool-id` the element carries.
+    key: SourceNodeId,
+    /// The layer name. Unique in the project, as the metadata requires.
+    name: String,
+    /// The manifest's kind.
+    kind: String,
+    /// The engine's parent. `None` for a node on the page.
+    parent: Option<NodeId>,
+    /// The engine's children, in paint order.
+    children: Vec<NodeId>,
+    /// The file the node's element lives in.
+    file: String,
+    /// The element to author. `None` for a node the source already describes.
+    element: Option<NewElement>,
+    /// The stroke facts CSS cannot say, for a node the editor made.
+    stroke: Option<figcraft_doc::StrokeProps>,
+    /// The corner smoothing, which CSS cannot say.
+    corners: Option<figcraft_doc::Corners>,
+}
+
+/// What a save will do with the editor's document.
+///
+/// The plan is where a node the user drew stops being a problem. It is given
+/// an identity, an element and a place in the hierarchy, and the three
+/// things a save writes are all projections of it.
+#[derive(Clone, Debug, Default)]
+struct Plan {
+    /// One entry per node: the ones the source describes first, in the
+    /// order the metadata lists them, and then the ones the editor made.
+    nodes: Vec<Planned>,
+    /// The nodes that cannot be authored, with the reason.
+    refused: Vec<(String, String)>,
+}
+
+impl Plan {
+    /// The plan for a document the editor has been working on.
+    fn new(live: &Document, project: &SourceProject) -> Plan {
+        let mut plan = Plan::default();
+        // A document that was never compiled holds nothing to plan, and
+        // planning it would empty the project.
+        let Some(page) = live.current_page else {
+            return plan;
+        };
+        // The names, made unique: the metadata requires them to be, and a
+        // project with two layers called "Rectangle" does not open.
+        let names = unique_names(live, project, page);
+        // The identities already in use, so a minted one cannot collide.
+        let mut keys: BTreeSet<String> = project
+            .manifest
+            .nodes
+            .iter()
+            .map(|record| record.key.clone())
+            .collect();
+        // The nodes the editor made.
+        let mut drawn: Vec<Planned> = Vec::new();
+        let mut refused: BTreeSet<NodeId> = BTreeSet::new();
+        for id in live.subtree(page) {
+            let Some(node) = live.node(id) else {
+                continue;
+            };
+            if matches!(node.kind, figcraft_doc::NodeKind::Page { .. }) {
+                continue;
+            }
+            if project.manifest.node(id).is_some() {
+                continue;
+            }
+            if refused.contains(&id) {
+                // Its parent could not be authored, so it cannot be either:
+                // there is no element for it to live in.
+                plan.refused.push((
+                    format!("engine-{}", id.0),
+                    "its parent could not be authored, so it has nowhere to be written".to_owned(),
+                ));
+                continue;
+            }
+            match plan_drawn(live, project, id, node, &names, &mut keys) {
+                Ok(planned) => drawn.push(planned),
+                Err(reason) => {
+                    refused.insert(id);
+                    plan.refused.push((format!("engine-{}", id.0), reason));
+                }
+            }
+        }
+        // The nodes the source describes, in the order the metadata lists
+        // them: an untouched project has to project onto itself.
+        for record in &project.manifest.nodes {
+            let id = NodeId(record.id);
+            let Some(node) = live.node(id) else {
+                continue;
+            };
+            let Some(key) = source_id(record) else {
+                continue;
+            };
+            plan.nodes.push(Planned {
+                id,
+                key,
+                name: names
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| record.name.clone()),
+                kind: record.kind.clone(),
+                parent: node.parent,
+                children: node.children.clone(),
+                file: record.binding.file.clone(),
+                element: None,
+                stroke: None,
+                corners: None,
+            });
+        }
+        plan.nodes.extend(drawn);
+        // The hierarchy the metadata states is the one the plan can describe:
+        // a node that could not be authored is not in the metadata, and a
+        // parent that named it would be a manifest that does not validate.
+        let known: BTreeSet<NodeId> = plan.nodes.iter().map(|planned| planned.id).collect();
+        for planned in &mut plan.nodes {
+            planned.parent = planned.parent.filter(|parent| known.contains(parent));
+            planned.children.retain(|child| known.contains(child));
+        }
+        plan
+    }
+
+    /// The edits that author the elements of the nodes the editor made.
+    fn creates(&self) -> Vec<SourceEdit> {
+        self.nodes
+            .iter()
+            .filter_map(|planned| {
+                planned.element.as_ref().map(|element| SourceEdit::Create {
+                    node: planned.key.clone(),
+                    element: element.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// The editor's model of the project, as the save writes it.
+    fn persistent_document(&self, project: &SourceProject) -> PersistentDocument {
+        let keys: BTreeMap<NodeId, &SourceNodeId> = self
+            .nodes
+            .iter()
+            .map(|planned| (planned.id, &planned.key))
+            .collect();
+        let nodes = self
+            .nodes
+            .iter()
+            .map(|planned| StructuralNode {
+                id: planned.key.clone(),
+                name: planned.name.clone(),
+                kind: planned.kind.clone(),
+                parent: planned
+                    .parent
+                    .filter(|parent| keys.contains_key(parent))
+                    .and_then(|parent| keys.get(&parent))
+                    .map(|key| (*key).clone()),
+                children: planned
+                    .children
+                    .iter()
+                    .filter_map(|child| keys.get(child))
+                    .map(|key| (*key).clone())
+                    .collect(),
+                source: SourceBinding {
+                    file: planned.file.clone(),
+                    selector: selector_for(&planned.key),
+                },
+            })
+            .collect();
+        PersistentDocument {
+            structure: LamineStructure { nodes },
+            sources: project.document.sources.clone(),
+        }
+    }
+
+    /// The manifest the project should hold after the save.
+    ///
+    /// The authored manifest with the editor's identity and hierarchy laid
+    /// over it: every Owner B value the author wrote survives, and the nodes
+    /// the editor made get records of their own. A record whose node the
+    /// editor deleted goes, because the element it describes goes with it.
+    ///
+    /// The model id is the engine's own: the engine's node id *is* the
+    /// manifest's id, so a node the editor made keeps the identity it has
+    /// everywhere else, and the next comparison finds it where it left it.
+    fn manifest(
+        &self,
+        live: &Document,
+        project: &SourceProject,
+        removed: &BTreeSet<u64>,
+    ) -> Manifest {
+        let mut manifest = project.manifest.clone();
+        // A document that was never compiled says nothing about the project,
+        // and merging it would empty the metadata.
+        if live.current_page.is_none() {
+            return manifest;
+        }
+        manifest
+            .nodes
+            .retain(|record| !removed.contains(&record.id));
+        for planned in &self.nodes {
+            if live.node(planned.id).is_none() {
+                continue;
+            }
+            // A node on the page has no parent in the metadata: the page is
+            // not a managed node, and the manifest's `parent: None` is what
+            // says so.
+            let parent = planned
+                .parent
+                .filter(|parent| Some(*parent) != live.current_page)
+                .map(|parent| parent.0);
+            let children: Vec<u64> = planned.children.iter().map(|child| child.0).collect();
+            match manifest
+                .nodes
+                .iter_mut()
+                .find(|record| record.id == planned.id.0)
+            {
+                Some(record) => {
+                    record.key = planned.key.as_str().to_owned();
+                    record.name = planned.name.clone();
+                    record.parent = parent;
+                    record.children = children;
+                    // The binding stays as the author wrote it: the file and
+                    // the selector of a node the source describes do not
+                    // change, and the kind stays the author's too.
+                }
+                None => {
+                    manifest.nodes.push(NodeRecord {
+                        id: planned.id.0,
+                        key: planned.key.as_str().to_owned(),
+                        name: planned.name.clone(),
+                        kind: planned.kind.clone(),
+                        parent,
+                        children,
+                        binding: spool_source::manifest::SourceBinding {
+                            file: planned.file.clone(),
+                            selector: selector_for(&planned.key),
+                        },
+                        stroke: planned.stroke.clone(),
+                        corners: planned.corners,
+                        ..NodeRecord::default()
+                    });
+                }
+            }
+        }
+        manifest
+    }
+}
+
+/// The selector that finds a node's element.
+fn selector_for(key: &SourceNodeId) -> String {
+    format!("[data-spool-id=\"{}\"]", key.as_str())
+}
+
+/// The identity and the element for a node the editor made.
+fn plan_drawn(
+    live: &Document,
+    project: &SourceProject,
+    id: NodeId,
+    node: &Node,
+    names: &BTreeMap<NodeId, String>,
+    keys: &mut BTreeSet<String>,
+) -> Result<Planned, String> {
+    let kind = kind_for(node).ok_or_else(|| {
+        format!(
+            "a {} has no authored spelling this editor can write yet",
+            node.kind.type_name().to_lowercase()
+        )
+    })?;
+    let key = mint_key(id, keys)?;
+    let file = file_for(live, project, id)?;
+    let element = element_for(live, node)?;
+    Ok(Planned {
+        id,
+        key,
+        name: names.get(&id).cloned().unwrap_or_else(|| node.name.clone()),
+        kind: kind.to_owned(),
+        parent: node.parent,
+        children: node.children.clone(),
+        file,
+        element: Some(element),
+        stroke: stroke_facts(node),
+        corners: corners_facts(node),
+    })
+}
+
+/// The stroke facts CSS cannot say.
+///
+/// The weight and the colour are the CSS's — they are the `border`
+/// declaration — so this record carries only the rest: where the stroke
+/// sits, how it ends, how it varies. The weight is left at zero, because
+/// the reader takes it from the border, and a value the CSS already owns
+/// must not be written here as well.
+fn stroke_facts(node: &Node) -> Option<figcraft_doc::StrokeProps> {
+    if node.strokes.is_empty() {
+        return None;
+    }
+    let default = figcraft_doc::StrokeProps::default();
+    let mut facts = node.stroke.clone();
+    facts.weight = 0.0;
+    let mut comparable = facts.clone();
+    comparable.weight = default.weight;
+    if comparable == default {
+        None
+    } else {
+        Some(facts)
+    }
+}
+
+/// The corner smoothing, which CSS cannot say.
+///
+/// The radii are the CSS's — they are the `border-radius` declaration — so
+/// this record carries only the smoothing, with the radii left at zero.
+fn corners_facts(node: &Node) -> Option<figcraft_doc::Corners> {
+    if node.corners.smoothing == 0.0 {
+        return None;
+    }
+    Some(figcraft_doc::Corners {
+        radii: [0.0; 4],
+        smoothing: node.corners.smoothing,
+    })
+}
+
+/// The manifest's kind for a node, when the reader can compile it.
+///
+/// The kinds are the ones `spool-source`'s reader knows how to build. A kind
+/// it cannot build — a vector, a slice, a boolean operation — is refused
+/// rather than written as something else: a manifest that names a kind the
+/// reader does not have is a project that does not open.
+fn kind_for(node: &Node) -> Option<&'static str> {
+    Some(match &node.kind {
+        figcraft_doc::NodeKind::Frame => "frame",
+        figcraft_doc::NodeKind::Group => "group",
+        figcraft_doc::NodeKind::Section { .. } => "section",
+        figcraft_doc::NodeKind::Rectangle => "rectangle",
+        figcraft_doc::NodeKind::Ellipse { .. } => "ellipse",
+        figcraft_doc::NodeKind::Polygon { .. } => "polygon",
+        figcraft_doc::NodeKind::Star { .. } => "star",
+        figcraft_doc::NodeKind::Line => "line",
+        figcraft_doc::NodeKind::Text(_) => "text",
+        figcraft_doc::NodeKind::Component { .. } => "component",
+        figcraft_doc::NodeKind::ComponentSet { .. } => "componentset",
+        figcraft_doc::NodeKind::Instance { .. } => "instance",
+        _ => return None,
+    })
+}
+
+/// The identity a node the editor made is written under.
+///
+/// The engine's own id, which is opaque and never reused: "spool-node-17".
+/// An identity already in use is stepped past, so a minted one can never
+/// collide with one the author wrote.
+fn mint_key(id: NodeId, taken: &mut BTreeSet<String>) -> Result<SourceNodeId, String> {
+    let mut candidate = format!("spool-node-{}", id.0);
+    let mut suffix = 2;
+    while !taken.insert(candidate.clone()) {
+        candidate = format!("spool-node-{}-{suffix}", id.0);
+        suffix += 1;
+    }
+    SourceNodeId::new(candidate)
+        .map_err(|error| format!("the identity minted for a new node is not a legal one: {error}"))
+}
+
+/// The file a new node's element goes in.
+///
+/// The file of the nearest ancestor the source describes: a new element
+/// belongs beside the elements it is a child of, in the same file. A node on
+/// the page has no such ancestor, so it goes in the project's first markup
+/// file — where every other page-level element is.
+fn file_for(live: &Document, project: &SourceProject, id: NodeId) -> Result<String, String> {
+    let mut cursor = live.node(id).and_then(|node| node.parent);
+    while let Some(parent) = cursor {
+        if let Some(record) = project.manifest.node(parent) {
+            return Ok(record.binding.file.clone());
+        }
+        cursor = live.node(parent).and_then(|node| node.parent);
+    }
+    primary_markup_file(project)
+        .ok_or_else(|| "the project has no markup file to author the element in".to_owned())
+}
+
+/// The project's first markup file, in a stable order.
+fn primary_markup_file(project: &SourceProject) -> Option<String> {
+    let mut files: Vec<&String> = project
+        .document
+        .sources
+        .keys()
+        .filter(|file| crate::source_binding::is_markup(file))
+        .collect();
+    files.sort();
+    files.first().map(|file| (*file).clone())
+}
+
+/// The layer names the save writes, one per node.
+///
+/// The editor's names are the truth, but the metadata requires them to be
+/// unique: a project with two layers called "Rectangle" does not open. So a
+/// name that is already taken gets a number, the way the engine names a new
+/// frame.
+///
+/// The nodes the source describes keep their names as far as they can: those
+/// are the ones the author chose, and only a name that is already taken is
+/// changed.
+fn unique_names(
+    live: &Document,
+    project: &SourceProject,
+    page: NodeId,
+) -> BTreeMap<NodeId, String> {
+    let mut taken: BTreeSet<String> = BTreeSet::new();
+    let mut out = BTreeMap::new();
+    for record in &project.manifest.nodes {
+        let id = NodeId(record.id);
+        let Some(node) = live.node(id) else {
+            continue;
+        };
+        let name = if node.name.trim().is_empty() {
+            record.name.clone()
+        } else {
+            node.name.clone()
+        };
+        out.insert(id, take_name(&name, &mut taken));
+    }
+    for id in live.subtree(page) {
+        if out.contains_key(&id) {
+            continue;
+        }
+        let Some(node) = live.node(id) else {
+            continue;
+        };
+        if matches!(node.kind, figcraft_doc::NodeKind::Page { .. }) {
+            continue;
+        }
+        out.insert(id, take_name(&node.name, &mut taken));
+    }
+    out
+}
+
+/// A name no other layer has.
+fn take_name(name: &str, taken: &mut BTreeSet<String>) -> String {
+    let base = if name.trim().is_empty() {
+        "Layer"
+    } else {
+        name
+    };
+    let mut candidate = base.to_owned();
+    let mut suffix = 2;
+    while !taken.insert(candidate.clone()) {
+        candidate = format!("{base} {suffix}");
+        suffix += 1;
+    }
+    candidate
+}
+
+/// The element to author for a node the editor made.
+///
+/// The geometry and the paint are Owner A: they are authored in the
+/// element's own `style`, the way the retired runtime authored a created
+/// box. The identity and the hierarchy are Owner B and live in the
+/// metadata, not here.
+fn element_for(live: &Document, node: &Node) -> Result<NewElement, String> {
+    let mut declarations: Vec<(String, String)> = Vec::new();
+
+    // The place. A node the layout positions has no authored position: the
+    // layout computes it, and writing one would pin a box the layout owns.
+    if !position_is_layout_owned(live, node) {
+        let at = figcraft_geom::translation(node.transform);
+        declarations.push(("position".to_owned(), "absolute".to_owned()));
+        declarations.push((
+            "left".to_owned(),
+            format!("{}px", project_save::css_length(at.x as f32)),
+        ));
+        declarations.push((
+            "top".to_owned(),
+            format!("{}px", project_save::css_length(at.y as f32)),
+        ));
+    }
+    // The size, for the same reason.
+    if !size_is_layout_owned(live, node) {
+        declarations.push((
+            "width".to_owned(),
+            format!("{}px", project_save::css_length(node.width as f32)),
+        ));
+        declarations.push((
+            "height".to_owned(),
+            format!("{}px", project_save::css_length(node.height as f32)),
+        ));
+    }
+    // The fill.
+    if node.fills.len() > 1 {
+        return Err(
+            "a node with more than one fill has no CSS spelling this editor can write yet"
+                .to_owned(),
+        );
+    }
+    if let Some(paint) = node.fills.first() {
+        let Some(color) = solid(Some(paint)) else {
+            return Err(
+                "a fill that is not one solid colour has no CSS spelling this editor can write \
+                 yet"
+                .to_owned(),
+            );
+        };
+        declarations.push(("background-color".to_owned(), css_color(color)));
+    }
+    // The stroke. The weight and the colour are the CSS's; the alignment and
+    // the caps are the metadata's, and the plan carries them there.
+    if node.strokes.len() > 1 {
+        return Err(
+            "a node with more than one stroke has no CSS spelling this editor can write yet"
+                .to_owned(),
+        );
+    }
+    if let Some(paint) = node.strokes.first() {
+        let Some(color) = solid(Some(paint)) else {
+            return Err(
+                "a stroke that is not one solid colour has no CSS spelling this editor can \
+                 write yet"
+                    .to_owned(),
+            );
+        };
+        declarations.push((
+            "border".to_owned(),
+            format!(
+                "{}px solid {}",
+                project_save::css_length(node.stroke.weight as f32),
+                css_color(color)
+            ),
+        ));
+    }
+    // The corner radii.
+    if node.corners.radii != [0.0; 4] {
+        declarations.push(("border-radius".to_owned(), radii_value(node.corners.radii)));
+    }
+    // The opacity.
+    if (node.opacity as f64 - 1.0).abs() > OPACITY_EPSILON {
+        declarations.push(("opacity".to_owned(), project_save::css_length(node.opacity)));
+    }
+    // The text, and the two properties the reader needs to compile it.
+    let mut text = None;
+    if let Some(data) = node.kind.text() {
+        text = Some(data.characters.clone()).filter(|text| !text.is_empty());
+        declarations.push((
+            "font-size".to_owned(),
+            format!(
+                "{}px",
+                project_save::css_length(data.style.font_size as f32)
+            ),
+        ));
+        if let Some(color) = text_color(data) {
+            declarations.push(("color".to_owned(), css_color(color)));
+        }
+    }
+
+    Ok(NewElement {
+        tag: "div".to_owned(),
+        text,
+        declarations,
+    })
+}
+
+/// The records whose nodes the editor deleted.
+///
+/// A node the editor removed has to leave the metadata as well as the source:
+/// a record that names an element which is no longer there is a project that
+/// does not open. A node the source does not have is left alone, because its
+/// element is still there.
+fn removed_ids(baseline: &Baseline, live: &Document) -> BTreeSet<u64> {
+    let Baseline::Compiled(read) = baseline else {
+        return BTreeSet::new();
+    };
+    read.document
+        .ids()
+        .filter(|id| live.node(*id).is_none())
+        .map(|id| id.0)
+        .collect()
 }
 
 /// The comparison of one project, between the engine's document and the
@@ -541,32 +1136,6 @@ impl Comparison<'_> {
         self.out.edits.push(SourceEdit::Remove {
             node: id,
             file: record.binding.file.clone(),
-        });
-    }
-
-    /// A node the engine created, which the manifest does not describe.
-    ///
-    /// Reported, not invented: without a manifest record there is no key, no
-    /// file and no selector, and a save that guessed them would put an element
-    /// in the source that nothing binds to.
-    fn unbound(&mut self, id: NodeId) {
-        let label = format!("engine-{}", id.0);
-        let node = match SourceNodeId::new(label) {
-            Ok(node) => node,
-            Err(error) => {
-                self.out.notes.push(format!(
-                    "the engine's node {} could not be reported: {error}",
-                    id.0
-                ));
-                return;
-            }
-        };
-        self.out.unsupported.push(UnsupportedEdit {
-            node,
-            kind: "object",
-            reason: "not in lamine.yaml, so it has no source binding and nowhere to be \
-                     authored"
-                .to_owned(),
         });
     }
 
@@ -779,7 +1348,7 @@ impl Comparison<'_> {
         let id = NodeId(record.id);
         let mut width = None;
         let mut height = None;
-        if !self.size_is_layout_owned(live_node) {
+        if !size_is_layout_owned(self.live, live_node) {
             if self.source_owns(id, "width")
                 && (live_node.width - base_node.width).abs() > LENGTH_EPSILON
             {
@@ -793,7 +1362,7 @@ impl Comparison<'_> {
         }
 
         let mut placement = None;
-        if !self.position_is_layout_owned(live_node) {
+        if !position_is_layout_owned(self.live, live_node) {
             let live_at = figcraft_geom::translation(live_node.transform);
             let base_at = figcraft_geom::translation(base_node.transform);
             let dx = live_at.x - base_at.x;
@@ -1074,32 +1643,6 @@ impl Comparison<'_> {
         );
     }
 
-    /// Whether the layout, rather than the source, decides this node's size.
-    fn size_is_layout_owned(&self, node: &Node) -> bool {
-        if node.child_layout.sizing_h != Sizing::Fixed
-            || node.child_layout.sizing_v != Sizing::Fixed
-        {
-            // A node that hugs or fills gets its size from the layout.
-            return true;
-        }
-        self.in_auto_layout_flow(node)
-    }
-
-    /// Whether the layout, rather than the source, decides this node's place.
-    fn position_is_layout_owned(&self, node: &Node) -> bool {
-        self.in_auto_layout_flow(node)
-    }
-
-    /// Whether the node is placed by an auto-layout frame.
-    fn in_auto_layout_flow(&self, node: &Node) -> bool {
-        if node.child_layout.absolute {
-            return false;
-        }
-        node.parent
-            .and_then(|parent| self.live.node(parent))
-            .is_some_and(|parent| parent.layout.is_some() && parent.kind.is_frame_like())
-    }
-
     /// One style edit.
     fn style(&mut self, key: &SourceNodeId, property: &str, value: &str) {
         self.out.edits.push(SourceEdit::Style {
@@ -1108,6 +1651,34 @@ impl Comparison<'_> {
             value: value.to_owned(),
         });
     }
+}
+
+/// Whether the layout, rather than the source, decides a node's size.
+///
+/// A node that hugs or fills gets its size from the layout, and so does a
+/// node the layout places: the layout computes it and the source never said
+/// it.
+fn size_is_layout_owned(live: &Document, node: &Node) -> bool {
+    if node.child_layout.sizing_h != Sizing::Fixed || node.child_layout.sizing_v != Sizing::Fixed {
+        // A node that hugs or fills gets its size from the layout.
+        return true;
+    }
+    in_auto_layout_flow(live, node)
+}
+
+/// Whether the layout, rather than the source, decides a node's place.
+fn position_is_layout_owned(live: &Document, node: &Node) -> bool {
+    in_auto_layout_flow(live, node)
+}
+
+/// Whether the node is placed by an auto-layout frame.
+fn in_auto_layout_flow(live: &Document, node: &Node) -> bool {
+    if node.child_layout.absolute {
+        return false;
+    }
+    node.parent
+        .and_then(|parent| live.node(parent))
+        .is_some_and(|parent| parent.layout.is_some() && parent.kind.is_frame_like())
 }
 
 /// The solid colour of a paint, if it is one.
@@ -1424,7 +1995,147 @@ mod tests {
     }
 
     #[test]
-    fn a_node_the_engine_created_is_reported_rather_than_invented() {
+    fn a_drawn_shape_survives_a_save_and_a_reopen_in_a_version_one_project() {
+        // The same round trip for the other metadata format. A version 1 file
+        // is written from the editor's own structure, so the shape needs a
+        // record there too.
+        let root = scratch("landing");
+        let (project, mut document) = project_and_document(&root);
+        let frame = engine_id(&project, "spool-frame-root");
+        let created = document
+            .create(
+                frame,
+                NodeKind::Rectangle,
+                "Rectangle 1",
+                10.0,
+                20.0,
+                120.0,
+                60.0,
+            )
+            .expect("the engine creates the node");
+
+        let outcome = save_engine_document(&root, &document).expect("the save succeeds");
+        assert!(outcome.unsupported.is_empty(), "{:?}", outcome.unsupported);
+
+        let yaml = std::fs::read_to_string(root.join("lamine.yaml")).expect("lamine.yaml");
+        assert!(
+            yaml.contains(&format!("spool-node-{}", created.0)),
+            "the shape has a record: {yaml}"
+        );
+        assert!(
+            yaml.starts_with("version: 1"),
+            "and it is still a version 1 file"
+        );
+
+        let reopened = read_project(&root).expect("the project reads again");
+        let read = reader::read_with_diagnostics(&reopened.manifest, &reopened.sources)
+            .expect("the saved source compiles");
+        let node = read
+            .document
+            .node(created)
+            .expect("the shape is in the reopened document");
+        assert_eq!(node.name, "Rectangle 1");
+        assert_eq!(node.width, 120.0);
+        assert_eq!(node.height, 60.0);
+        assert_eq!(node.parent, Some(frame));
+    }
+
+    #[test]
+    fn a_drawn_text_node_keeps_its_words() {
+        // The words are the element's own text, and the size and the colour
+        // are the two properties the reader needs to compile the text.
+        let root = scratch("cascade");
+        let (project, mut document) = project_and_document(&root);
+        let hero = engine_id(&project, "spool-frame-hero");
+        let created = document
+            .create(
+                hero,
+                NodeKind::Text(figcraft_doc::TextData::default()),
+                "Text 1",
+                10.0,
+                20.0,
+                100.0,
+                20.0,
+            )
+            .expect("the engine creates the node");
+        if let Some(text) = document
+            .node_mut(created)
+            .expect("the node is there")
+            .kind
+            .text_mut()
+        {
+            text.characters = "Hello".to_owned();
+        }
+
+        let outcome = save_engine_document(&root, &document).expect("the save succeeds");
+        assert!(outcome.unsupported.is_empty(), "{:?}", outcome.unsupported);
+
+        let html = std::fs::read_to_string(root.join("index.html")).expect("index.html");
+        assert!(
+            html.contains(">Hello</div>"),
+            "the words are authored: {html}"
+        );
+
+        let reopened = read_project(&root).expect("the project reads again");
+        let read = reader::read_with_diagnostics(&reopened.manifest, &reopened.sources)
+            .expect("the saved source compiles");
+        let node = read
+            .document
+            .node(created)
+            .expect("the text is in the reopened document");
+        let text = node.kind.text().expect("it is a text node");
+        assert_eq!(text.characters, "Hello");
+    }
+
+    #[test]
+    fn the_metadata_is_edited_and_not_rewritten() {
+        // The author's own file is edited, not rewritten: the comment the
+        // project carries about itself stays, and only the record that
+        // changed is written out again.
+        let root = scratch("cascade");
+        let (project, mut document) = project_and_document(&root);
+        let hero = engine_id(&project, "spool-frame-hero");
+        document
+            .create(
+                hero,
+                NodeKind::Rectangle,
+                "Rectangle 1",
+                0.0,
+                0.0,
+                10.0,
+                10.0,
+            )
+            .expect("the engine creates the node");
+
+        let outcome = save_engine_document(&root, &document).expect("the save succeeds");
+        assert!(outcome.unsupported.is_empty(), "{:?}", outcome.unsupported);
+        assert!(
+            outcome.notes.is_empty(),
+            "the metadata was edited, not re-encoded: {:?}",
+            outcome.notes
+        );
+
+        let yaml = std::fs::read_to_string(root.join("lamine.yaml")).expect("lamine.yaml");
+        assert!(
+            yaml.contains("# This fixture exists to make one CSS bug VISIBLE"),
+            "the project's own comment survives: {yaml}"
+        );
+        assert!(
+            yaml.contains("# Equal specificity in both sheets, so link order decides."),
+            "and so does the one between two records: {yaml}"
+        );
+        assert!(
+            yaml.contains("color_profile: srgb"),
+            "and the document-level fact: {yaml}"
+        );
+    }
+
+    #[test]
+    fn a_node_the_engine_created_is_authored_rather_than_reported() {
+        // The bug this whole change exists for: a shape the user drew has no
+        // source binding, and a save that had nowhere to put it left the
+        // project byte-identical. It is new content, so it is authored: an
+        // element in the markup and a record in the metadata.
         let root = scratch("cascade");
         let (project, mut document) = project_and_document(&root);
         // A node the engine made for itself: a fresh id above every id the
@@ -1446,17 +2157,345 @@ mod tests {
         );
 
         let edits = edits(&document, &project);
+        let creates: Vec<&SourceEdit> = edits
+            .edits
+            .iter()
+            .filter(|edit| matches!(edit, SourceEdit::Create { .. }))
+            .collect();
+        assert_eq!(creates.len(), 1, "{:?}", edits.edits);
+        match creates[0] {
+            SourceEdit::Create { node, element } => {
+                assert_eq!(
+                    node.as_str(),
+                    format!("spool-node-{}", created.0),
+                    "the node is written under an identity of its own"
+                );
+                assert_eq!(element.tag, "div");
+                let width = element
+                    .declarations
+                    .iter()
+                    .find(|(property, _)| property == "width")
+                    .map(|(_, value)| value.clone());
+                assert_eq!(width.as_deref(), Some("20px"), "{:?}", element);
+            }
+            other => panic!("expected a creation, got {other:?}"),
+        }
         assert!(
-            edits.edits.is_empty(),
-            "a node with nowhere to go produces no edit: {:?}",
-            edits.edits
+            edits.unsupported.is_empty(),
+            "a node that can be authored is not reported: {:?}",
+            edits.unsupported
         );
-        assert_eq!(edits.unsupported.len(), 1, "{:?}", edits.unsupported);
-        assert_eq!(edits.unsupported[0].kind, "object");
+    }
+
+    // ── The round trip that matters ──────────────────────────────────────
+    //
+    // A shape the user drew has to come back after a save: the same size,
+    // the same colour, the same name, in the same place in the hierarchy.
+    // These are the cases the whole change exists for.
+
+    /// The colour a node paints with.
+    fn fill_of(node: &Node) -> Option<Color> {
+        solid(node.fills.first())
+    }
+
+    #[test]
+    fn a_drawn_shape_survives_a_save_and_a_reopen() {
+        let root = scratch("cascade");
+        let (project, mut document) = project_and_document(&root);
+        let hero = engine_id(&project, "spool-frame-hero");
+        let created = document
+            .create(
+                hero,
+                NodeKind::Rectangle,
+                "Rectangle 1",
+                10.0,
+                20.0,
+                120.0,
+                60.0,
+            )
+            .expect("the engine creates the node");
+        document.node_mut(created).expect("the node is there").fills =
+            vec![Paint::solid(Color::from_rgb8_const(0x33, 0x66, 0x99))];
+
+        let outcome = save_engine_document(&root, &document).expect("the save succeeds");
+        assert!(outcome.unsupported.is_empty(), "{:?}", outcome.unsupported);
+
+        // The markup carries the element, with the identity the metadata
+        // binds to.
+        let key = format!("spool-node-{}", created.0);
+        let html = std::fs::read_to_string(root.join("index.html")).expect("index.html");
         assert!(
-            edits.unsupported[0].reason.contains("no source binding"),
+            html.contains(&format!("data-spool-id=\"{key}\"")),
+            "the shape has an element: {html}"
+        );
+        assert!(
+            html.contains("width: 120px"),
+            "the size is authored, not guessed: {html}"
+        );
+        assert!(
+            html.contains("background-color: #336699"),
+            "the fill is authored, not guessed: {html}"
+        );
+
+        // The metadata carries the record.
+        let yaml = std::fs::read_to_string(root.join("lamine.yaml")).expect("lamine.yaml");
+        assert!(yaml.contains(&key), "the shape has a record: {yaml}");
+
+        // And the project opens again with the shape in it, exactly as it was.
+        let reopened = read_project(&root).expect("the project reads again");
+        let read = reader::read_with_diagnostics(&reopened.manifest, &reopened.sources)
+            .expect("the saved source compiles");
+        let node = read
+            .document
+            .node(created)
+            .expect("the shape is in the reopened document");
+        assert_eq!(node.name, "Rectangle 1", "the name survives");
+        assert_eq!(node.width, 120.0, "the width survives");
+        assert_eq!(node.height, 60.0, "the height survives");
+        assert_eq!(
+            fill_of(node),
+            Some(Color::from_rgb8_const(0x33, 0x66, 0x99)),
+            "the fill survives"
+        );
+        assert_eq!(
+            node.parent,
+            Some(hero),
+            "it is a child of the frame it was drawn in"
+        );
+        let frame = read.document.node(hero).expect("the frame is there");
+        assert!(
+            frame.children.contains(&created),
+            "and the frame lists it, so the paint order is stated: {:?}",
+            frame.children
+        );
+    }
+
+    #[test]
+    fn the_saved_project_opens_again_with_the_shape_in_it() {
+        // The whole project, opened the way the editor opens it: the saved
+        // HTML is well-formed, the saved CSS compiles, and the shape is one
+        // of the layers the editor draws.
+        let root = scratch("cascade");
+        let (project, mut document) = project_and_document(&root);
+        let hero = engine_id(&project, "spool-frame-hero");
+        let created = document
+            .create(
+                hero,
+                NodeKind::Rectangle,
+                "Rectangle 1",
+                10.0,
+                20.0,
+                120.0,
+                60.0,
+            )
+            .expect("the engine creates the node");
+
+        save_engine_document(&root, &document).expect("the save succeeds");
+
+        let opened = crate::project_open::open_project(&root).expect("the saved project opens");
+        assert!(opened.unrendered.is_empty(), "{:?}", opened.unrendered);
+        let node = opened
+            .engine
+            .document
+            .node(created)
+            .expect("the shape is in the engine's document");
+        assert_eq!(node.name, "Rectangle 1");
+        assert_eq!(node.width, 120.0);
+        assert_eq!(node.height, 60.0);
+        assert_eq!(node.parent, Some(hero));
+    }
+
+    #[test]
+    fn a_second_save_after_a_drawn_shape_writes_nothing() {
+        // The save has to converge: the shape that was written back is the
+        // shape the source now says, so the next comparison finds nothing to
+        // change and the project does not grow on every save.
+        let root = scratch("cascade");
+        let (project, mut document) = project_and_document(&root);
+        let hero = engine_id(&project, "spool-frame-hero");
+        document
+            .create(
+                hero,
+                NodeKind::Rectangle,
+                "Rectangle 1",
+                10.0,
+                20.0,
+                120.0,
+                60.0,
+            )
+            .expect("the engine creates the node");
+
+        save_engine_document(&root, &document).expect("the first save succeeds");
+        let outcome = save_engine_document(&root, &document).expect("the second save succeeds");
+        assert!(
+            outcome.written.is_empty(),
+            "nothing changed, so nothing was written: {:?}",
+            outcome.written
+        );
+    }
+
+    #[test]
+    fn one_node_that_cannot_be_authored_does_not_stop_the_rest_of_the_document() {
+        // A vector has no HTML spelling this editor can write yet. It is
+        // reported — and everything else in the document is still written.
+        let root = scratch("cascade");
+        let (project, mut document) = project_and_document(&root);
+        let hero = engine_id(&project, "spool-frame-hero");
+        let vector = document
+            .create(
+                hero,
+                NodeKind::Vector {
+                    network: figcraft_doc::VectorNetwork::default(),
+                },
+                "Vector 1",
+                0.0,
+                0.0,
+                10.0,
+                10.0,
+            )
+            .expect("the engine creates the node");
+        let shape = document
+            .create(
+                hero,
+                NodeKind::Rectangle,
+                "Rectangle 1",
+                0.0,
+                0.0,
+                10.0,
+                10.0,
+            )
+            .expect("the engine creates the node");
+
+        let outcome = save_engine_document(&root, &document).expect("the save succeeds");
+        assert_eq!(outcome.unsupported.len(), 1, "{:?}", outcome.unsupported);
+        assert!(
+            outcome.unsupported[0].reason.contains("vector"),
             "{}",
-            edits.unsupported[0].reason
+            outcome.unsupported[0].reason
+        );
+
+        // The shape the editor could express is in the source, and the one
+        // it could not is not.
+        let html = std::fs::read_to_string(root.join("index.html")).expect("index.html");
+        assert!(
+            html.contains(&format!("data-spool-id=\"spool-node-{}\"", shape.0)),
+            "the shape that can be authored is written: {html}"
+        );
+        assert!(
+            !html.contains(&format!("data-spool-id=\"spool-node-{}\"", vector.0)),
+            "the one that cannot is not: {html}"
+        );
+    }
+
+    #[test]
+    fn an_edited_authored_node_and_a_drawn_one_are_both_saved() {
+        // The change to a node the source describes is still written the way
+        // it always was — in the declaration that won the cascade — and the
+        // shape the user drew is written beside it.
+        let root = scratch("cascade");
+        let (project, mut document) = project_and_document(&root);
+        let hero = engine_id(&project, "spool-frame-hero");
+        document.node_mut(hero).expect("the hero is there").fills =
+            vec![Paint::solid(Color::from_rgb8_const(0x00, 0x66, 0x33))];
+        let created = document
+            .create(
+                hero,
+                NodeKind::Rectangle,
+                "Rectangle 1",
+                0.0,
+                0.0,
+                10.0,
+                10.0,
+            )
+            .expect("the engine creates the node");
+
+        let outcome = save_engine_document(&root, &document).expect("the save succeeds");
+        assert!(outcome.unsupported.is_empty(), "{:?}", outcome.unsupported);
+
+        let base = std::fs::read_to_string(root.join("base.css")).expect("base.css");
+        assert!(
+            base.contains("background: #006633;"),
+            "the authored declaration was rewritten: {base}"
+        );
+        let html = std::fs::read_to_string(root.join("index.html")).expect("index.html");
+        assert!(
+            html.contains(&format!("data-spool-id=\"spool-node-{}\"", created.0)),
+            "and the shape the user drew is in the source: {html}"
+        );
+    }
+
+    #[test]
+    fn a_drawn_line_keeps_the_stroke_facts_css_cannot_say() {
+        // The weight and the colour are the CSS's; where the stroke sits is
+        // the metadata's, and a line's stroke is centred on its path.
+        let root = scratch("cascade");
+        let (project, mut document) = project_and_document(&root);
+        let hero = engine_id(&project, "spool-frame-hero");
+        let created = document
+            .create(hero, NodeKind::Line, "Line 1", 10.0, 20.0, 100.0, 0.0)
+            .expect("the engine creates the node");
+
+        let outcome = save_engine_document(&root, &document).expect("the save succeeds");
+        assert!(outcome.unsupported.is_empty(), "{:?}", outcome.unsupported);
+
+        let html = std::fs::read_to_string(root.join("index.html")).expect("index.html");
+        assert!(
+            html.contains("border: 1px solid #000000"),
+            "the stroke's weight and colour are authored: {html}"
+        );
+        let yaml = std::fs::read_to_string(root.join("lamine.yaml")).expect("lamine.yaml");
+        assert!(
+            yaml.contains("align: center"),
+            "where the stroke sits is the metadata's: {yaml}"
+        );
+
+        let reopened = read_project(&root).expect("the project reads again");
+        let read = reader::read_with_diagnostics(&reopened.manifest, &reopened.sources)
+            .expect("the saved source compiles");
+        let node = read
+            .document
+            .node(created)
+            .expect("the line is in the reopened document");
+        assert_eq!(node.stroke.weight, 1.0, "the weight comes from the border");
+        assert_eq!(
+            node.stroke.align,
+            figcraft_doc::StrokeAlign::Center,
+            "and the alignment comes from the metadata"
+        );
+    }
+
+    #[test]
+    fn two_shapes_with_the_same_name_are_both_saved() {
+        // two layers called "Rectangle" does not open — so the second one is
+        // given a number rather than the save failing.
+        let root = scratch("cascade");
+        let (project, mut document) = project_and_document(&root);
+        let hero = engine_id(&project, "spool-frame-hero");
+        let first = document
+            .create(hero, NodeKind::Rectangle, "Rectangle", 0.0, 0.0, 10.0, 10.0)
+            .expect("the engine creates the node");
+        let second = document
+            .create(hero, NodeKind::Rectangle, "Rectangle", 0.0, 0.0, 10.0, 10.0)
+            .expect("the engine creates the node");
+
+        let outcome = save_engine_document(&root, &document).expect("the save succeeds");
+        assert!(outcome.unsupported.is_empty(), "{:?}", outcome.unsupported);
+
+        let reopened = read_project(&root).expect("the project reads again");
+        let read = reader::read_with_diagnostics(&reopened.manifest, &reopened.sources)
+            .expect("the saved source compiles");
+        let names: Vec<String> = [first, second]
+            .iter()
+            .map(|id| {
+                read.document
+                    .node(*id)
+                    .map(|node| node.name.clone())
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec!["Rectangle".to_owned(), "Rectangle 2".to_owned()]
         );
     }
 

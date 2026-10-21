@@ -245,6 +245,130 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// One record's place in a metadata file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RecordSpan {
+    /// The byte offset the record starts at.
+    start: usize,
+    /// The byte offset just after the record's last line.
+    end: usize,
+    /// The indentation the record's `- ` is written at.
+    indent: String,
+}
+
+/// The `nodes:` sequence of a metadata file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NodesSequence {
+    /// Each record's span, in the order the file lists them.
+    records: Vec<RecordSpan>,
+    /// The byte offset just after the last record.
+    end: usize,
+    /// The indentation the records are written at.
+    indent: String,
+}
+
+/// The `nodes:` sequence of a metadata file, and where each record in it is.
+///
+/// Line-based, because that is what the file is: a block sequence of
+/// records, one `- id:` each, with the keys of a record indented under it.
+/// A file that is not shaped like that is refused rather than guessed at.
+///
+/// The gap between two records — a blank line, a comment — belongs to
+/// neither of them, so a record that is rewritten does not take the
+/// author's comment about the next one with it.
+fn nodes_sequence(text: &str) -> Option<NodesSequence> {
+    let mut records: Vec<RecordSpan> = Vec::new();
+    let mut item_indent: Option<String> = None;
+    let mut offset = 0usize;
+    let mut in_sequence = false;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\n', '\r']);
+        let content = trimmed.trim_start();
+        let indent = trimmed[..trimmed.len() - content.len()].to_owned();
+        let body = content.trim_end();
+        if !in_sequence {
+            if body == "nodes:" || body.starts_with("nodes: #") {
+                in_sequence = true;
+            }
+            offset += line.len();
+            continue;
+        }
+        // Inside the sequence: a blank line or a comment is the gap between
+        // two records.
+        if body.is_empty() || body.starts_with('#') {
+            offset += line.len();
+            continue;
+        }
+        let is_item = body == "-" || body.starts_with("- ");
+        match &item_indent {
+            None => {
+                // The first record sets the indentation the sequence is
+                // written at.
+                if !is_item {
+                    break;
+                }
+                item_indent = Some(indent.clone());
+                records.push(RecordSpan {
+                    start: offset,
+                    end: offset + line.len(),
+                    indent: indent.clone(),
+                });
+            }
+            Some(current) => {
+                if is_item && indent.len() == current.len() {
+                    records.push(RecordSpan {
+                        start: offset,
+                        end: offset + line.len(),
+                        indent: indent.clone(),
+                    });
+                } else if indent.len() > current.len() {
+                    // A key of the record above, or a sequence inside it.
+                    if let Some(record) = records.last_mut() {
+                        record.end = offset + line.len();
+                    }
+                } else {
+                    // Anything else ends the sequence.
+                    break;
+                }
+            }
+        }
+        offset += line.len();
+    }
+    if !in_sequence {
+        return None;
+    }
+    let indent = item_indent.unwrap_or_else(|| "  ".to_owned());
+    let end = records.last().map(|record| record.end).unwrap_or(offset);
+    Some(NodesSequence {
+        records,
+        end,
+        indent,
+    })
+}
+
+/// A record as the file writes it.
+///
+/// The YAML the schema's own writer produces, at the file's own
+/// indentation: a record is a mapping, so its keys sit two spaces in from
+/// the `- ` that introduces it.
+fn encode_record(record: &NodeRecord, indent: &str) -> Result<String, ManifestError> {
+    let yaml =
+        noyalib_serde_yaml::to_string(record).map_err(|e| ManifestError::Yaml(e.to_string()))?;
+    let key_indent = format!("{indent}  ");
+    let mut out = String::new();
+    for (index, line) in yaml.lines().enumerate() {
+        if index == 0 {
+            out.push_str(indent);
+            out.push_str("- ");
+        } else {
+            out.push_str(&key_indent);
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
 /// Whether the engine's model lets this kind hold children.
 ///
 /// Mirrors `figcraft_doc::NodeKind::is_container`. Keep the two in step: a kind
@@ -253,9 +377,22 @@ fn is_false(b: &bool) -> bool {
 pub fn is_container_kind(kind: &str) -> bool {
     matches!(
         kind,
-        "page" | "Page" | "frame" | "Frame" | "group" | "Group" | "section" | "Section"
-            | "booleanOp" | "BooleanOp" | "component" | "Component" | "componentSet"
-            | "ComponentSet" | "instance" | "Instance"
+        "page"
+            | "Page"
+            | "frame"
+            | "Frame"
+            | "group"
+            | "Group"
+            | "section"
+            | "Section"
+            | "booleanOp"
+            | "BooleanOp"
+            | "component"
+            | "Component"
+            | "componentSet"
+            | "ComponentSet"
+            | "instance"
+            | "Instance"
     )
 }
 
@@ -352,6 +489,78 @@ impl Manifest {
             }
             found => Err(ManifestError::Version { found }),
         }
+    }
+
+    /// Merge a changed manifest into the file it was read from.
+    ///
+    /// The file is **edited**, not rewritten: a record that did not change
+    /// keeps the author's own bytes — its comments, its quoting, its
+    /// indentation — and only the records that did change are written out
+    /// again. A file that is not shaped like a sequence of records is refused
+    /// rather than guessed at, so a caller can write the whole thing again
+    /// instead of corrupting it.
+    ///
+    /// The result is checked before it is returned: it has to parse back into
+    /// the manifest that was asked for, or the merge is refused. A merge that
+    /// quietly produced a different file would be worse than no merge.
+    pub fn merge_into(text: &str, merged: &Self) -> Result<String, ManifestError> {
+        let authored = Self::from_yaml(text)?;
+        let Some(sequence) = nodes_sequence(text) else {
+            return Err(ManifestError::Yaml(
+                "the metadata file has no `nodes:` sequence to merge into".into(),
+            ));
+        };
+        // The file's records and the manifest's are the same records in the
+        // same order: the manifest was parsed out of the file.
+        if sequence.records.len() != authored.nodes.len() {
+            return Err(ManifestError::Yaml(
+                "the metadata file's records and the manifest's do not line up".into(),
+            ));
+        }
+
+        let mut out = String::new();
+        let mut cursor = 0usize;
+        for (span, record) in sequence.records.iter().zip(&authored.nodes) {
+            let replacement = match merged.node_by_key(&record.key) {
+                // The record is gone: take it out with its own lines.
+                None => Some(String::new()),
+                // The record did not change: the author's bytes are the
+                // best ones there are.
+                Some(new) if new == record => None,
+                Some(new) => Some(encode_record(new, &span.indent)?),
+            };
+            let Some(replacement) = replacement else {
+                continue;
+            };
+            out.push_str(&text[cursor..span.start]);
+            out.push_str(&replacement);
+            cursor = span.end;
+        }
+
+        // The records that are new go at the end of the sequence, where a
+        // record added to the project belongs.
+        let added: Vec<&NodeRecord> = merged
+            .nodes
+            .iter()
+            .filter(|record| authored.node_by_key(&record.key).is_none())
+            .collect();
+        if !added.is_empty() {
+            out.push_str(&text[cursor..sequence.end]);
+            cursor = sequence.end;
+            for record in added {
+                out.push_str(&encode_record(record, &sequence.indent)?);
+            }
+        }
+        out.push_str(&text[cursor..]);
+
+        // The merged file has to say what it was meant to say.
+        let back = Self::from_yaml(&out)?;
+        if &back != merged {
+            return Err(ManifestError::Yaml(
+                "the merged metadata does not say what it was meant to say".into(),
+            ));
+        }
+        Ok(out)
     }
 
     /// Upgrade a version 1 manifest by allocating model ids in document order.
@@ -724,5 +933,113 @@ nodes:
         assert_eq!(back, m);
         assert!(back.nodes[1].locked);
         assert_eq!(back.nodes[1].mask_type, Some(MaskType::Luminance));
+    }
+
+    /// A metadata file, written the way a person writes one.
+    const AUTHORED: &str = r#"version: 2
+# A comment the author wrote about the project.
+nodes:
+  - id: 1
+    key: root
+    name: Root
+    kind: frame
+    children:
+      - 2
+    binding:
+      file: index.html
+      selector: "[data-spool-id=\"root\"]"
+
+  # A comment about the second record.
+  - id: 2
+    key: child
+    name: Child
+    kind: frame
+    parent: 1
+    binding:
+      file: index.html
+      selector: "[data-spool-id=\"child\"]"
+
+color_profile: srgb
+"#;
+
+    #[test]
+    fn a_merge_leaves_the_authors_bytes_alone() {
+        // The file is edited, not rewritten: the comment the author wrote
+        // stays, and only the record that changed is written out again.
+        let mut merged = Manifest::from_yaml(AUTHORED).expect("the file parses");
+        merged.nodes[0].children.push(3);
+        merged.nodes.push(NodeRecord {
+            id: 3,
+            key: "new".to_owned(),
+            name: "New".to_owned(),
+            kind: "rectangle".to_owned(),
+            parent: Some(1),
+            children: Vec::new(),
+            binding: SourceBinding {
+                file: "index.html".to_owned(),
+                selector: "[data-spool-id=\"new\"]".to_owned(),
+            },
+            ..NodeRecord::default()
+        });
+
+        let out = Manifest::merge_into(AUTHORED, &merged).expect("the file merges");
+        assert!(
+            out.contains("# A comment the author wrote about the project."),
+            "the header comment survives: {out}"
+        );
+        assert!(
+            out.contains("# A comment about the second record."),
+            "and so does the one between two records: {out}"
+        );
+        assert!(
+            out.contains("  - id: 2\n    key: child\n"),
+            "and the record that did not change keeps its own bytes: {out}"
+        );
+        assert!(
+            out.contains("key: new"),
+            "and the new record is there: {out}"
+        );
+        assert!(
+            out.contains("color_profile: srgb"),
+            "and so does the document-level fact: {out}"
+        );
+        assert_eq!(
+            Manifest::from_yaml(&out).expect("the merged file parses"),
+            merged,
+            "the merged file says what it was meant to say"
+        );
+    }
+
+    #[test]
+    fn a_merge_of_an_unchanged_manifest_is_the_same_file() {
+        let manifest = Manifest::from_yaml(AUTHORED).expect("the file parses");
+        let out = Manifest::merge_into(AUTHORED, &manifest).expect("the file merges");
+        assert_eq!(out, AUTHORED, "nothing changed, so nothing moved");
+    }
+
+    #[test]
+    fn a_removed_record_is_taken_out_with_its_own_lines() {
+        let mut merged = Manifest::from_yaml(AUTHORED).expect("the file parses");
+        merged.nodes.remove(1);
+        merged.nodes[0].children.clear();
+
+        let out = Manifest::merge_into(AUTHORED, &merged).expect("the file merges");
+        assert!(!out.contains("key: child"), "the record is gone: {out}");
+        assert!(
+            out.contains("# A comment the author wrote about the project."),
+            "and the author's own text is still there: {out}"
+        );
+        assert_eq!(
+            Manifest::from_yaml(&out).expect("the merged file parses"),
+            merged
+        );
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_sequence_of_records_is_refused() {
+        // Rather than guessed at: a file this shape cannot be merged into
+        // has to be written out again, not edited.
+        let text = "version: 2\nnodes: []\n";
+        assert!(Manifest::merge_into(text, &Manifest::default()).is_err());
     }
 }
