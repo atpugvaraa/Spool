@@ -1252,7 +1252,7 @@ mod tests {
     fn open_layer(
         cx: &mut TestAppContext,
         session: Rc<RefCell<Session>>,
-    ) -> (Entity<LayerView>, &mut VisualTestContext) {
+    ) -> (Rc<RefCell<GuideState>>, &mut VisualTestContext) {
         let state = Rc::new(RefCell::new(GuideState::default()));
         let (view, window) = cx.add_window_view({
             let session = session.clone();
@@ -1265,13 +1265,13 @@ mod tests {
             |_, _| view.clone().into_any_element(),
         );
         window.run_until_parked();
-        (view, window)
+        (state, window)
     }
 
     #[gpui::test]
     fn the_layer_is_drawn_in_the_window(cx: &mut TestAppContext) {
         let (session, _page) = session_with_a_page();
-        let (_view, window) = open_layer(cx, session);
+        let (state, window) = open_layer(cx, session);
         let bounds = window
             .debug_bounds("guides-layer")
             .expect("the guides layer is laid out");
@@ -1280,12 +1280,17 @@ mod tests {
             WINDOW,
             "the layer fills the window it is drawn in"
         );
+        assert_eq!(
+            state.borrow().viewport,
+            Viewport::new(bounds),
+            "and it knows where the canvas is, so it can draw on it"
+        );
     }
 
     #[gpui::test]
     fn a_drag_out_of_the_ruler_makes_a_guide(cx: &mut TestAppContext) {
         let (session, page) = session_with_a_page();
-        let (_view, window) = open_layer(cx, session.clone());
+        let (_state, window) = open_layer(cx, session.clone());
         // A press in the left ruler, a drag onto the canvas, and a release.
         // The pointer lands at page x 200: the page's origin is at the
         // window's centre, which is 600 to the right of the left ruler.
@@ -1316,7 +1321,7 @@ mod tests {
     #[gpui::test]
     fn a_guide_dropped_on_a_frame_belongs_to_that_frame_in_the_window(cx: &mut TestAppContext) {
         let (session, page, frame) = session_with_a_frame();
-        let (_view, window) = open_layer(cx, session.clone());
+        let (_state, window) = open_layer(cx, session.clone());
         window.simulate_mouse_down(
             point(px(10.0), px(450.0)),
             MouseButton::Left,
@@ -1351,7 +1356,7 @@ mod tests {
                 .execute("guide.add", &json!({ "vertical": true, "offset": 100.0 }))
                 .expect("a guide");
         }
-        let (_view, window) = open_layer(cx, session.clone());
+        let (_state, window) = open_layer(cx, session.clone());
         // The guide is at page x 100, which is 700 on the window.
         window.simulate_mouse_down(
             point(px(700.0), px(450.0)),
@@ -1381,7 +1386,7 @@ mod tests {
                 .execute("guide.add", &json!({ "vertical": true, "offset": 100.0 }))
                 .expect("a guide");
         }
-        let (_view, window) = open_layer(cx, session.clone());
+        let (_state, window) = open_layer(cx, session.clone());
         // A press on the guide, a drag back to the left ruler, and a release.
         window.simulate_mouse_down(
             point(px(700.0), px(450.0)),
@@ -1413,7 +1418,7 @@ mod tests {
                 .execute("guide.add", &json!({ "vertical": true, "offset": 100.0 }))
                 .expect("a guide");
         }
-        let (_view, window) = open_layer(cx, session.clone());
+        let (_state, window) = open_layer(cx, session.clone());
         window.simulate_mouse_down(
             point(px(700.0), px(450.0)),
             MouseButton::Left,
