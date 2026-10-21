@@ -158,18 +158,64 @@ fn create_engine_rectangle(
     x: f64,
     y: f64,
 ) {
+    create_engine_node(
+        shell,
+        window,
+        EngineNode {
+            kind: "rectangle",
+            x,
+            y,
+            width: 200.0,
+            height: 120.0,
+            name: "Rect",
+        },
+    );
+}
+
+/// Put one frame in the engine's document, and frame the page.
+///
+/// A frame and not a rectangle, because an auto layout belongs to a frame: the
+/// engine refuses one on anything else, and the panel says so rather than
+/// offering a control the engine would turn down.
+fn create_engine_frame(shell: &Entity<AppShell>, window: &mut VisualTestContext, x: f64, y: f64) {
+    create_engine_node(
+        shell,
+        window,
+        EngineNode {
+            kind: "frame",
+            x,
+            y,
+            width: 320.0,
+            height: 200.0,
+            name: "Row",
+        },
+    );
+}
+
+/// A node the engine is asked to make.
+struct EngineNode {
+    kind: &'static str,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    name: &'static str,
+}
+
+/// Put one node of the engine's own making in the document.
+fn create_engine_node(shell: &Entity<AppShell>, window: &mut VisualTestContext, node: EngineNode) {
     window.update(|_, cx| {
         shell.update(cx, |shell, cx| {
             shell.engine_canvas().update(cx, |canvas, cx| {
                 canvas.run_engine_command(
                     "node.create",
                     serde_json::json!({
-                        "type": "rectangle",
-                        "x": x,
-                        "y": y,
-                        "width": 200.0,
-                        "height": 120.0,
-                        "name": "Rect"
+                        "type": node.kind,
+                        "x": node.x,
+                        "y": node.y,
+                        "width": node.width,
+                        "height": node.height,
+                        "name": node.name
                     }),
                     cx,
                 );
@@ -178,6 +224,24 @@ fn create_engine_rectangle(
         });
     });
     window.run_until_parked();
+}
+
+/// The auto layout the engine's document holds for the selected layer.
+fn engine_selected_layout(
+    shell: &Entity<AppShell>,
+    window: &mut VisualTestContext,
+) -> Option<figcraft_doc::AutoLayout> {
+    let selection = engine_selection(shell, window);
+    let id = *selection.first()?;
+    window.update(|_, cx| {
+        shell.read_with(cx, |shell, _| {
+            let canvas = shell.engine_canvas().read(cx);
+            canvas.with_session(|session| {
+                let doc = session.doc().ok()?;
+                doc.node(id)?.layout.clone()
+            })
+        })
+    })
 }
 
 /// A point on the engine's page, in page coordinates.
@@ -490,6 +554,158 @@ fn the_inspector_shows_the_layer_the_canvas_selected(cx: &mut TestAppContext) {
     );
     assert_eq!(shown[0].name, "Hero", "and it is that layer's name");
     assert_eq!(shown[0].kind, "Frame", "and that layer's kind");
+}
+
+#[gpui::test]
+fn the_layout_panel_changes_the_engines_document(cx: &mut TestAppContext) {
+    // The whole chain, driven by real events and nothing stubbed at the seams:
+    //
+    //   click the panel's control -> the Inspector's command -> the engine's
+    //   session -> the engine's document
+    //
+    // A frame is what an auto layout belongs to, so the test drives a frame.
+    let (shell, window) = open_shell(cx);
+    create_engine_frame(&shell, window, 40.0, 40.0);
+    click_engine_node(&shell, window, 1, Modifiers::none());
+    assert_eq!(
+        engine_selection(&shell, window).len(),
+        1,
+        "the frame should be selected for the panel to show"
+    );
+
+    // A frame with no auto layout is offered one, rather than a control that
+    // would set a gap on a layout that is not there.
+    redraw(&shell, window);
+    let add = window
+        .debug_bounds("inspector-layout-add")
+        .expect("the panel offers to add an auto layout");
+    window.simulate_click(add.center(), Modifiers::none());
+    window.run_until_parked();
+    redraw(&shell, window);
+    assert!(
+        engine_selected_layout(&shell, window).is_some(),
+        "the engine's document holds an auto layout after the panel added one"
+    );
+
+    // The direction is the panel's own control, and the engine's document is
+    // what it has to change.
+    let history_before = engine_undo_len(&shell, window);
+    let vertical = window
+        .debug_bounds("inspector-layout-direction-0")
+        .expect("the panel offers the vertical direction");
+    window.simulate_click(vertical.center(), Modifiers::none());
+    window.run_until_parked();
+
+    let layout = engine_selected_layout(&shell, window).expect("the frame still has its layout");
+    assert_eq!(
+        layout.mode,
+        figcraft_doc::LayoutMode::Vertical,
+        "the engine's document holds the direction the panel set"
+    );
+    assert_eq!(
+        engine_undo_len(&shell, window),
+        history_before + 1,
+        "one click on the panel is one history entry"
+    );
+}
+
+#[gpui::test]
+fn a_mixed_selection_shows_mixed_in_the_layout_panel(cx: &mut TestAppContext) {
+    // Two frames, each with an auto layout, and one gap different from the
+    // other: a disagreement about the gap and agreement about everything else.
+    // The panel has to say which is which.
+    let session = session_with_two_frames();
+    let (engine, inspector, window) = open_canvas_and_inspector(cx, session.0);
+    let frames = session.1;
+
+    // Select both of them.
+    window.update(|_, cx| {
+        engine.update(cx, |canvas, cx| {
+            canvas.run_engine_command(
+                "select.set",
+                serde_json::json!({ "ids": frames.iter().map(|id| id.0).collect::<Vec<_>>() }),
+                cx,
+            );
+        });
+    });
+    window.run_until_parked();
+    assert_eq!(
+        window.update(|_, cx| engine.read(cx).selection().len()),
+        2,
+        "both frames should be selected"
+    );
+
+    let words = window
+        .update(|_, cx| inspector.update(cx, |inspector, cx| inspector.test_layout_words(cx)));
+    assert_eq!(
+        words.first().map(String::as_str),
+        Some("Mixed"),
+        "the panel says the two frames disagree about the gap: {words:?}"
+    );
+
+    // And the panel draws the layout rows, so the word it says is on the
+    // screen rather than in a model nobody looks at.
+    window.draw(
+        point(px(0.0), px(0.0)),
+        size(px(300.0), px(900.0)),
+        |_, _| inspector.clone().into_any_element(),
+    );
+    window.run_until_parked();
+    assert!(
+        window.debug_bounds("inspector-layout-gap-mode").is_some(),
+        "the panel draws the layout rows rather than a note about them"
+    );
+}
+
+/// A session with two frames, each with an auto layout, and one gap of its
+/// own.
+fn session_with_two_frames() -> (
+    std::rc::Rc<std::cell::RefCell<figcraft_engine::Session>>,
+    Vec<figcraft_doc::NodeId>,
+) {
+    let mut doc = figcraft_doc::Document::new("Project");
+    let page = doc.pages[0];
+    let first = doc
+        .create(
+            page,
+            figcraft_doc::NodeKind::Frame,
+            "First",
+            0.0,
+            0.0,
+            320.0,
+            200.0,
+        )
+        .expect("a frame");
+    let second = doc
+        .create(
+            page,
+            figcraft_doc::NodeKind::Frame,
+            "Second",
+            400.0,
+            0.0,
+            320.0,
+            200.0,
+        )
+        .expect("a frame");
+    let session = std::rc::Rc::new(std::cell::RefCell::new(
+        figcraft_engine::Session::with_document(doc),
+    ));
+    {
+        let mut session = session.borrow_mut();
+        for id in [first.0, second.0] {
+            session
+                .execute("layout.add", &serde_json::json!({ "ids": [id] }))
+                .expect("the frame gets an auto layout");
+        }
+        // One of them gets a gap of its own, so the two disagree about it.
+        session
+            .execute(
+                "node.set",
+                &serde_json::json!({ "ids": [second.0], "props": { "gap": 24.0 } }),
+            )
+            .expect("the second frame gets its gap");
+    }
+    (session, vec![first, second])
 }
 
 #[gpui::test]

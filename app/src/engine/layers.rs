@@ -1360,7 +1360,11 @@ impl LayersPanel {
     /// with no height at all and its rows are clipped away.
     fn chrome_height(&self) -> f32 {
         let pages = self.pages_viewport();
-        let search = if self.state.layer_search { SEARCH_H } else { 0.0 };
+        let search = if self.state.layer_search {
+            SEARCH_H
+        } else {
+            0.0
+        };
         FILE_HEADER_H + (HEADER_H + pages.height + 1.0) + HEADER_H + search
     }
 

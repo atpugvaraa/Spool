@@ -59,8 +59,19 @@ use gpui::{
 };
 use serde_json::Value as JsonValue;
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use crate::engine::canvas::EngineCanvas;
 use crate::engine::inspector_model as model;
+use crate::engine::panel_components::{
+    self as panel_components, ComponentAction, ComponentsHost, ComponentsModel,
+    ComponentsPanelState,
+};
+use crate::engine::panel_effects::EffectsPanel;
+use crate::engine::panel_export::{
+    self as panel_export, ExportAction, ExportHost, ExportModel, ExportPanelState,
+};
 use crate::theme;
 
 /// The word for a property the selected objects disagree about.
@@ -74,6 +85,21 @@ const MIXED: &str = "Mixed";
 /// The word for a property nobody has set.
 const UNSET: &str = "None";
 
+/// The word for a layout property nobody has set.
+///
+/// The engine's word for it, not the panel's. A paint nobody filled is "None"
+/// here, but the layout section reads the engine's own model, and a gap that
+/// is not there is "Not set" — the same word the engine's own panel uses for a
+/// value it does not have.
+const NOT_SET: &str = "Not set";
+
+/// The word for a gap the flow makes up rather than the user typing.
+///
+/// The engine's own word: a layout whose items are spread by the free space
+/// has no gap of its own, and says so rather than showing a number that is
+/// not in use.
+const AUTO: &str = "Auto";
+
 /// The mark for a number that exists but has no value to print.
 const NO_VALUE: &str = "—";
 
@@ -85,13 +111,6 @@ const MIXED_GEOMETRY: &str = "Mixed selection has no agreed position";
 
 /// Why a stroke width is unavailable when there is no stroke.
 const NO_STROKE: &str = "No stroke to be wide";
-
-/// Why the layout rows exist but do nothing.
-///
-/// The document model has no auto-layout to put a gap in. These rows say that
-/// rather than drawing a control that looks live and does nothing, which is the
-/// only kind of lie a property panel should not tell.
-const NOT_MODELLED: &str = "Not modelled yet";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Sections
@@ -241,9 +260,6 @@ pub enum Availability {
     /// The control is real and has a value, but does not apply to this
     /// selection right now. The value stays readable.
     Disabled(&'static str),
-    /// The document model cannot express the property yet. There is nothing to
-    /// show, so nothing is drawn that could be mistaken for a control.
-    Unsupported(&'static str),
 }
 
 impl Availability {
@@ -255,7 +271,7 @@ impl Availability {
     pub fn reason(self) -> Option<&'static str> {
         match self {
             Self::Supported => None,
-            Self::Disabled(reason) | Self::Unsupported(reason) => Some(reason),
+            Self::Disabled(reason) => Some(reason),
         }
     }
 }
@@ -340,6 +356,22 @@ impl NumberSpec {
         }
     }
 
+    /// A count of things: whole numbers, and at least one.
+    ///
+    /// A count is not a length, so it does not take a decimal place: half a
+    /// column is not a column.
+    const fn count() -> Self {
+        Self {
+            step: 1.0,
+            step_quantum: 1.0,
+            precision: Precision::Whole,
+            suffix: "",
+            scale: 1.0,
+            min: Some(1.0),
+            max: None,
+        }
+    }
+
     /// The value as the user reads it.
     pub fn display(self, stored: f32) -> f32 {
         stored * self.scale
@@ -400,6 +432,59 @@ pub fn format_number(value: f32, spec: NumberSpec) -> String {
     match spec.suffix.is_empty() {
         true => bare_number(display, spec),
         false => format!("{}{}", bare_number(display, spec), spec.suffix),
+    }
+}
+
+/// The words a number field uses for the states its value can be in.
+///
+/// The panel's own numbers say "—" for a value nobody set and "Mixed" for a
+/// disagreement. A layout number has the engine's words instead: a gap the
+/// flow makes up is "Auto", and a padding nobody has set is "Not set".
+///
+/// One place for the words, so the layout section and the rest of the panel
+/// cannot drift into two vocabularies for the same three states.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NumberWords {
+    /// The word for a value nobody has set.
+    unset: &'static str,
+    /// The word for a disagreement.
+    mixed: &'static str,
+    /// A word that stands in for the value entirely.
+    ///
+    /// `Some("Auto")` for a gap the layout makes up: the gap is not a number
+    /// the user typed, so a number there would be a number nobody chose.
+    automatic: Option<&'static str>,
+}
+
+impl NumberWords {
+    /// The panel's own words.
+    const fn panel() -> Self {
+        Self {
+            unset: NO_VALUE,
+            mixed: MIXED,
+            automatic: None,
+        }
+    }
+
+    /// The engine's words, for the layout section.
+    const fn layout() -> Self {
+        Self {
+            unset: NOT_SET,
+            mixed: MIXED,
+            automatic: None,
+        }
+    }
+
+    /// The word this field shows for a value.
+    fn shown(self, value: Value<f32>, spec: NumberSpec) -> String {
+        match value {
+            Value::Set(number) => match self.automatic {
+                Some(word) => word.to_owned(),
+                None => format_number(number, spec),
+            },
+            Value::Unset => self.unset.to_owned(),
+            Value::Mixed => self.mixed.to_owned(),
+        }
     }
 }
 
@@ -595,6 +680,18 @@ pub enum Property {
     Opacity,
     StrokeWidth,
     FontSize,
+    /// The gap between the items of an auto layout.
+    Gap,
+    /// The gap between the wrapped rows or columns of an auto layout.
+    CrossGap,
+    /// The padding on the left and the right of an auto layout.
+    PaddingHorizontal,
+    /// The padding at the top and the bottom of an auto layout.
+    PaddingVertical,
+    /// The number of columns in a grid auto layout.
+    GridColumns,
+    /// The number of rows in a grid auto layout.
+    GridRows,
 }
 
 impl Property {
@@ -613,6 +710,16 @@ impl Property {
             Self::Opacity => "Opacity",
             Self::StrokeWidth => "Width",
             Self::FontSize => "Size",
+            Self::Gap => "Gap",
+            Self::CrossGap => "Gap",
+            // The panel is 264 points wide, and a padding field has to fit
+            // beside its neighbour with the value in it: "Padding H" and "Not
+            // set" together are wider than the row, and a clipped value is a
+            // value the user cannot read.
+            Self::PaddingHorizontal => "Pad H",
+            Self::PaddingVertical => "Pad V",
+            Self::GridColumns => "Columns",
+            Self::GridRows => "Rows",
         }
     }
 
@@ -627,6 +734,12 @@ impl Property {
             Self::Opacity => "opacity",
             Self::StrokeWidth => "stroke-width",
             Self::FontSize => "font-size",
+            Self::Gap => "gap",
+            Self::CrossGap => "cross-gap",
+            Self::PaddingHorizontal => "padding-h",
+            Self::PaddingVertical => "padding-v",
+            Self::GridColumns => "grid-columns",
+            Self::GridRows => "grid-rows",
         }
     }
 
@@ -660,7 +773,16 @@ impl Property {
             Self::Y => Some(model::BoxProperty::Y),
             Self::Width => Some(model::BoxProperty::Width),
             Self::Height => Some(model::BoxProperty::Height),
-            Self::BorderRadius | Self::Opacity | Self::StrokeWidth | Self::FontSize => None,
+            Self::BorderRadius
+            | Self::Opacity
+            | Self::StrokeWidth
+            | Self::FontSize
+            | Self::Gap
+            | Self::CrossGap
+            | Self::PaddingHorizontal
+            | Self::PaddingVertical
+            | Self::GridColumns
+            | Self::GridRows => None,
         }
     }
 
@@ -700,6 +822,21 @@ impl Property {
             // instead of inviting the user to author a stroke that is not there.
             Self::StrokeWidth => object.stroke.map(|stroke| stroke.width),
             Self::FontSize => object.font_size,
+            // The layout's numbers belong to the frame's auto layout. A frame
+            // without one has no gap at all, which is not a gap of zero: the
+            // engine's model says the layout is not there, and so does this.
+            Self::Gap => object.auto_layout.map(|layout| layout.gap),
+            Self::CrossGap => object.auto_layout.map(|layout| layout.cross_gap),
+            // The two sides that have to agree for one number to stand for
+            // them. Sides that disagree are a disagreement, not an absence.
+            Self::PaddingHorizontal => object
+                .auto_layout
+                .and_then(|layout| agreeing(layout.padding[3], layout.padding[1])),
+            Self::PaddingVertical => object
+                .auto_layout
+                .and_then(|layout| agreeing(layout.padding[0], layout.padding[2])),
+            Self::GridColumns => object.auto_layout.map(|layout| layout.grid_columns as f32),
+            Self::GridRows => object.auto_layout.map(|layout| layout.grid_rows as f32),
         }
     }
 
@@ -716,12 +853,21 @@ impl Property {
             Self::Y => geometry.position.y,
             Self::Width => geometry.size.width,
             Self::Height => geometry.size.height,
-            // Paint and typography properties are not box numbers. The panel only
-            // asks for geometry where `is_continuous` is true, which is exactly
-            // this set, so this arm is unreachable from the panel today — and
-            // saying so explicitly is what keeps a new property from inheriting a
-            // silent zero.
-            Self::BorderRadius | Self::Opacity | Self::StrokeWidth | Self::FontSize => 0.0,
+            // Paint, typography and layout properties are not box numbers. The
+            // panel only asks for geometry where `is_continuous` is true, which
+            // is exactly the geometry set, so this arm is unreachable from the
+            // panel today — and saying so explicitly is what keeps a new
+            // property from inheriting a silent zero.
+            Self::BorderRadius
+            | Self::Opacity
+            | Self::StrokeWidth
+            | Self::FontSize
+            | Self::Gap
+            | Self::CrossGap
+            | Self::PaddingHorizontal
+            | Self::PaddingVertical
+            | Self::GridColumns
+            | Self::GridRows => 0.0,
         }
     }
 
@@ -741,7 +887,16 @@ impl Property {
             // As in `read_geometry`: named rather than wildcard, so writing a
             // number into a property with no box to write it into has to be a
             // deliberate act instead of a silently ignored one.
-            Self::BorderRadius | Self::Opacity | Self::StrokeWidth | Self::FontSize => {}
+            Self::BorderRadius
+            | Self::Opacity
+            | Self::StrokeWidth
+            | Self::FontSize
+            | Self::Gap
+            | Self::CrossGap
+            | Self::PaddingHorizontal
+            | Self::PaddingVertical
+            | Self::GridColumns
+            | Self::GridRows => {}
         }
         next
     }
@@ -759,6 +914,40 @@ impl Property {
             // naming the four is what makes a ninth variant a compile error here
             // instead of a property that quietly never commits.
             Self::X | Self::Y | Self::Width | Self::Height => return None,
+            // A layout property commits a layout edit instead, for the same
+            // reason.
+            Self::Gap
+            | Self::CrossGap
+            | Self::PaddingHorizontal
+            | Self::PaddingVertical
+            | Self::GridColumns
+            | Self::GridRows => return None,
+        })
+    }
+
+    /// The layout edit this property commits as, if it is part of an auto
+    /// layout rather than of the box or of the paint.
+    pub fn layout_edit(self, value: f32) -> Option<model::LayoutEdit> {
+        Some(match self {
+            Self::Gap => model::LayoutEdit::Gap(value),
+            Self::CrossGap => model::LayoutEdit::CrossGap(value),
+            Self::PaddingHorizontal => model::LayoutEdit::PaddingHorizontal(value),
+            Self::PaddingVertical => model::LayoutEdit::PaddingVertical(value),
+            Self::GridColumns => model::LayoutEdit::GridColumns(value),
+            Self::GridRows => model::LayoutEdit::GridRows(value),
+            // Everything else commits a box command or a style edit, so it has
+            // no layout edit. `None` is the real answer rather than a
+            // fallthrough: naming the rest is what makes a seventh layout
+            // variant a compile error here instead of a property that quietly
+            // never commits.
+            Self::X
+            | Self::Y
+            | Self::Width
+            | Self::Height
+            | Self::BorderRadius
+            | Self::Opacity
+            | Self::StrokeWidth
+            | Self::FontSize => return None,
         })
     }
 
@@ -772,8 +961,22 @@ impl Property {
             // even though nothing about the renderer requires one.
             Self::FontSize => NumberSpec::length(Some(1.0)),
             Self::Opacity => NumberSpec::percent(),
+            // A gap or a padding is a distance and cannot be negative.
+            Self::Gap | Self::CrossGap | Self::PaddingHorizontal | Self::PaddingVertical => {
+                NumberSpec::length(Some(0.0))
+            }
+            // A count of tracks is a whole number of things.
+            Self::GridColumns | Self::GridRows => NumberSpec::count(),
         }
     }
+}
+
+/// The one number two sides agree on, when they agree.
+///
+/// The two sides of a padding that disagree are a disagreement, not an absence:
+/// the padding is set, and the panel simply cannot show one number for it.
+fn agreeing(first: f32, second: f32) -> Option<f32> {
+    (first == second).then_some(first)
 }
 
 fn floor_size(value: f32) -> f32 {
@@ -898,6 +1101,209 @@ impl Paint {
 
 pub fn color_hex(color: model::Color) -> String {
     color.to_hex()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Auto layout
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The index of the cell nothing is on.
+///
+/// The picker offers three cells on each axis, and a cell can be off because
+/// the selection disagrees about where the items sit rather than because the
+/// items sit at the end.
+const NOTHING: i32 = -1;
+
+/// The index that lights a whole axis.
+///
+/// An auto gap spreads the items along the whole main axis, so every cell on
+/// that axis is on; wrapped lines spread across the flow light the whole cross
+/// axis the same way.
+const SPREAD: i32 = 9;
+
+/// Why a layout row cannot be used on a layer that cannot hold a layout.
+const NO_FRAME: &str = "Auto layout needs a frame";
+
+/// Why a layout row cannot be used on a frame that has no auto layout.
+const NO_AUTO_LAYOUT: &str = "This layer has no auto layout";
+
+/// Why a layout row cannot be used on a selection that disagrees about it.
+const MIXED_AUTO_LAYOUT: &str = "Mixed selection has no agreed auto layout";
+
+/// What the selection's auto layout says.
+///
+/// One fold per property, so a disagreement is a disagreement about *that*
+/// property: two frames that flow the same way but space their children
+/// differently agree about the direction and disagree about the gap.
+///
+/// The three states come from the engine's model rather than from a flag the
+/// panel keeps: a frame with no auto layout has no gap, no padding and no
+/// alignment at all, which is not the same as a gap of zero.
+#[derive(Clone, Copy, Debug)]
+struct LayoutState {
+    /// Whether the selected layers have an auto layout.
+    present: Value<bool>,
+    mode: Value<model::LayoutMode>,
+    wrap: Value<bool>,
+    gap: Value<f32>,
+    cross_gap: Value<f32>,
+    padding_horizontal: Value<f32>,
+    padding_vertical: Value<f32>,
+    main_align: Value<model::MainAlign>,
+    cross_align: Value<model::CrossAlign>,
+    content_align: Value<model::ContentAlign>,
+    grid_columns: Value<f32>,
+    grid_rows: Value<f32>,
+}
+
+impl LayoutState {
+    /// Read the auto layout of a selection.
+    fn read(selected: &[model::DesignObject]) -> Self {
+        let present = Value::across(
+            selected
+                .iter()
+                .map(|object| Some(object.auto_layout.is_some())),
+        );
+        let numbers = |read: fn(&model::AutoLayout) -> f32| {
+            Value::across(
+                selected
+                    .iter()
+                    .map(|object| object.auto_layout.as_ref().map(read)),
+            )
+        };
+        let padding = |read: fn(&model::AutoLayout) -> (f32, f32)| {
+            Value::across(selected.iter().map(|object| {
+                object.auto_layout.as_ref().and_then(|layout| {
+                    let (first, second) = read(layout);
+                    agreeing(first, second)
+                })
+            }))
+        };
+        Self {
+            present,
+            mode: Value::across(
+                selected
+                    .iter()
+                    .map(|object| object.auto_layout.as_ref().map(|layout| layout.mode)),
+            ),
+            wrap: Value::across(
+                selected
+                    .iter()
+                    .map(|object| object.auto_layout.as_ref().map(|layout| layout.wrap)),
+            ),
+            gap: numbers(|layout| layout.gap),
+            cross_gap: numbers(|layout| layout.cross_gap),
+            // The sides that disagree are a disagreement, not an absence: the
+            // padding is there, and the panel cannot show one number for it.
+            padding_horizontal: disagreeing(
+                padding(|layout| (layout.padding[3], layout.padding[1])),
+                present,
+            ),
+            padding_vertical: disagreeing(
+                padding(|layout| (layout.padding[0], layout.padding[2])),
+                present,
+            ),
+            main_align: Value::across(
+                selected
+                    .iter()
+                    .map(|object| object.auto_layout.as_ref().map(|layout| layout.main_align)),
+            ),
+            cross_align: Value::across(
+                selected
+                    .iter()
+                    .map(|object| object.auto_layout.as_ref().map(|layout| layout.cross_align)),
+            ),
+            content_align: Value::across(selected.iter().map(|object| {
+                object
+                    .auto_layout
+                    .as_ref()
+                    .map(|layout| layout.content_align)
+            })),
+            grid_columns: numbers(|layout| layout.grid_columns as f32),
+            grid_rows: numbers(|layout| layout.grid_rows as f32),
+        }
+    }
+
+    /// Whether the flow wraps.
+    ///
+    /// A grid has no wrap: its tracks are its lines.
+    fn wraps(&self) -> bool {
+        self.wrap == Value::Set(true) && !self.is_grid()
+    }
+
+    /// Whether the flow is a grid.
+    fn is_grid(&self) -> bool {
+        self.mode == Value::Set(model::LayoutMode::Grid)
+    }
+
+    /// Whether the items are spread along the main axis by the free space.
+    fn auto_gap(&self) -> bool {
+        matches!(self.main_align, Value::Set(align) if align.is_auto_gap())
+    }
+
+    /// Whether the wrapped lines are spread across the flow.
+    fn spread_lines(&self) -> bool {
+        !self.is_grid()
+            && self.wrap == Value::Set(true)
+            && self.content_align == Value::Set(model::ContentAlign::SpaceBetween)
+    }
+}
+
+/// A padding whose sides disagree is a disagreement, not an absence.
+///
+/// Only when there is an auto layout to disagree about: a frame without one
+/// has no padding at all, and that is a different answer.
+fn disagreeing(value: Value<f32>, present: Value<bool>) -> Value<f32> {
+    match present {
+        Value::Set(true) => match value {
+            Value::Unset => Value::Mixed,
+            other => other,
+        },
+        _ => value,
+    }
+}
+
+/// Whether the layout rows can be used, and why not.
+///
+/// The engine's own rules: an auto layout needs a frame, and a gap belongs to
+/// a frame that has one. A frame without one is offered the button that adds
+/// it, rather than a control that would add one as a side effect of a number.
+fn layout_availability(state: &LayoutState, frames: bool) -> Availability {
+    if !frames {
+        return Availability::Disabled(NO_FRAME);
+    }
+    match state.present {
+        Value::Set(true) => Availability::Supported,
+        // Agreement that there is no auto layout, and no reading at all, are
+        // the same answer here: there is no layout to put a gap in.
+        Value::Set(false) | Value::Unset => Availability::Disabled(NO_AUTO_LAYOUT),
+        Value::Mixed => Availability::Disabled(MIXED_AUTO_LAYOUT),
+    }
+}
+
+/// Which layout menu is open, if any.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LayoutMenu {
+    /// How the gap between the items is made.
+    GapMode,
+    /// How the gap between the wrapped lines is made.
+    CrossGapMode,
+}
+
+/// One cell of the alignment picker.
+///
+/// Where it sits in the grid, whether it is on, and which way the flow runs —
+/// the three things that decide what the cell means and what it draws.
+#[derive(Clone, Copy, Debug)]
+struct AlignmentCell {
+    /// The main axis's cell: 0 is the start, 1 the middle, 2 the end.
+    main: i32,
+    /// The cross axis's cell, the same way.
+    cross: i32,
+    /// Whether the selection agrees this is where the items sit.
+    on: bool,
+    /// Whether the flow runs across rather than down.
+    horizontal: bool,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1030,6 +1436,17 @@ pub struct Inspector {
     /// before it builds the engine canvas, so the two are joined afterwards by
     /// [`Inspector::set_engine_canvas`].
     engine: Option<Entity<EngineCanvas>>,
+    /// The effects section's own state. It is an ENTITY, because a field being
+    /// typed into needs a focus handle and a keyboard.
+    effects: Option<Entity<EffectsPanel>>,
+    /// The components section's state: which of its menus is open.
+    ///
+    /// The section is a function, not an entity, so the state lives here and
+    /// the section is handed a handle to it.
+    components_state: Rc<RefCell<ComponentsPanelState>>,
+    /// The export section's state: which row is being edited, and what is being
+    /// typed into it.
+    export_state: Rc<RefCell<ExportPanelState>>,
     tab: usize,
     sections: Sections,
     /// The property the arrow keys move, once a field has been touched.
@@ -1045,6 +1462,8 @@ pub struct Inspector {
     rename: Option<RenameSession>,
     /// Which colour control has its palette open, if any.
     palette: Option<StyleProperty>,
+    /// Which layout menu is open, if any.
+    layout_menu: Option<LayoutMenu>,
     /// Repaints that must outlive the constructor.
     ///
     /// The Inspector is a view of the document: an engine edit has to repaint it
@@ -1064,6 +1483,9 @@ impl Inspector {
     pub fn new() -> Self {
         Self {
             engine: None,
+            effects: None,
+            components_state: Rc::new(RefCell::new(ComponentsPanelState::default())),
+            export_state: Rc::new(RefCell::new(ExportPanelState::default())),
             tab: 0,
             sections: Sections::new(),
             focus: None,
@@ -1071,6 +1493,7 @@ impl Inspector {
             scrub: None,
             rename: None,
             palette: None,
+            layout_menu: None,
             observations: Vec::new(),
         }
     }
@@ -1088,6 +1511,10 @@ impl Inspector {
     pub fn set_engine_canvas(&mut self, engine: Entity<EngineCanvas>, cx: &mut Context<Self>) {
         let observation = cx.observe(&engine, |_, _, cx| cx.notify());
         self.observations.push(observation);
+        // The effects section is an ENTITY, because a field being typed into
+        // needs a focus handle and the keyboard. It is built here, once, from the
+        // same engine canvas this panel reads.
+        self.effects = Some(cx.new(|cx| EffectsPanel::new(engine.clone(), cx)));
         self.engine = Some(engine);
         cx.notify();
     }
@@ -1298,6 +1725,26 @@ impl Inspector {
         engine.read(cx).selection()
     }
 
+    /// The words the layout section shows, in the order it shows them.
+    ///
+    /// For the window-level tests: what the user would read for the layout
+    /// rows — a number, "Mixed", "Not set" or "Auto" — so a test can say what
+    /// the panel says without reading pixels.
+    #[cfg(test)]
+    pub fn test_layout_words(&self, cx: &mut Context<Self>) -> Vec<String> {
+        let state = LayoutState::read(&self.selected(cx));
+        let gap = NumberWords {
+            automatic: state.auto_gap().then_some(AUTO),
+            ..NumberWords::layout()
+        };
+        vec![
+            gap.shown(state.gap, Property::Gap.spec()),
+            NumberWords::layout()
+                .shown(state.padding_horizontal, Property::PaddingHorizontal.spec()),
+            NumberWords::layout().shown(state.padding_vertical, Property::PaddingVertical.spec()),
+        ]
+    }
+
     /// The box of one layer, in the frame the layer is in.
     fn geometry_of(
         &self,
@@ -1333,6 +1780,72 @@ impl Inspector {
             return false;
         };
         engine.update(cx, |canvas, cx| canvas.run_engine_command(id, params, cx))
+    }
+
+    /// The effects section: the selected layer's effects, in the engine's
+    /// vocabulary.
+    ///
+    /// It is an entity, so the section's own state -- which row is open, which
+    /// field is being typed into -- lives with it and keeps its focus.
+    fn effects_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        match self.effects.clone() {
+            Some(panel) => panel.into_any_element(),
+            None => empty_note("No effects yet.").into_any_element(),
+        }
+    }
+
+    /// The export section: the selected layer's export settings.
+    fn export_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(engine) = self.engine.clone() else {
+            return empty_note("Add export setting").into_any_element();
+        };
+        let model: ExportModel = engine.read(cx).with_session(|session| {
+            let Ok(doc) = session.doc() else {
+                return ExportModel::default();
+            };
+            panel_export::selected_exports(doc, &session.selection())
+        });
+        let state = self.export_state.clone();
+        panel_export::section(&model, &state, cx).into_any_element()
+    }
+
+    /// The components section: what the selected layer is, in the components
+    /// vocabulary.
+    ///
+    /// The model is read from the engine's document, the same one the rest of
+    /// the panel reads, so the two cannot be about different layers.
+    fn components_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(engine) = self.engine.clone() else {
+            return div().into_any_element();
+        };
+        let model = engine.read(cx).with_session(|session| {
+            let Ok(doc) = session.doc() else {
+                return ComponentsModel::empty();
+            };
+            ComponentsModel::read(doc, &session.selection())
+        });
+        let state = self.components_state.clone();
+        panel_components::components_section(&model, &state, cx)
+    }
+
+    /// Run a component change through the engine.
+    ///
+    /// The engine's commands are the operation surface, so a change made from
+    /// the section is the same change the CLI or a shortcut would make, and it
+    /// lands in the same history.
+    fn run_component_action(&mut self, action: ComponentAction, cx: &mut Context<Self>) {
+        let (command, params) = action.command();
+        self.run(&command, params, cx);
+    }
+
+    /// Run an export change through the engine.
+    ///
+    /// The engine's commands are the operation surface, so a change made from
+    /// the section is the same change the CLI or a shortcut would make, and it
+    /// lands in the same history.
+    fn run_export_action(&mut self, action: ExportAction, cx: &mut Context<Self>) {
+        let (command, params) = action.command();
+        self.run(&command, params, cx);
     }
 
     /// Write one property of one layer's box.
@@ -1404,6 +1917,8 @@ impl Inspector {
             self.commit_box(property, value, object, cx);
         } else if let Some(edit) = focus.property.style_edit(stored) {
             self.commit_style(edit, cx);
+        } else if let Some(edit) = focus.property.layout_edit(stored) {
+            self.commit_layout(edit, cx);
         }
     }
 
@@ -1432,6 +1947,21 @@ impl Inspector {
     fn commit_style(&mut self, edit: model::StyleEdit, cx: &mut Context<Self>) {
         let ids = self.selection(cx);
         let (command, params) = model::style_command(&edit, &ids);
+        self.run(&command, params, cx);
+    }
+
+    /// Commit a change to the selection's auto layout.
+    ///
+    /// The one exit for the layout rows, so a direction, a gap and a padding
+    /// all produce the same single history entry rather than each deciding for
+    /// itself what "one edit" means.
+    ///
+    /// An auto layout belongs to the frame rather than to one of its children,
+    /// so this applies to the whole selection: "make these all flow this way"
+    /// is one operation.
+    fn commit_layout(&mut self, edit: model::LayoutEdit, cx: &mut Context<Self>) {
+        let ids = self.selection(cx);
+        let (command, params) = model::layout_command(&edit, &ids);
         self.run(&command, params, cx);
     }
 
@@ -1559,6 +2089,20 @@ impl Inspector {
     }
 }
 
+impl ExportHost for Inspector {
+    /// Run an export change through the engine.
+    fn run_export_action(&mut self, action: ExportAction, cx: &mut Context<Self>) {
+        Inspector::run_export_action(self, action, cx);
+    }
+}
+
+impl ComponentsHost for Inspector {
+    /// Run a component change through the engine.
+    fn run_component_action(&mut self, action: ComponentAction, cx: &mut Context<Self>) {
+        Inspector::run_component_action(self, action, cx);
+    }
+}
+
 impl Render for Inspector {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::diagnostics::count("inspector_build", 1);
@@ -1627,6 +2171,22 @@ impl Inspector {
         body: impl IntoElement,
         cx: &mut Context<Self>,
     ) -> Div {
+        self.inspector_section_with(title, slot, None, body, cx)
+    }
+
+    /// A collapsible section with a button in its header.
+    ///
+    /// The same section, with one control beside the collapse chevron: the
+    /// layout section's "add auto layout" is a header button because it is
+    /// about the section as a whole rather than about one row of it.
+    fn inspector_section_with(
+        &self,
+        title: &'static str,
+        slot: SectionSlot,
+        action: Option<AnyElement>,
+        body: impl IntoElement,
+        cx: &mut Context<Self>,
+    ) -> Div {
         let collapsed = self.sections.is_collapsed(slot);
         let mut section = column()
             .border_b_1()
@@ -1652,12 +2212,18 @@ impl Inspector {
                             .text_color(rgb(theme::TEXT))
                             .child(title),
                     )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(theme::TEXT_MUTED))
-                            .child(if collapsed { "＋" } else { "−" }),
-                    ),
+                    .child({
+                        let mut right = div().flex().items_center().gap_2();
+                        if let Some(action) = action {
+                            right = right.child(action);
+                        }
+                        right.child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(theme::TEXT_MUTED))
+                                .child(if collapsed { "＋" } else { "−" }),
+                        )
+                    }),
             );
         if !collapsed {
             section = section.child(body);
@@ -1702,12 +2268,7 @@ impl Inspector {
                 column()
                     .child(self.layer_header(object, cx))
                     .child(self.position_section(selection, cx))
-                    .child(self.inspector_section(
-                        "Layout",
-                        SectionSlot::LAYOUT,
-                        self.layout_fields(),
-                        cx,
-                    ))
+                    .child(self.layout_section(selection, cx))
                     .child(self.inspector_section(
                         "Appearance",
                         SectionSlot::APPEARANCE,
@@ -1723,21 +2284,26 @@ impl Inspector {
                     .child(self.inspector_section(
                         "Effects",
                         SectionSlot::EFFECTS,
-                        empty_note("No effects yet."),
+                        self.effects_section(cx),
                         cx,
                     ))
                     .child(self.inspector_section(
                         "Export",
                         SectionSlot::EXPORT,
-                        empty_note("Add export setting"),
+                        self.export_section(cx),
                         cx,
                     ))
+                    .child(self.components_section(cx))
                     .into_any_element()
             }
             _ => {
                 let mut sections = column()
                     .child(multi_header(selected.len()))
                     .child(self.position_section(selected, cx))
+                    // The layout section is here too: a selection of several
+                    // frames has one layout each, and a disagreement about it
+                    // is a disagreement the panel has to say out loud.
+                    .child(self.layout_section(selected, cx))
                     .child(self.inspector_section(
                         "Appearance",
                         SectionSlot::APPEARANCE,
@@ -1843,14 +2409,14 @@ impl Inspector {
         let count = selected.len();
         let body = section_body()
             .child(field_pair(
-                self.number_field(
+                self.panel_number_field(
                     Property::X,
                     object,
                     selected_value(selected, Property::X),
                     count,
                     cx,
                 ),
-                self.number_field(
+                self.panel_number_field(
                     Property::Y,
                     object,
                     selected_value(selected, Property::Y),
@@ -1859,14 +2425,14 @@ impl Inspector {
                 ),
             ))
             .child(field_pair(
-                self.number_field(
+                self.panel_number_field(
                     Property::Width,
                     object,
                     selected_value(selected, Property::Width),
                     count,
                     cx,
                 ),
-                self.number_field(
+                self.panel_number_field(
                     Property::Height,
                     object,
                     selected_value(selected, Property::Height),
@@ -1877,18 +2443,607 @@ impl Inspector {
         self.inspector_section("Position and size", SectionSlot::POSITION, body, cx)
     }
 
-    /// The layout rows, as things the document model cannot yet express.
+    /// The layout section: the auto layout of what is selected.
     ///
-    /// Drawn as unsupported notes rather than as working controls. A control
-    /// that looks live and does nothing is a promise the model cannot keep, and
-    /// the only way to make the promise true is to implement the operation — not
-    /// to draw the control early.
-    fn layout_fields(&self) -> Div {
-        let unsupported = Availability::Unsupported(NOT_MODELLED);
-        section_body()
-            .child(unsupported_pair("Auto layout", "Direction", unsupported))
-            .child(unsupported_pair("Gap", "Padding", unsupported))
-            .child(unsupported_pair("Align", "Wrap", unsupported))
+    /// The engine's own model, read through the model and written through the
+    /// engine's commands — the same contract the engine's own design panel
+    /// uses. Every row is one of the engine's layout properties, and every one
+    /// of them says which of the three states it is in.
+    fn layout_section(&self, selected: &[model::DesignObject], cx: &mut Context<Self>) -> Div {
+        let state = LayoutState::read(selected);
+        let frames = !selected.is_empty() && selected.iter().all(|object| object.frame_like);
+        let availability = layout_availability(&state, frames);
+        // The engine's own name for the section: "Auto layout" once there is
+        // one, "Layout" before that.
+        let title = match state.present {
+            Value::Set(true) => "Auto layout",
+            _ => "Layout",
+        };
+        let body = self.layout_body(&state, availability, cx);
+        let action = self.layout_action(&state, frames, cx);
+        self.inspector_section_with(title, SectionSlot::LAYOUT, action, body, cx)
+    }
+
+    /// The header's button: add or remove the auto layout.
+    ///
+    /// The engine's own commands, because they are the ones that know what
+    /// adding a layout means: the gap and the padding are read off the
+    /// children rather than guessed at.
+    fn layout_action(
+        &self,
+        state: &LayoutState,
+        frames: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let ids = self.selection(cx);
+        if ids.is_empty() {
+            return None;
+        }
+        let (command, label, selector) = match state.present {
+            // Adding a layout to a frame that already has one would wrap it in
+            // a new frame instead, so the button is only offered when there is
+            // none to add.
+            Value::Set(false) if frames => {
+                ("layout.add", "＋ Add auto layout", "inspector-layout-add")
+            }
+            Value::Set(true) | Value::Mixed => (
+                "layout.remove",
+                "− Remove auto layout",
+                "inspector-layout-remove",
+            ),
+            _ => return None,
+        };
+        let params = serde_json::json!({
+            "ids": ids.iter().map(|id| id.0).collect::<Vec<_>>(),
+        });
+        Some(
+            div()
+                .id(SharedString::from(selector))
+                .debug_selector(|| selector.to_owned())
+                .px(px(6.0))
+                .py(px(3.0))
+                .rounded_sm()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_SECONDARY))
+                .hover(|style| style.bg(rgb(theme::SURFACE_HOVER)))
+                .cursor_pointer()
+                .child(label)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    // The header is a click target too: without this the click
+                    // would also collapse the section it belongs to.
+                    cx.stop_propagation();
+                    this.run(command, params.clone(), cx);
+                }))
+                .into_any_element(),
+        )
+    }
+
+    /// The layout rows: the direction, the alignment, and the spacing.
+    fn layout_body(
+        &self,
+        state: &LayoutState,
+        availability: Availability,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let mut body = section_body();
+        // The reason the rows cannot be used, said out loud. A dimmed row with
+        // no explanation is a row the user has to guess about.
+        if let Some(reason) = availability.reason() {
+            body = body.child(disabled_note(reason));
+        }
+        body = body.child(self.layout_direction(state, availability, cx));
+        body = body.child(self.layout_alignment(state, availability, cx));
+        body = body.child(self.layout_spacing(state, availability, cx));
+        body
+    }
+
+    /// The direction of the flow, and whether it wraps.
+    ///
+    /// The engine's three directions, in the engine's own order: vertical,
+    /// horizontal and grid.
+    fn layout_direction(
+        &self,
+        state: &LayoutState,
+        availability: Availability,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let enabled = availability.is_editable();
+        let selected = match state.mode {
+            Value::Set(model::LayoutMode::Vertical) => Some(0),
+            Value::Set(model::LayoutMode::Horizontal) => Some(1),
+            Value::Set(model::LayoutMode::Grid) => Some(2),
+            _ => None,
+        };
+        let word = if state.mode.is_mixed() {
+            Some(MIXED)
+        } else {
+            None
+        };
+        let direction = segmented(
+            "inspector-layout-direction",
+            &[
+                ("Vertical", enabled),
+                ("Horizontal", enabled),
+                ("Grid", enabled),
+            ],
+            selected,
+            word,
+            false,
+            |index, this: &mut Inspector, cx: &mut Context<Inspector>| {
+                let mode = match index {
+                    0 => model::LayoutMode::Vertical,
+                    1 => model::LayoutMode::Horizontal,
+                    _ => model::LayoutMode::Grid,
+                };
+                this.commit_layout(model::LayoutEdit::Mode(mode), cx);
+            },
+            cx,
+        );
+        // The direction and the wrap are two things, so they are two rows: the
+        // direction's three words are as wide as the panel allows, and the wrap
+        // would run off the edge beside them.
+        let mut rows = column().gap_2();
+        rows = rows.child(div().flex().items_center().gap_2().child(direction));
+        // Wrap belongs to the flow: a horizontal one wraps into rows, a
+        // vertical one into columns. A grid has no wrap to offer.
+        if !state.is_grid() {
+            rows = rows.child(self.layout_wrap(state, enabled, cx));
+        }
+        rows
+    }
+
+    /// The wrap toggle.
+    fn layout_wrap(&self, state: &LayoutState, enabled: bool, cx: &mut Context<Self>) -> Div {
+        let on = state.wrap == Value::Set(true);
+        let word = if state.wrap.is_mixed() {
+            Some(MIXED)
+        } else {
+            None
+        };
+        segmented(
+            "inspector-layout-wrap",
+            &[("Wrap", enabled)],
+            if on { Some(0) } else { None },
+            word,
+            false,
+            move |_, this: &mut Inspector, cx: &mut Context<Inspector>| {
+                this.commit_layout(model::LayoutEdit::Wrap(!on), cx);
+            },
+            cx,
+        )
+    }
+
+    /// The alignment of the items, and the gap between them.
+    fn layout_alignment(
+        &self,
+        state: &LayoutState,
+        availability: Availability,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let mut body = column().gap_2();
+        body = body.child(
+            div()
+                .flex()
+                .gap_2()
+                .child(self.alignment_picker(state, availability, cx))
+                .child(self.gap_column(state, availability, cx)),
+        );
+        // Text baselines: a horizontal stack only, because a vertical one
+        // stacks the text on top of itself.
+        if matches!(state.mode, Value::Set(model::LayoutMode::Horizontal)) {
+            body = body.child(self.layout_baselines(state, availability, cx));
+        }
+        body
+    }
+
+    /// The text baselines toggle.
+    fn layout_baselines(
+        &self,
+        state: &LayoutState,
+        availability: Availability,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let enabled = availability.is_editable();
+        let on = state.cross_align == Value::Set(model::CrossAlign::Baseline);
+        let word = if state.cross_align.is_mixed() {
+            Some(MIXED)
+        } else {
+            None
+        };
+        segmented(
+            "inspector-layout-baselines",
+            &[("Align text baselines", enabled)],
+            if on { Some(0) } else { None },
+            word,
+            false,
+            move |_, this: &mut Inspector, cx: &mut Context<Inspector>| {
+                let align = if on {
+                    model::CrossAlign::Min
+                } else {
+                    model::CrossAlign::Baseline
+                };
+                this.commit_layout(model::LayoutEdit::CrossAlign(align), cx);
+            },
+            cx,
+        )
+    }
+
+    /// The alignment picker: the main axis across, the cross axis down.
+    ///
+    /// Nine cells, each a main alignment and a cross alignment together. An
+    /// auto gap keeps its mode — the free space is still spread out — so the
+    /// cells only pick the cross alignment there.
+    fn alignment_picker(
+        &self,
+        state: &LayoutState,
+        availability: Availability,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let enabled = availability.is_editable();
+        // A vertical flow runs down, so its main axis is the column.
+        let horizontal = !matches!(state.mode, Value::Set(model::LayoutMode::Vertical));
+        let main = match state.main_align {
+            Value::Set(align) if align.is_auto_gap() => SPREAD,
+            Value::Set(model::MainAlign::Min) => 0,
+            Value::Set(model::MainAlign::Center) => 1,
+            Value::Set(model::MainAlign::Max) => 2,
+            _ => NOTHING,
+        };
+        // Wrapped lines spread across the flow light the whole cross axis, the
+        // way an auto gap lights the whole main one.
+        let cross = if state.spread_lines() {
+            SPREAD
+        } else {
+            match state.cross_align {
+                Value::Set(model::CrossAlign::Min) | Value::Set(model::CrossAlign::Baseline) => 0,
+                Value::Set(model::CrossAlign::Center) => 1,
+                Value::Set(model::CrossAlign::Max) => 2,
+                _ => NOTHING,
+            }
+        };
+        let mut picker = column().gap_1();
+        for row in 0..3 {
+            let mut line = div().flex().gap_1();
+            for column in 0..3 {
+                let (main_i, cross_i) = if horizontal {
+                    (column, row)
+                } else {
+                    (row, column)
+                };
+                let on =
+                    (main == main_i || main == SPREAD) && (cross == cross_i || cross == SPREAD);
+                line = line.child(self.alignment_cell(
+                    state,
+                    AlignmentCell {
+                        main: main_i,
+                        cross: cross_i,
+                        on,
+                        horizontal,
+                    },
+                    enabled,
+                    cx,
+                ));
+            }
+            picker = picker.child(line);
+        }
+        picker
+    }
+
+    /// One cell of the alignment picker.
+    fn alignment_cell(
+        &self,
+        state: &LayoutState,
+        cell: AlignmentCell,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let grid = state.is_grid();
+        let current = match state.main_align {
+            Value::Set(align) => Some(align),
+            _ => None,
+        };
+        // An auto gap keeps its mode: the cells pick the cross alignment.
+        let keeps = !grid && current.is_some_and(|align| align.is_auto_gap());
+        let selector = format!("inspector-layout-align-{}-{}", cell.main, cell.cross);
+        let mark = if cell.on {
+            div()
+                .w(px(if cell.horizontal { 4.0 } else { 12.0 }))
+                .h(px(if cell.horizontal { 12.0 } else { 4.0 }))
+                .rounded_sm()
+                .bg(rgb(theme::ACCENT))
+        } else {
+            div()
+                .w(px(3.0))
+                .h(px(3.0))
+                .rounded_full()
+                .bg(rgb(theme::TEXT_MUTED))
+        };
+        let cell_div = div()
+            .id(SharedString::from(selector.clone()))
+            .debug_selector(move || selector.clone())
+            .w(px(22.0))
+            .h(px(20.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_sm()
+            .hover(|style| style.bg(rgb(theme::SURFACE_HOVER)))
+            .child(mark);
+        let cell_div = if enabled {
+            cell_div.cursor_pointer()
+        } else {
+            cell_div.cursor_default().opacity(0.55)
+        };
+        if !enabled {
+            // A dimmed cell is not a cell that works: the click handler is
+            // what makes it live, so a disabled one does not get one.
+            return cell_div;
+        }
+        cell_div.on_click(cx.listener(move |this, _, _, cx| {
+            let main = if keeps {
+                current
+            } else {
+                model::MainAlign::from_index(cell.main as usize)
+            };
+            let cross = model::CrossAlign::from_index(cell.cross as usize);
+            if let (Some(main), Some(cross)) = (main, cross) {
+                this.commit_layout(model::LayoutEdit::Alignment { main, cross }, cx);
+            }
+        }))
+    }
+
+    /// The gap between the items, and whether the flow makes it up.
+    fn gap_column(
+        &self,
+        state: &LayoutState,
+        availability: Availability,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let words = NumberWords {
+            automatic: state.auto_gap().then_some(AUTO),
+            ..NumberWords::layout()
+        };
+        let gap = self.number_field(Property::Gap, None, state.gap, availability, words, cx);
+        let mode = self.gap_mode(state, availability, cx);
+        column().flex_1().gap_2().child(gap).child(mode)
+    }
+
+    /// How the gap between the items is made.
+    ///
+    /// The engine couples the two: an auto gap *is* a main alignment, so
+    /// choosing one here is choosing how the items sit along the flow.
+    fn gap_mode(
+        &self,
+        state: &LayoutState,
+        availability: Availability,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let label = match state.main_align {
+            Value::Set(model::MainAlign::SpaceBetween) => "Space between",
+            Value::Set(model::MainAlign::SpaceAround) => "Space around",
+            Value::Set(model::MainAlign::SpaceEvenly) => "Space evenly",
+            Value::Set(_) => "Fixed gap",
+            Value::Unset => NOT_SET,
+            Value::Mixed => MIXED,
+        };
+        self.layout_menu(
+            LayoutMenu::GapMode,
+            "inspector-layout-gap-mode",
+            label,
+            availability,
+            vec![
+                ("Fixed", model::LayoutEdit::MainAlign(model::MainAlign::Min)),
+                (
+                    "Auto (space between)",
+                    model::LayoutEdit::MainAlign(model::MainAlign::SpaceBetween),
+                ),
+                (
+                    "Auto (space evenly)",
+                    model::LayoutEdit::MainAlign(model::MainAlign::SpaceEvenly),
+                ),
+                (
+                    "Auto (space around)",
+                    model::LayoutEdit::MainAlign(model::MainAlign::SpaceAround),
+                ),
+            ],
+            cx,
+        )
+    }
+
+    /// The padding, and the rest of the spacing.
+    fn layout_spacing(
+        &self,
+        state: &LayoutState,
+        availability: Availability,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let words = NumberWords::layout();
+        let mut body = column().gap_2();
+        body = body.child(field_pair(
+            self.number_field(
+                Property::PaddingHorizontal,
+                None,
+                state.padding_horizontal,
+                availability,
+                words,
+                cx,
+            ),
+            self.number_field(
+                Property::PaddingVertical,
+                None,
+                state.padding_vertical,
+                availability,
+                words,
+                cx,
+            ),
+        ));
+        // A wrapped flow has a gap between its lines as well as between its
+        // items.
+        if state.wraps() {
+            body = body.child(self.cross_gap_row(state, availability, cx));
+        }
+        // A grid has tracks rather than a flow.
+        if state.is_grid() {
+            body = body.child(field_pair(
+                self.number_field(
+                    Property::GridColumns,
+                    None,
+                    state.grid_columns,
+                    availability,
+                    words,
+                    cx,
+                ),
+                self.number_field(
+                    Property::GridRows,
+                    None,
+                    state.grid_rows,
+                    availability,
+                    words,
+                    cx,
+                ),
+            ));
+        }
+        body
+    }
+
+    /// The gap between the wrapped lines, and whether the flow makes it up.
+    fn cross_gap_row(
+        &self,
+        state: &LayoutState,
+        availability: Availability,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let vertical = matches!(state.mode, Value::Set(model::LayoutMode::Vertical));
+        let name = if vertical { "Column gap" } else { "Row gap" };
+        let spread = state.content_align == Value::Set(model::ContentAlign::SpaceBetween);
+        let words = NumberWords {
+            automatic: spread.then_some(AUTO),
+            ..NumberWords::layout()
+        };
+        let label = match state.content_align {
+            Value::Set(model::ContentAlign::SpaceBetween) => "Space between",
+            Value::Set(_) => "Fixed gap",
+            Value::Unset => NOT_SET,
+            Value::Mixed => MIXED,
+        };
+        let gap = self.number_field(
+            Property::CrossGap,
+            None,
+            state.cross_gap,
+            availability,
+            words,
+            cx,
+        );
+        let mode = self.layout_menu(
+            LayoutMenu::CrossGapMode,
+            "inspector-layout-cross-gap-mode",
+            label,
+            availability,
+            vec![
+                (
+                    "Fixed",
+                    model::LayoutEdit::ContentAlign(model::ContentAlign::Auto),
+                ),
+                (
+                    "Auto (space between)",
+                    model::LayoutEdit::ContentAlign(model::ContentAlign::SpaceBetween),
+                ),
+            ],
+            cx,
+        );
+        column()
+            .gap_1()
+            .child(sublabel(name))
+            .child(field_pair(gap, mode))
+    }
+
+    /// A menu of choices: the trigger, and the list under it while it is open.
+    fn layout_menu(
+        &self,
+        kind: LayoutMenu,
+        selector: &'static str,
+        label: &str,
+        availability: Availability,
+        options: Vec<(&'static str, model::LayoutEdit)>,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let open = self.layout_menu == Some(kind);
+        let enabled = availability.is_editable();
+        let trigger = div()
+            .id(SharedString::from(selector))
+            .debug_selector(|| selector.to_owned())
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .px(px(8.0))
+            .py(px(8.0))
+            .rounded_md()
+            .bg(rgb(theme::WINDOW))
+            .border_1()
+            .border_color(rgb(theme::BORDER_SOFT))
+            .text_xs()
+            .child(
+                div()
+                    .text_color(rgb(theme::TEXT_SECONDARY))
+                    .child(label.to_owned()),
+            )
+            .child(div().text_color(rgb(theme::TEXT_MUTED)).child(if open {
+                "▴"
+            } else {
+                "▾"
+            }));
+        let trigger = if enabled {
+            trigger
+                .cursor_pointer()
+                .hover(|style| style.bg(rgb(theme::SURFACE_HOVER)))
+        } else {
+            trigger.cursor_default().opacity(0.55)
+        };
+        let mut menu = column().gap_1().child(trigger.on_click(cx.listener(
+            move |this: &mut Inspector, _, _, cx: &mut Context<Inspector>| {
+                if !enabled {
+                    return;
+                }
+                this.layout_menu = if this.layout_menu == Some(kind) {
+                    None
+                } else {
+                    Some(kind)
+                };
+                cx.notify();
+            },
+        )));
+        if open && enabled {
+            let mut list = div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .p(px(6.0))
+                .rounded_md()
+                .bg(rgb(theme::WINDOW))
+                .border_1()
+                .border_color(rgb(theme::BORDER));
+            for (index, (name, edit)) in options.into_iter().enumerate() {
+                let item = div()
+                    .id(SharedString::from(format!("{selector}-item-{index}")))
+                    .debug_selector(move || format!("{selector}-item-{index}"))
+                    .px(px(6.0))
+                    .py(px(5.0))
+                    .rounded_sm()
+                    .text_xs()
+                    .text_color(rgb(theme::TEXT_SECONDARY))
+                    .hover(|style| style.bg(rgb(theme::SURFACE_HOVER)))
+                    .cursor_pointer()
+                    .child(name)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.layout_menu = None;
+                        this.commit_layout(edit, cx);
+                    }));
+                list = list.child(item);
+            }
+            menu = menu.child(list);
+        }
+        menu
     }
 
     fn appearance_fields(&self, selected: &[model::DesignObject], cx: &mut Context<Self>) -> Div {
@@ -1953,11 +3108,11 @@ impl Inspector {
         property: Property,
         object: Option<model::EngineObjectId>,
         value: Value<f32>,
-        count: usize,
+        availability: Availability,
+        words: NumberWords,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let spec = property.spec();
-        let availability = self.availability(property, &value, count);
         let focus = Focus { object, property };
         let editable = availability.is_editable();
         let scrubbable = editable && property.is_continuous();
@@ -1967,13 +3122,7 @@ impl Inspector {
             .as_ref()
             .filter(|edit| edit.focus == focus)
             .map(|edit| SharedString::from(edit.buffer().to_owned()));
-        let shown = match value {
-            Value::Set(number) => format_number(number, spec),
-            // A dash rather than `None`: `None` is the answer for a paint, and a
-            // width is not a paint.
-            Value::Unset => NO_VALUE.to_owned(),
-            Value::Mixed => MIXED.to_owned(),
-        };
+        let shown = words.shown(value, spec);
         let text = editing.unwrap_or_else(|| SharedString::from(shown));
         let dragging = self.scrub.is_some() && self.focus == Some(focus);
         let border = if dragging {
@@ -2040,6 +3189,31 @@ impl Inspector {
                     this.end_scrub(cx);
                 }),
             )
+    }
+
+    /// One labelled number, with the panel's own availability and words.
+    ///
+    /// The shape every numeric row outside the layout section takes: the
+    /// availability comes from the property itself and the words are the
+    /// panel's. The layout section says which of its own numbers it means, so
+    /// it uses [`Self::number_field`] directly.
+    fn panel_number_field(
+        &self,
+        property: Property,
+        object: Option<model::EngineObjectId>,
+        value: Value<f32>,
+        count: usize,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let availability = self.availability(property, &value, count);
+        self.number_field(
+            property,
+            object,
+            value,
+            availability,
+            NumberWords::panel(),
+            cx,
+        )
     }
 
     /// A number offered as one-click values.
@@ -2329,26 +3503,28 @@ fn field_chrome(label: SharedString, value: SharedString, border: u32, dimmed: b
     }
 }
 
-/// A row for a property the document model cannot express.
+/// A run of text above the controls it labels.
 ///
-/// It states the reason rather than drawing a control. Affinity's rule is that
-/// an action which does not apply is disabled rather than silently absent, and
-/// the same reasoning covers a property that does not exist yet: the useful
-/// information is *that it is missing*, not an inviting rectangle.
-fn unsupported_row(label: &'static str, availability: Availability) -> Div {
-    field_chrome(
-        SharedString::from(label),
-        SharedString::from(availability.reason().unwrap_or(NOT_MODELLED)),
-        theme::BORDER_SOFT,
-        true,
-    )
+/// The engine's own panel labels a group of rows this way, and the reason
+/// holds: a row gap with nothing to say which gap it is would be a control
+/// that cannot mean anything.
+fn sublabel(text: &str) -> Div {
+    div()
+        .text_xs()
+        .text_color(rgb(theme::TEXT_MUTED))
+        .child(text.to_owned())
 }
 
-fn unsupported_pair(left: &'static str, right: &'static str, availability: Availability) -> Div {
-    field_pair(
-        unsupported_row(left, availability),
-        unsupported_row(right, availability),
-    )
+/// The reason a row of controls cannot be used.
+///
+/// Said rather than hidden: a dimmed control with no explanation is a control
+/// the user has to guess about, and the reason is usually the one thing that
+/// tells them what to do next.
+fn disabled_note(reason: &'static str) -> Div {
+    div()
+        .text_xs()
+        .text_color(rgb(theme::TEXT_MUTED))
+        .child(reason.to_owned())
 }
 
 /// A section with nothing in it yet.
@@ -2445,6 +3621,10 @@ fn segmented(
         // move its own copy into its own listener without sharing one.
         let option = div()
             .id(SharedString::from(format!("{prefix}-{index}")))
+            // A test looks an option up by the control's name and the option's
+            // index, so a test can say which choice it is clicking. A no-op in
+            // a release build.
+            .debug_selector(|| format!("{prefix}-{index}"))
             .flex()
             .items_center()
             .justify_center()
@@ -2601,6 +3781,8 @@ mod tests {
             }),
             border_radius: Some(0.0),
             opacity: 1.0,
+            auto_layout: None,
+            frame_like: false,
         }
     }
 
@@ -2720,13 +3902,16 @@ mod tests {
         // An unusable control that cannot say why is just a dead rectangle, and
         // a dead rectangle is worse than an absent one because it looks like a
         // promise somebody intends to keep.
-        assert!(!Availability::Disabled(NO_STROKE).is_editable());
-        assert_eq!(Availability::Disabled(NO_STROKE).reason(), Some(NO_STROKE));
-        assert!(!Availability::Unsupported(NOT_MODELLED).is_editable());
-        assert_eq!(
-            Availability::Unsupported(NOT_MODELLED).reason(),
-            Some(NOT_MODELLED)
-        );
+        for reason in [
+            NO_STROKE,
+            MIXED_GEOMETRY,
+            NO_FRAME,
+            NO_AUTO_LAYOUT,
+            MIXED_AUTO_LAYOUT,
+        ] {
+            assert!(!Availability::Disabled(reason).is_editable());
+            assert_eq!(Availability::Disabled(reason).reason(), Some(reason));
+        }
     }
 
     // ── Numbers ─────────────────────────────────────────────────────────────
@@ -3144,6 +4329,153 @@ mod tests {
         );
     }
 
+    // ── Auto layout ─────────────────────────────────────────────────────────
+
+    /// An auto layout, as the model reads one.
+    fn layout(gap: f32) -> model::AutoLayout {
+        model::AutoLayout {
+            mode: model::LayoutMode::Horizontal,
+            wrap: false,
+            gap,
+            cross_gap: 10.0,
+            padding: [10.0; 4],
+            main_align: model::MainAlign::Min,
+            cross_align: model::CrossAlign::Min,
+            content_align: model::ContentAlign::Auto,
+            grid_columns: 2,
+            grid_rows: 2,
+        }
+    }
+
+    /// A frame, with or without an auto layout.
+    fn frame_with(layout: Option<model::AutoLayout>) -> model::DesignObject {
+        let mut object = object(None, None, None, None);
+        object.auto_layout = layout;
+        object.frame_like = true;
+        object
+    }
+
+    #[test]
+    fn a_mixed_selection_shows_mixed_rather_than_one_of_the_values() {
+        let selected = [
+            frame_with(Some(layout(10.0))),
+            frame_with(Some(layout(20.0))),
+        ];
+        let state = LayoutState::read(&selected);
+        assert_eq!(state.gap, Value::Mixed, "two gaps are a disagreement");
+        assert_eq!(
+            NumberWords::layout().shown(state.gap, Property::Gap.spec()),
+            MIXED,
+            "and the field says so rather than showing one of the values"
+        );
+        // The direction the two frames agree about is still shown: a
+        // disagreement about the gap is not a disagreement about everything.
+        assert_eq!(state.mode, Value::Set(model::LayoutMode::Horizontal));
+        assert!(!state.mode.is_mixed());
+    }
+
+    #[test]
+    fn a_selection_without_an_auto_layout_has_no_gap_to_show() {
+        let state = LayoutState::read(&[frame_with(None)]);
+        assert_eq!(state.present, Value::Set(false));
+        assert_eq!(
+            state.gap,
+            Value::Unset,
+            "a frame without an auto layout has no gap at all, which is not a gap of zero"
+        );
+        assert_eq!(
+            NumberWords::layout().shown(state.gap, Property::Gap.spec()),
+            NOT_SET,
+            "and the field says so in the engine's words"
+        );
+    }
+
+    #[test]
+    fn a_gap_the_flow_makes_up_says_auto_rather_than_a_number_nobody_chose() {
+        let mut layout = layout(10.0);
+        layout.main_align = model::MainAlign::SpaceBetween;
+        let state = LayoutState::read(&[frame_with(Some(layout))]);
+        assert!(state.auto_gap());
+        let words = NumberWords {
+            automatic: Some(AUTO),
+            ..NumberWords::layout()
+        };
+        assert_eq!(
+            words.shown(state.gap, Property::Gap.spec()),
+            AUTO,
+            "the free space makes this gap up, so the number in the document is not in use"
+        );
+    }
+
+    #[test]
+    fn a_padding_whose_sides_disagree_is_mixed_rather_than_unset() {
+        let mut layout = layout(10.0);
+        // Left 10, right 8: the padding is there, and there is no one number
+        // for it.
+        layout.padding = [4.0, 8.0, 4.0, 10.0];
+        let state = LayoutState::read(&[frame_with(Some(layout))]);
+        assert_eq!(state.padding_horizontal, Value::Mixed);
+        assert_eq!(
+            state.padding_vertical,
+            Value::Set(4.0),
+            "the sides that do agree are a value"
+        );
+    }
+
+    #[test]
+    fn the_layout_rows_are_only_editable_when_every_layer_has_a_layout() {
+        let with = LayoutState::read(&[frame_with(Some(layout(10.0)))]);
+        assert_eq!(
+            layout_availability(&with, true),
+            Availability::Supported,
+            "a frame with an auto layout can have its gap changed"
+        );
+
+        let without = LayoutState::read(&[frame_with(None)]);
+        assert_eq!(
+            layout_availability(&without, true),
+            Availability::Disabled(NO_AUTO_LAYOUT),
+            "a frame without one cannot: there is no layout to put a gap in"
+        );
+
+        let mixed = LayoutState::read(&[frame_with(Some(layout(10.0))), frame_with(None)]);
+        assert_eq!(
+            layout_availability(&mixed, true),
+            Availability::Disabled(MIXED_AUTO_LAYOUT),
+            "and a selection that disagrees about it cannot either"
+        );
+
+        assert_eq!(
+            layout_availability(&with, false),
+            Availability::Disabled(NO_FRAME),
+            "the engine's own rule: an auto layout needs a frame"
+        );
+    }
+
+    #[test]
+    fn an_auto_layout_is_a_number_of_the_engines_own_words() {
+        // The engine's spelling is the contract: `node.set` accepts these and
+        // nothing else.
+        assert_eq!(model::LayoutMode::Vertical.prop_value(), "vertical");
+        assert_eq!(model::LayoutMode::Horizontal.prop_value(), "horizontal");
+        assert_eq!(model::LayoutMode::Grid.prop_value(), "grid");
+        assert_eq!(model::MainAlign::Min.prop_value(), "min");
+        assert_eq!(model::MainAlign::SpaceBetween.prop_value(), "spaceBetween");
+        assert_eq!(model::MainAlign::SpaceAround.prop_value(), "spaceAround");
+        assert_eq!(model::MainAlign::SpaceEvenly.prop_value(), "spaceEvenly");
+        assert_eq!(model::CrossAlign::Baseline.prop_value(), "baseline");
+        assert_eq!(model::ContentAlign::Auto.prop_value(), "auto");
+        assert_eq!(
+            model::ContentAlign::SpaceBetween.prop_value(),
+            "spaceBetween"
+        );
+        assert!(
+            model::MainAlign::SpaceBetween.is_auto_gap(),
+            "the auto gaps are the ones the free space makes up"
+        );
+        assert!(!model::MainAlign::Center.is_auto_gap());
+    }
+
     // ── The layer name ──────────────────────────────────────────────────────
 
     #[test]
@@ -3277,6 +4609,51 @@ mod tests {
         (session, id.0)
     }
 
+    /// A session over a document with one frame on it, selected, with an auto
+    /// layout.
+    ///
+    /// A frame, because an auto layout belongs to a frame: the layout rows are
+    /// only real for one.
+    fn session_with_a_selected_frame() -> (Rc<RefCell<figcraft_engine::Session>>, u64) {
+        frame_session(true)
+    }
+
+    /// A session over a document with one frame on it, selected, with no auto
+    /// layout.
+    fn session_with_a_selected_bare_frame() -> (Rc<RefCell<figcraft_engine::Session>>, u64) {
+        frame_session(false)
+    }
+
+    /// A session over a document with one frame on it, selected.
+    fn frame_session(with_layout: bool) -> (Rc<RefCell<figcraft_engine::Session>>, u64) {
+        let mut doc = figcraft_doc::Document::new("test");
+        let page = doc.add_page("Page 1");
+        let id = doc
+            .create(
+                page,
+                figcraft_doc::NodeKind::Frame,
+                "Row",
+                10.0,
+                20.0,
+                300.0,
+                200.0,
+            )
+            .expect("a frame");
+        let session = Rc::new(RefCell::new(figcraft_engine::Session::with_document(doc)));
+        {
+            let mut session = session.borrow_mut();
+            if with_layout {
+                session
+                    .execute("layout.add", &serde_json::json!({ "ids": [id.0] }))
+                    .expect("the frame gets an auto layout");
+            }
+            session
+                .execute("select.set", &serde_json::json!({ "ids": [id.0] }))
+                .expect("the layer is selected");
+        }
+        (session, id.0)
+    }
+
     /// A root view that shows the Inspector on its own.
     ///
     /// The panel is normally a part of the shell; a test that wants to see what
@@ -3300,6 +4677,34 @@ mod tests {
         u64,
     ) {
         let (session, id) = session_with_a_selected_rectangle();
+        open_panel_over(cx, session, id)
+    }
+
+    /// Open a window with the Inspector in it, over a session with one
+    /// selected frame that has an auto layout.
+    fn open_panel_with_a_frame(
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        Entity<Panel>,
+        &mut gpui::VisualTestContext,
+        Rc<RefCell<figcraft_engine::Session>>,
+        u64,
+    ) {
+        let (session, id) = session_with_a_selected_frame();
+        open_panel_over(cx, session, id)
+    }
+
+    /// Open a window with the Inspector in it, over the given session.
+    fn open_panel_over(
+        cx: &mut gpui::TestAppContext,
+        session: Rc<RefCell<figcraft_engine::Session>>,
+        id: u64,
+    ) -> (
+        Entity<Panel>,
+        &mut gpui::VisualTestContext,
+        Rc<RefCell<figcraft_engine::Session>>,
+        u64,
+    ) {
         let (root, window) = cx.add_window_view(|_, cx| {
             let engine = cx.new(|cx| EngineCanvas::from_handle(Rc::clone(&session), cx));
             let inspector = cx.new(|_| Inspector::new());
@@ -3398,6 +4803,74 @@ mod tests {
             "the engine's document holds the value the panel committed"
         );
         assert_eq!(node.id, model::EngineObjectId(id));
+    }
+
+    #[gpui::test]
+    fn the_layout_rows_fit_inside_the_panel(cx: &mut gpui::TestAppContext) {
+        // The panel is 264 points wide and the layout rows are the widest
+        // thing in it. A row that runs off the edge is a row the user cannot
+        // read: the value is cut in half, and the control that was supposed to
+        // say "Not set" says "Not se" instead.
+        let (root, window, _session, _id) = open_panel_with_a_frame(cx);
+        window.draw(
+            point(px(0.0), px(0.0)),
+            size(px(300.0), px(900.0)),
+            |_, _| root.clone().into_any_element(),
+        );
+        window.run_until_parked();
+
+        // The panel's own padding, so the rows are measured against the space
+        // they are actually given.
+        let edge = px(264.0 - 14.0);
+        for selector in [
+            "inspector-layout-direction-0",
+            "inspector-layout-direction-1",
+            "inspector-layout-direction-2",
+            "inspector-layout-wrap-0",
+            "inspector-layout-gap-mode",
+            "inspector-layout-align-1-1",
+            "inspector-selection-gap",
+            "inspector-selection-padding-h",
+            "inspector-selection-padding-v",
+        ] {
+            let bounds = window
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("the panel draws {selector}"));
+            assert!(
+                bounds.right() <= edge,
+                "{selector} runs off the panel: {bounds:?}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn a_layout_row_that_cannot_be_used_does_not_change_the_document(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // A frame with no auto layout: the layout rows are dimmed, and a
+        // dimmed row that still writes is a row that lies about being dimmed.
+        let (session, id) = session_with_a_selected_bare_frame();
+        let (root, window, _session, _id) = open_panel_over(cx, session, id);
+        window.draw(
+            point(px(0.0), px(0.0)),
+            size(px(300.0), px(900.0)),
+            |_, _| root.clone().into_any_element(),
+        );
+        window.run_until_parked();
+
+        let cell = window
+            .debug_bounds("inspector-layout-align-1-1")
+            .expect("the panel draws the alignment picker");
+        window.simulate_click(cell.center(), gpui::Modifiers::none());
+        window.run_until_parked();
+
+        let session = _session.borrow();
+        let doc = session.doc().expect("a document");
+        let node = doc.node(model::EngineObjectId(id)).expect("the frame");
+        assert_eq!(
+            node.layout, None,
+            "a dimmed alignment cell wrote an auto layout into a frame that has none"
+        );
     }
 
     #[gpui::test]

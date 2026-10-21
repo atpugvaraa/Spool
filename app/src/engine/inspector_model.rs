@@ -153,6 +153,18 @@ pub struct DesignObject {
     pub border_radius: Option<f32>,
     /// The layer's opacity, from 0 to 1.
     pub opacity: f32,
+    /// The auto layout the layer has, if it has one.
+    ///
+    /// `None` for a layer that has none: a frame without an auto layout has no
+    /// gap, no padding and no alignment at all, which is not the same as a
+    /// layout whose gap happens to be zero.
+    pub auto_layout: Option<AutoLayout>,
+    /// Whether the layer is one that can hold an auto layout.
+    ///
+    /// The engine's own question (`NodeKind::is_frame_like`), asked here so the
+    /// panel can say "auto layout needs a frame" instead of guessing from the
+    /// kind's label.
+    pub frame_like: bool,
 }
 
 /// A change to a layer's paint or its typography.
@@ -198,6 +210,272 @@ impl BoxProperty {
     }
 }
 
+// ── Auto layout ──────────────────────────────────────────────────────────────
+//
+// The engine's own layout model, in the panel's vocabulary.
+//
+// The engine decides what a layout *is*: a frame either has one or it does
+// not, and a frame that has one has concrete values for every part of it. The
+// panel's job is to show those values honestly — including the difference
+// between "the gap is ten" and "there is no gap here at all", which is why
+// the reading is an `Option` all the way up.
+
+/// The direction an auto layout flows in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayoutMode {
+    Horizontal,
+    Vertical,
+    Grid,
+}
+
+impl LayoutMode {
+    /// The label the panel shows.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Horizontal => "Horizontal",
+            Self::Vertical => "Vertical",
+            Self::Grid => "Grid",
+        }
+    }
+
+    /// The engine's spelling of this direction in a `node.set` prop.
+    ///
+    /// The engine's words, not the panel's: `node.set` accepts `horizontal`,
+    /// `vertical` and `grid`, and nothing else.
+    pub fn prop_value(self) -> &'static str {
+        match self {
+            Self::Horizontal => "horizontal",
+            Self::Vertical => "vertical",
+            Self::Grid => "grid",
+        }
+    }
+
+    fn from_engine(mode: figcraft_doc::LayoutMode) -> Self {
+        match mode {
+            figcraft_doc::LayoutMode::Horizontal => Self::Horizontal,
+            figcraft_doc::LayoutMode::Vertical => Self::Vertical,
+            figcraft_doc::LayoutMode::Grid => Self::Grid,
+        }
+    }
+}
+
+/// The alignment along the main axis of an auto layout.
+///
+/// The `Space*` modes are the auto gaps: the free space goes between the
+/// children instead of the gap value deciding it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MainAlign {
+    Min,
+    Center,
+    Max,
+    SpaceBetween,
+    SpaceAround,
+    SpaceEvenly,
+}
+
+impl MainAlign {
+    /// The label the panel shows.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Min => "Min",
+            Self::Center => "Center",
+            Self::Max => "Max",
+            Self::SpaceBetween => "Space between",
+            Self::SpaceAround => "Space around",
+            Self::SpaceEvenly => "Space evenly",
+        }
+    }
+
+    /// The engine's spelling of this alignment in a `node.set` prop.
+    pub fn prop_value(self) -> &'static str {
+        match self {
+            Self::Min => "min",
+            Self::Center => "center",
+            Self::Max => "max",
+            Self::SpaceBetween => "spaceBetween",
+            Self::SpaceAround => "spaceAround",
+            Self::SpaceEvenly => "spaceEvenly",
+        }
+    }
+
+    /// Whether the gap comes from the free space rather than from the gap.
+    pub fn is_auto_gap(self) -> bool {
+        matches!(
+            self,
+            Self::SpaceBetween | Self::SpaceAround | Self::SpaceEvenly
+        )
+    }
+
+    /// The alignment a picker cell stands for.
+    ///
+    /// The picker offers three cells along the main axis, and the auto gaps
+    /// are not among them: an auto gap is chosen by the gap's own menu.
+    pub fn from_index(index: usize) -> Option<Self> {
+        match index {
+            0 => Some(Self::Min),
+            1 => Some(Self::Center),
+            2 => Some(Self::Max),
+            _ => None,
+        }
+    }
+
+    fn from_engine(align: figcraft_doc::MainAlign) -> Self {
+        match align {
+            figcraft_doc::MainAlign::Min => Self::Min,
+            figcraft_doc::MainAlign::Center => Self::Center,
+            figcraft_doc::MainAlign::Max => Self::Max,
+            figcraft_doc::MainAlign::SpaceBetween => Self::SpaceBetween,
+            figcraft_doc::MainAlign::SpaceAround => Self::SpaceAround,
+            figcraft_doc::MainAlign::SpaceEvenly => Self::SpaceEvenly,
+        }
+    }
+}
+
+/// The alignment across the main axis of an auto layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CrossAlign {
+    Min,
+    Center,
+    Max,
+    /// The children's text sits on one baseline.
+    Baseline,
+}
+
+impl CrossAlign {
+    /// The label the panel shows.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Min => "Min",
+            Self::Center => "Center",
+            Self::Max => "Max",
+            Self::Baseline => "Baseline",
+        }
+    }
+
+    /// The engine's spelling of this alignment in a `node.set` prop.
+    pub fn prop_value(self) -> &'static str {
+        match self {
+            Self::Min => "min",
+            Self::Center => "center",
+            Self::Max => "max",
+            Self::Baseline => "baseline",
+        }
+    }
+
+    /// The alignment a picker cell stands for.
+    ///
+    /// The picker offers three cells across the cross axis; the baseline is not
+    /// among them, because it is a stack's own choice rather than a place.
+    pub fn from_index(index: usize) -> Option<Self> {
+        match index {
+            0 => Some(Self::Min),
+            1 => Some(Self::Center),
+            2 => Some(Self::Max),
+            _ => None,
+        }
+    }
+
+    fn from_engine(align: figcraft_doc::CrossAlign) -> Self {
+        match align {
+            figcraft_doc::CrossAlign::Min => Self::Min,
+            figcraft_doc::CrossAlign::Center => Self::Center,
+            figcraft_doc::CrossAlign::Max => Self::Max,
+            figcraft_doc::CrossAlign::Baseline => Self::Baseline,
+        }
+    }
+}
+
+/// How the lines of a wrapping layout share the free space across the flow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContentAlign {
+    /// Packed, `cross_gap` apart.
+    Auto,
+    /// The free space goes between the lines.
+    SpaceBetween,
+}
+
+impl ContentAlign {
+    /// The label the panel shows.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Fixed gap",
+            Self::SpaceBetween => "Space between",
+        }
+    }
+
+    /// The engine's spelling of this alignment in a `node.set` prop.
+    pub fn prop_value(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::SpaceBetween => "spaceBetween",
+        }
+    }
+
+    fn from_engine(align: figcraft_doc::ContentAlign) -> Self {
+        match align {
+            figcraft_doc::ContentAlign::Auto => Self::Auto,
+            figcraft_doc::ContentAlign::SpaceBetween => Self::SpaceBetween,
+        }
+    }
+}
+
+/// The auto layout a frame has.
+///
+/// The engine's layout, in the panel's units: the same directions, the same
+/// alignments, and the same numbers the engine holds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AutoLayout {
+    pub mode: LayoutMode,
+    /// Whether the flow wraps: rows of a horizontal one, columns of a vertical.
+    pub wrap: bool,
+    /// The gap between the items along the main axis.
+    pub gap: f32,
+    /// The gap between the wrapped rows or columns.
+    pub cross_gap: f32,
+    /// The padding, `[top, right, bottom, left]`.
+    pub padding: [f32; 4],
+    pub main_align: MainAlign,
+    pub cross_align: CrossAlign,
+    pub content_align: ContentAlign,
+    pub grid_columns: u32,
+    pub grid_rows: u32,
+}
+
+/// A change to the selection's auto layout.
+///
+/// One variant per thing the panel can change, so a change the engine has no
+/// command for cannot be written down as though it had one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LayoutEdit {
+    /// The direction the flow runs in.
+    Mode(LayoutMode),
+    /// Whether the flow wraps.
+    Wrap(bool),
+    /// The gap between the items along the main axis.
+    Gap(f32),
+    /// The gap between the wrapped rows or columns.
+    ///
+    /// A typed gap is a fixed gap, so this also says so: the engine's
+    /// `contentAlign` decides whether the lines are packed or spread.
+    CrossGap(f32),
+    /// The padding on the left and the right.
+    PaddingHorizontal(f32),
+    /// The padding at the top and the bottom.
+    PaddingVertical(f32),
+    /// The alignment along the main axis.
+    MainAlign(MainAlign),
+    /// The alignment across the main axis.
+    CrossAlign(CrossAlign),
+    /// The alignment on both axes, as the alignment picker sets them.
+    Alignment { main: MainAlign, cross: CrossAlign },
+    /// How the wrapped lines share the free space.
+    ContentAlign(ContentAlign),
+    /// The number of grid columns.
+    GridColumns(f32),
+    /// The number of grid rows.
+    GridRows(f32),
+}
+
 // ── Reading ──────────────────────────────────────────────────────────────────
 
 /// The layers the engine has selected, with the properties the panel shows.
@@ -225,6 +503,34 @@ pub fn object(doc: &Document, id: NodeId) -> Option<DesignObject> {
         stroke: stroke_of(node),
         border_radius: node.corners.uniform().map(|radius| radius as f32),
         opacity: node.opacity,
+        auto_layout: auto_layout_of(node),
+        frame_like: node.kind.is_frame_like(),
+    })
+}
+
+/// The auto layout a node has, if it has one.
+///
+/// The engine's layout, read into the panel's vocabulary. A node with no auto
+/// layout has none of these values at all: there is no gap to be zero and no
+/// padding to be unset, because the layout itself is not there.
+fn auto_layout_of(node: &Node) -> Option<AutoLayout> {
+    let layout = node.layout.as_ref()?;
+    Some(AutoLayout {
+        mode: LayoutMode::from_engine(layout.mode),
+        wrap: layout.wrap,
+        gap: layout.gap as f32,
+        cross_gap: layout.cross_gap as f32,
+        padding: [
+            layout.padding[0] as f32,
+            layout.padding[1] as f32,
+            layout.padding[2] as f32,
+            layout.padding[3] as f32,
+        ],
+        main_align: MainAlign::from_engine(layout.main_align),
+        cross_align: CrossAlign::from_engine(layout.cross_align),
+        content_align: ContentAlign::from_engine(layout.content_align),
+        grid_columns: layout.grid_columns,
+        grid_rows: layout.grid_rows,
     })
 }
 
@@ -342,6 +648,49 @@ pub fn rename_command(id: EngineObjectId, name: &str) -> (String, Value) {
             ("ids", id_list(&[id])),
             ("name", Value::String(name.to_owned())),
         ]),
+    )
+}
+
+/// The command that writes one change to the selection's auto layout.
+///
+/// An auto layout is a property of the frame, not of one of its children, so
+/// this takes the whole selection rather than one layer: "make these all
+/// flow this way" is one operation.
+///
+/// The keys are the engine's own: `layout`, `gap`, `crossGap`,
+/// `paddingHorizontal`, `paddingVertical`, `mainAlign`, `crossAlign`,
+/// `contentAlign`, `wrap`, `gridColumns` and `gridRows`.
+pub fn layout_command(edit: &LayoutEdit, ids: &[NodeId]) -> (String, Value) {
+    let entries: Vec<(&str, Value)> = match edit {
+        LayoutEdit::Mode(mode) => vec![("layout", Value::String(mode.prop_value().to_owned()))],
+        LayoutEdit::Wrap(on) => vec![("wrap", Value::Bool(*on))],
+        LayoutEdit::Gap(gap) => vec![("gap", number(*gap))],
+        // A typed cross gap is a fixed gap: the lines stop being spread out.
+        LayoutEdit::CrossGap(gap) => vec![
+            ("crossGap", number(*gap)),
+            ("contentAlign", Value::String("auto".to_owned())),
+        ],
+        LayoutEdit::PaddingHorizontal(padding) => vec![("paddingHorizontal", number(*padding))],
+        LayoutEdit::PaddingVertical(padding) => vec![("paddingVertical", number(*padding))],
+        LayoutEdit::MainAlign(align) => {
+            vec![("mainAlign", Value::String(align.prop_value().to_owned()))]
+        }
+        LayoutEdit::CrossAlign(align) => {
+            vec![("crossAlign", Value::String(align.prop_value().to_owned()))]
+        }
+        LayoutEdit::Alignment { main, cross } => vec![
+            ("mainAlign", Value::String(main.prop_value().to_owned())),
+            ("crossAlign", Value::String(cross.prop_value().to_owned())),
+        ],
+        LayoutEdit::ContentAlign(align) => {
+            vec![("contentAlign", Value::String(align.prop_value().to_owned()))]
+        }
+        LayoutEdit::GridColumns(count) => vec![("gridColumns", number(*count))],
+        LayoutEdit::GridRows(count) => vec![("gridRows", number(*count))],
+    };
+    (
+        "node.set".to_owned(),
+        params(vec![("ids", id_list(ids)), ("props", props(entries))]),
     )
 }
 
@@ -514,6 +863,187 @@ mod tests {
         assert_eq!(object.text_content.as_deref(), Some("Headline"));
         assert_eq!(object.font_size, Some(24.0));
         assert_eq!(object.kind, "Text");
+    }
+
+    // ── Auto layout ─────────────────────────────────────────────────────────
+
+    /// A frame with an auto layout, as the engine holds one.
+    fn frame_with_layout() -> (Document, NodeId) {
+        let mut doc = Document::new("test");
+        let page = doc.add_page("Page 1");
+        let id = doc
+            .create(page, NodeKind::Frame, "Row", 0.0, 0.0, 200.0, 100.0)
+            .expect("a frame");
+        let layout = figcraft_doc::AutoLayout {
+            mode: figcraft_doc::LayoutMode::Vertical,
+            wrap: true,
+            gap: 12.0,
+            cross_gap: 7.0,
+            padding: [4.0, 8.0, 6.0, 10.0],
+            main_align: figcraft_doc::MainAlign::SpaceBetween,
+            cross_align: figcraft_doc::CrossAlign::Baseline,
+            content_align: figcraft_doc::ContentAlign::SpaceBetween,
+            grid_columns: 3,
+            grid_rows: 5,
+            ..Default::default()
+        };
+        doc.get_mut(id).expect("the frame").layout = Some(layout);
+        (doc, id)
+    }
+
+    #[test]
+    fn a_frame_with_an_auto_layout_reads_the_engines_values_for_it() {
+        let (doc, id) = frame_with_layout();
+        let object = object(&doc, id).expect("the frame");
+        let layout = object
+            .auto_layout
+            .expect("the frame has an auto layout, so it has its values");
+        assert_eq!(layout.mode, LayoutMode::Vertical);
+        assert!(layout.wrap);
+        assert_eq!(layout.gap, 12.0);
+        assert_eq!(layout.cross_gap, 7.0);
+        assert_eq!(layout.padding, [4.0, 8.0, 6.0, 10.0]);
+        assert_eq!(layout.main_align, MainAlign::SpaceBetween);
+        assert_eq!(layout.cross_align, CrossAlign::Baseline);
+        assert_eq!(layout.content_align, ContentAlign::SpaceBetween);
+        assert_eq!(layout.grid_columns, 3);
+        assert_eq!(layout.grid_rows, 5);
+        assert!(
+            object.frame_like,
+            "a frame is one of the layers that can hold an auto layout"
+        );
+    }
+
+    #[test]
+    fn a_layer_without_an_auto_layout_has_no_layout_at_all() {
+        let (doc, id) = document_with_rectangle();
+        let object = object(&doc, id).expect("the layer");
+        assert_eq!(
+            object.auto_layout, None,
+            "a frame without an auto layout has no gap to be zero and no padding to be unset"
+        );
+        assert!(
+            !object.frame_like,
+            "a rectangle is not one of the layers that can hold an auto layout"
+        );
+    }
+
+    #[test]
+    fn a_layout_edit_names_the_engine_key_it_writes() {
+        let (command, params) =
+            layout_command(&LayoutEdit::Mode(LayoutMode::Vertical), &[NodeId(3)]);
+        assert_eq!(command, "node.set");
+        assert_eq!(params["ids"], serde_json::json!([3]));
+        assert_eq!(params["props"]["layout"], serde_json::json!("vertical"));
+
+        let (_, params) = layout_command(&LayoutEdit::Wrap(true), &[NodeId(3)]);
+        assert_eq!(params["props"]["wrap"], serde_json::json!(true));
+
+        let (_, params) = layout_command(&LayoutEdit::Gap(16.0), &[NodeId(3)]);
+        assert_eq!(params["props"]["gap"], serde_json::json!(16.0));
+
+        let (_, params) = layout_command(&LayoutEdit::CrossGap(8.0), &[NodeId(3)]);
+        assert_eq!(params["props"]["crossGap"], serde_json::json!(8.0));
+        assert_eq!(
+            params["props"]["contentAlign"],
+            serde_json::json!("auto"),
+            "a typed cross gap is a fixed gap"
+        );
+
+        let (_, params) = layout_command(&LayoutEdit::PaddingHorizontal(5.0), &[NodeId(3)]);
+        assert_eq!(params["props"]["paddingHorizontal"], serde_json::json!(5.0));
+
+        let (_, params) = layout_command(&LayoutEdit::PaddingVertical(9.0), &[NodeId(3)]);
+        assert_eq!(params["props"]["paddingVertical"], serde_json::json!(9.0));
+
+        let (_, params) =
+            layout_command(&LayoutEdit::MainAlign(MainAlign::SpaceEvenly), &[NodeId(3)]);
+        assert_eq!(
+            params["props"]["mainAlign"],
+            serde_json::json!("spaceEvenly")
+        );
+
+        let (_, params) =
+            layout_command(&LayoutEdit::CrossAlign(CrossAlign::Baseline), &[NodeId(3)]);
+        assert_eq!(params["props"]["crossAlign"], serde_json::json!("baseline"));
+
+        let (_, params) = layout_command(
+            &LayoutEdit::ContentAlign(ContentAlign::SpaceBetween),
+            &[NodeId(3)],
+        );
+        assert_eq!(
+            params["props"]["contentAlign"],
+            serde_json::json!("spaceBetween")
+        );
+
+        let (_, params) = layout_command(&LayoutEdit::GridColumns(4.0), &[NodeId(3)]);
+        assert_eq!(params["props"]["gridColumns"], serde_json::json!(4.0));
+
+        let (_, params) = layout_command(&LayoutEdit::GridRows(2.0), &[NodeId(3)]);
+        assert_eq!(params["props"]["gridRows"], serde_json::json!(2.0));
+    }
+
+    #[test]
+    fn a_layout_edit_applies_to_the_whole_selection() {
+        let (_, params) =
+            layout_command(&LayoutEdit::Mode(LayoutMode::Grid), &[NodeId(1), NodeId(2)]);
+        assert_eq!(params["ids"], serde_json::json!([1, 2]));
+    }
+
+    #[test]
+    fn the_engine_accepts_the_layout_commands() {
+        let (doc, id) = frame_with_layout();
+        let mut session = Session::with_document(doc);
+
+        let (command, params) = layout_command(&LayoutEdit::Mode(LayoutMode::Grid), &[id]);
+        session
+            .execute(&command, &params)
+            .expect("the engine accepts the command");
+        let doc = session.doc().expect("a document");
+        let node = doc.node(id).expect("the frame");
+        assert_eq!(
+            node.layout.as_ref().expect("the frame has a layout").mode,
+            figcraft_doc::LayoutMode::Grid,
+            "the engine's document holds the direction the panel wrote"
+        );
+
+        let (command, params) = layout_command(&LayoutEdit::Gap(24.0), &[id]);
+        session
+            .execute(&command, &params)
+            .expect("the engine accepts the command");
+        let (command, params) = layout_command(&LayoutEdit::PaddingHorizontal(6.0), &[id]);
+        session
+            .execute(&command, &params)
+            .expect("the engine accepts the command");
+        let (command, params) =
+            layout_command(&LayoutEdit::MainAlign(MainAlign::SpaceAround), &[id]);
+        session
+            .execute(&command, &params)
+            .expect("the engine accepts the command");
+        let doc = session.doc().expect("a document");
+        let layout = doc
+            .node(id)
+            .expect("the frame")
+            .layout
+            .clone()
+            .expect("the frame has a layout");
+        assert_eq!(layout.gap, 24.0);
+        assert_eq!(layout.padding[1], 6.0);
+        assert_eq!(layout.padding[3], 6.0);
+        assert_eq!(layout.main_align, figcraft_doc::MainAlign::SpaceAround);
+    }
+
+    #[test]
+    fn the_engine_refuses_a_layout_on_something_that_is_not_a_frame() {
+        // The panel's own reason for offering the rows at all: the engine says
+        // no, and the panel says the same thing rather than guessing.
+        let (doc, id) = document_with_rectangle();
+        let mut session = Session::with_document(doc);
+        let (command, params) = layout_command(&LayoutEdit::Mode(LayoutMode::Vertical), &[id]);
+        assert!(
+            session.execute(&command, &params).is_err(),
+            "the engine refuses an auto layout on a rectangle"
+        );
     }
 
     #[test]
