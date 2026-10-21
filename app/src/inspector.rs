@@ -93,6 +93,7 @@ use crate::engine::panel_prototyping::{
 use crate::engine::panel_styles::{
     self as panel_styles, StylesAction, StylesHost, StylesModel, StylesPanelState,
 };
+use crate::engine::panel_vector as panel_vector;
 use crate::engine::panel_typography::{
     self as panel_typography, TypographyAction, TypographyHost, TypographyModel,
     TypographyPanelState,
@@ -3053,7 +3054,35 @@ impl Inspector {
 
     // ── Sections ────────────────────────────────────────────────────────────
 
+    /// The vector edit surface's model, when a vector is being edited.
+    ///
+    /// While the canvas is in vector edit mode the Design panel shows the
+    /// POINTS, not the layer -- that is what figcraft does, and the points
+    /// are a different set of facts with a different set of commands.
+    fn vector_model(&self, cx: &mut Context<Self>) -> Option<panel_vector::VectorModel> {
+        let engine = self.engine.as_ref()?;
+        engine.read(cx).with_session(|session| {
+            let edit = figcraft_engine::vectoredit::editing(session).ok()?;
+            let doc = session.doc().ok()?;
+            Some(panel_vector::VectorModel::read(doc, &edit))
+        })
+    }
+
     fn position_section(&self, selected: &[model::DesignObject], cx: &mut Context<Self>) -> Div {
+        // A VECTOR IN EDIT MODE SHOWS ITS POINTS, not the layer.
+        //
+        // The layer's own position and size are the wrong facts here: the
+        // points have their own transform box, their own corner radius, their
+        // own mirroring, and their own cap and join. So the section is
+        // replaced, not added to.
+        if let Some(model) = self.vector_model(cx) {
+            return self.inspector_section(
+                model.title(),
+                SectionSlot::POSITION,
+                panel_vector::section(&model),
+                cx,
+            );
+        }
         let object = selected.first().map(|object| object.id);
         let count = selected.len();
         let body = section_body()
