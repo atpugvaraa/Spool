@@ -1043,3 +1043,393 @@ fn cursor(
         },
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use figcraft_doc::NodeKind;
+    use gpui::{Context, Entity, Modifiers, Render, TestAppContext, VisualTestContext};
+    use serde_json::json;
+
+    /// A session with one page and nothing on it, and the rulers on.
+    ///
+    /// The camera looks at the page's origin from the middle of a 1200x900
+    /// window, so the page's origin is at the window's centre and a page
+    /// coordinate is 600 to the left of the window's and 450 above it.
+    fn session_with_a_page() -> (Rc<RefCell<Session>>, NodeId) {
+        let doc = Document::new("Project");
+        let page = doc.pages[0];
+        let session = Rc::new(RefCell::new(Session::with_document(doc)));
+        {
+            let mut session = session.borrow_mut();
+            let ds = session.ds_mut().expect("a document");
+            ds.view.rulers = true;
+            ds.view.vw = 1200.0;
+            ds.view.vh = 900.0;
+            ds.view.cx = 0.0;
+            ds.view.cy = 0.0;
+            ds.view.zoom = 1.0;
+        }
+        (session, page)
+    }
+
+    /// A session with one page and one frame on it, and the rulers on.
+    fn session_with_a_frame() -> (Rc<RefCell<Session>>, NodeId, NodeId) {
+        let mut doc = Document::new("Project");
+        let page = doc.pages[0];
+        let frame = doc
+            .create(page, NodeKind::Frame, "Hero", 0.0, 0.0, 560.0, 460.0)
+            .expect("a frame");
+        let session = Rc::new(RefCell::new(Session::with_document(doc)));
+        {
+            let mut session = session.borrow_mut();
+            let ds = session.ds_mut().expect("a document");
+            ds.view.rulers = true;
+            ds.view.vw = 1200.0;
+            ds.view.vh = 900.0;
+            ds.view.cx = 0.0;
+            ds.view.cy = 0.0;
+            ds.view.zoom = 1.0;
+        }
+        (session, page, frame)
+    }
+
+    /// The guides on a node, in the document.
+    fn guides_of(session: &Rc<RefCell<Session>>, id: NodeId) -> Vec<figcraft_doc::Guide> {
+        let session = session.borrow();
+        let doc = session.doc().expect("a document");
+        doc.node(id)
+            .map(|n| n.guides().to_vec())
+            .unwrap_or_default()
+    }
+
+    // --- the model ---------------------------------------------------------
+
+    #[test]
+    fn a_page_guide_and_a_frame_guide_are_both_placed() {
+        let (session, page, frame) = session_with_a_frame();
+        {
+            let mut session = session.borrow_mut();
+            session
+                .execute("guide.add", &json!({ "vertical": true, "offset": 100.0 }))
+                .expect("a page guide");
+            session
+                .execute(
+                    "guide.add",
+                    &json!({ "vertical": false, "offset": 50.0, "frame": frame }),
+                )
+                .expect("a frame guide");
+        }
+        let session = session.borrow();
+        let doc = session.doc().expect("a document");
+        let placed = placed_guides(&doc, page);
+        assert_eq!(placed.len(), 2, "both guides are placed: {placed:?}");
+        assert_eq!(placed[0].owner, page, "the page's own guide comes first");
+        assert_eq!(placed[0].index, 0);
+        assert_eq!(placed[0].offset, 100.0);
+        assert!(
+            placed[0].line.is_none(),
+            "a page guide crosses the whole canvas"
+        );
+        assert_eq!(placed[1].owner, frame, "and then the frame's");
+        assert_eq!(placed[1].index, 0);
+        assert_eq!(placed[1].offset, 50.0);
+        assert!(placed[1].line.is_some(), "a frame guide spans its frame");
+    }
+
+    #[test]
+    fn a_guide_dropped_on_a_frame_belongs_to_that_frame() {
+        let (session, page, frame) = session_with_a_frame();
+        let session = session.borrow();
+        let doc = session.doc().expect("a document");
+        // The pointer is over the frame, which sits at the page's origin.
+        let placed =
+            drop_target(&doc, page, Point::new(100.0, 100.0), true, true).expect("a guide to land");
+        assert_eq!(placed.owner, frame, "the frame under the pointer owns it");
+        assert_eq!(
+            placed.offset, 100.0,
+            "and the offset is in the frame's own coordinates"
+        );
+        assert!(placed.line.is_some(), "so the guide spans the frame");
+    }
+
+    #[test]
+    fn a_guide_dropped_on_the_page_belongs_to_the_page() {
+        let (session, page, _frame) = session_with_a_frame();
+        let session = session.borrow();
+        let doc = session.doc().expect("a document");
+        // The pointer is past the frame's right edge.
+        let placed =
+            drop_target(&doc, page, Point::new(900.0, 100.0), true, true).expect("a guide");
+        assert_eq!(placed.owner, page, "the page owns the guide");
+        assert_eq!(placed.offset, 900.0);
+        assert!(placed.line.is_none(), "and it crosses the whole canvas");
+    }
+
+    #[test]
+    fn a_frame_guide_names_its_frame_and_a_page_guide_does_not() {
+        let page = NodeId(1);
+        let frame = NodeId(2);
+        let params = owned(frame, page, json!({ "index": 0 }));
+        assert_eq!(
+            params["frame"],
+            json!(frame),
+            "a frame guide names the frame it belongs to"
+        );
+        let params = owned(page, page, json!({ "index": 0 }));
+        assert!(
+            params.get("frame").is_none(),
+            "a page guide needs no owner: {params}"
+        );
+    }
+
+    #[test]
+    fn a_guide_is_clipped_to_the_canvas_so_it_does_not_run_under_the_rulers() {
+        let lo = point(20.0, 20.0);
+        let hi = point(600.0, 400.0);
+        let clipped = clip_to_box(point(10.0, 0.0), point(10.0, 400.0), lo, hi);
+        assert!(
+            clipped.is_none(),
+            "a guide to the left of the ruler shows nowhere"
+        );
+        let clipped =
+            clip_to_box(point(100.0, 0.0), point(100.0, 400.0), lo, hi).expect("a guide to show");
+        assert_eq!(clipped[0].y, 20.0, "the part under the ruler is not drawn");
+        assert_eq!(clipped[1].y, 400.0, "and the rest is");
+    }
+
+    #[test]
+    fn the_distance_to_a_guide_is_measured_along_it() {
+        let a = point(0.0, 0.0);
+        let b = point(100.0, 0.0);
+        assert_eq!(distance_to_segment(point(50.0, 4.0), a, b), 4.0);
+        assert_eq!(distance_to_segment(point(-10.0, 0.0), a, b), 10.0);
+    }
+
+    // --- the layer, in a real window ---------------------------------------
+
+    /// The guides layer on its own, in a window.
+    struct LayerView {
+        session: Rc<RefCell<Session>>,
+        state: Rc<RefCell<GuideState>>,
+        focus: FocusHandle,
+    }
+
+    impl LayerView {
+        fn new(
+            session: Rc<RefCell<Session>>,
+            state: Rc<RefCell<GuideState>>,
+            cx: &mut Context<Self>,
+        ) -> Self {
+            Self {
+                session,
+                state,
+                focus: cx.focus_handle(),
+            }
+        }
+    }
+
+    impl Render for LayerView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(
+                GuidesLayer::new(self.session.clone(), self.focus.clone(), self.state.clone())
+                    .element(),
+            )
+        }
+    }
+
+    /// The window the layer is drawn in.
+    const WINDOW: (f32, f32) = (1200.0, 900.0);
+
+    /// The layer, drawn in a window of its own.
+    fn open_layer(
+        cx: &mut TestAppContext,
+        session: Rc<RefCell<Session>>,
+    ) -> (Entity<LayerView>, &mut VisualTestContext) {
+        let state = Rc::new(RefCell::new(GuideState::default()));
+        let (view, window) = cx.add_window_view({
+            let session = session.clone();
+            let state = state.clone();
+            move |_, cx| LayerView::new(session, state, cx)
+        });
+        window.draw(
+            point(px(0.0), px(0.0)),
+            size(px(WINDOW.0), px(WINDOW.1)),
+            |_, _| view.clone().into_any_element(),
+        );
+        window.run_until_parked();
+        (view, window)
+    }
+
+    #[gpui::test]
+    fn the_layer_is_drawn_in_the_window(cx: &mut TestAppContext) {
+        let (session, _page) = session_with_a_page();
+        let (_view, window) = open_layer(cx, session);
+        let bounds = window
+            .debug_bounds("guides-layer")
+            .expect("the guides layer is laid out");
+        assert_eq!(
+            (f32::from(bounds.size.width), f32::from(bounds.size.height)),
+            WINDOW,
+            "the layer fills the window it is drawn in"
+        );
+    }
+
+    #[gpui::test]
+    fn a_drag_out_of_the_ruler_makes_a_guide(cx: &mut TestAppContext) {
+        let (session, page) = session_with_a_page();
+        let (_view, window) = open_layer(cx, session.clone());
+        // A press in the left ruler, a drag onto the canvas, and a release.
+        // The pointer lands at page x 800, which is 600 to the right of the
+        // page's origin at the window's centre.
+        window.simulate_mouse_down(
+            point(px(10.0), px(450.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        window.simulate_mouse_move(
+            point(px(200.0), px(450.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        window.simulate_mouse_up(
+            point(px(200.0), px(450.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        let guides = guides_of(&session, page);
+        assert_eq!(guides.len(), 1, "the drag made a guide: {guides:?}");
+        assert!(
+            guides[0].vertical,
+            "out of the left ruler is a vertical one"
+        );
+        assert_eq!(guides[0].offset, 800.0, "where the pointer was let go");
+    }
+
+    #[gpui::test]
+    fn a_guide_dropped_on_a_frame_belongs_to_that_frame_in_the_window(cx: &mut TestAppContext) {
+        let (session, page, frame) = session_with_a_frame();
+        let (_view, window) = open_layer(cx, session.clone());
+        window.simulate_mouse_down(
+            point(px(10.0), px(450.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        // The pointer lands at page (100, 100), which is on the frame.
+        window.simulate_mouse_move(
+            point(px(700.0), px(550.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        window.simulate_mouse_up(
+            point(px(700.0), px(550.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        assert!(
+            guides_of(&session, page).is_empty(),
+            "the guide is not the page's"
+        );
+        let guides = guides_of(&session, frame);
+        assert_eq!(guides.len(), 1, "the frame's guide: {guides:?}");
+        assert_eq!(guides[0].offset, 100.0, "in the frame's coordinates");
+    }
+
+    #[gpui::test]
+    fn a_click_on_a_guide_selects_it(cx: &mut TestAppContext) {
+        let (session, page) = session_with_a_page();
+        {
+            let mut session = session.borrow_mut();
+            session
+                .execute("guide.add", &json!({ "vertical": true, "offset": 100.0 }))
+                .expect("a guide");
+        }
+        let (_view, window) = open_layer(cx, session.clone());
+        // The guide is at page x 100, which is 700 on the window.
+        window.simulate_mouse_down(
+            point(px(700.0), px(450.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        window.simulate_mouse_up(
+            point(px(700.0), px(450.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        let session = session.borrow();
+        let selected = session.ds().expect("a document").selected_guide();
+        assert_eq!(
+            selected,
+            Some((page, 0)),
+            "the guide under the pointer is selected"
+        );
+    }
+
+    #[gpui::test]
+    fn a_guide_dropped_back_on_its_ruler_is_removed(cx: &mut TestAppContext) {
+        let (session, page) = session_with_a_page();
+        {
+            let mut session = session.borrow_mut();
+            session
+                .execute("guide.add", &json!({ "vertical": true, "offset": 100.0 }))
+                .expect("a guide");
+        }
+        let (_view, window) = open_layer(cx, session.clone());
+        // A press on the guide, a drag back to the left ruler, and a release.
+        window.simulate_mouse_down(
+            point(px(700.0), px(450.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        window.simulate_mouse_move(
+            point(px(10.0), px(450.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        window.simulate_mouse_up(
+            point(px(10.0), px(450.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        assert!(
+            guides_of(&session, page).is_empty(),
+            "the guide is gone: it was dropped on its own ruler"
+        );
+    }
+
+    #[gpui::test]
+    fn a_guide_is_moved_by_a_drag(cx: &mut TestAppContext) {
+        let (session, page) = session_with_a_page();
+        {
+            let mut session = session.borrow_mut();
+            session
+                .execute("guide.add", &json!({ "vertical": true, "offset": 100.0 }))
+                .expect("a guide");
+        }
+        let (_view, window) = open_layer(cx, session.clone());
+        window.simulate_mouse_down(
+            point(px(700.0), px(450.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        // The pointer lands at page x 300.
+        window.simulate_mouse_move(
+            point(px(900.0), px(450.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        window.simulate_mouse_up(
+            point(px(900.0), px(450.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        let guides = guides_of(&session, page);
+        assert_eq!(guides.len(), 1, "the guide is still there: {guides:?}");
+        assert_eq!(guides[0].offset, 300.0, "and it moved with the pointer");
+    }
+}
