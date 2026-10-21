@@ -29,7 +29,7 @@ use std::time::Instant;
 use figcraft_doc::{BoolOp, Document, LayoutMode, NodeId, NodeKind};
 use figcraft_engine::{booleans, components, Session};
 use gpui::{
-    canvas, div, point, px, rgb, svg, AnyElement, ClickEvent, Context, FocusHandle, FontWeight,
+    canvas, div, px, rgb, svg, AnyElement, ClickEvent, Context, FocusHandle, FontWeight,
     InteractiveElement, IntoElement, Keystroke, MouseButton, ParentElement, Render, ScrollDelta,
     SharedString, StatefulInteractiveElement, Styled, Svg, Window,
 };

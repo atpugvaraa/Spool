@@ -65,7 +65,7 @@ use std::rc::Rc;
 use crate::engine::canvas::EngineCanvas;
 use crate::engine::inspector_model as model;
 use crate::engine::panel_colorpicker::{
-    self as panel_colorpicker, ColorAction, ColorHost, ColorPickerModel, ColorPickerState,
+    self as panel_colorpicker, ColorAction, ColorHost, ColorPickerState,
 };
 use crate::engine::panel_components::{
     self as panel_components, ComponentAction, ComponentsHost, ComponentsModel,
