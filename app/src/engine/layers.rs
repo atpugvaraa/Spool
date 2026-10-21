@@ -3186,6 +3186,7 @@ fn scroll_delta_y(delta: &ScrollDelta) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::point;
 
     /// A page with `n` rectangles on it, each named `Layer {i}`.
     fn doc_with(n: usize) -> (Document, NodeId, Vec<NodeId>) {
