@@ -60,5 +60,8 @@ pub mod panel_components;
 pub mod panel_effects;
 pub mod panel_export;
 pub mod panel_styles;
+pub mod panel_variables;
+pub mod panel_assets;
+pub mod panel_prototyping;
 pub mod panel_typography;
 pub mod source_edits;
