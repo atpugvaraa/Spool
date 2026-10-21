@@ -61,11 +61,16 @@
 //! writes to a [`Document`] directly, so an edit made from this panel, from the
 //! CLI and from an agent are the same edit and land in the same history.
 
+use std::cell::RefCell;
 use std::cmp::Reverse;
+use std::rc::Rc;
 
 use figcraft_doc::{Comment, Document, NodeId};
 use figcraft_engine::cmd::comment::{self, Filter, Sort};
+use gpui::{div, prelude::*, px, rgb, AnyElement, Context, Div, FocusHandle, SharedString};
 use serde_json::{json, Value};
+
+use crate::theme;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // The words
@@ -247,6 +252,17 @@ impl CommentProperty {
             CommentProperty::Replies => "Replies",
             CommentProperty::Resolved => "Resolved",
             CommentProperty::Unread => "Unread",
+        }
+    }
+
+    /// The property's name in a control id, for a test to look it up.
+    pub fn slug(self) -> &'static str {
+        match self {
+            CommentProperty::Author => "author",
+            CommentProperty::Text => "comment",
+            CommentProperty::Replies => "replies",
+            CommentProperty::Resolved => "resolved",
+            CommentProperty::Unread => "unread",
         }
     }
 
@@ -645,6 +661,654 @@ impl CommentsAction {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// The panel
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// What a surface that hosts the Comments section must be able to do.
+///
+/// The panel draws and asks; the surface owns the engine and runs the changes.
+/// The panel never touches the document itself, so the engine's command
+/// surface stays the one operation boundary.
+pub trait CommentsHost: Sized + 'static {
+    /// Run a change through the engine.
+    fn run_comments_action(&mut self, action: CommentsAction, cx: &mut Context<Self>);
+}
+
+/// Which menu of the panel is open.
+///
+/// One menu at a time: a second one opening closes the first, which is what a
+/// menu that opens another does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommentsMenu {
+    /// The filter and sort menu in the header.
+    Header,
+    /// The actions on one thread.
+    Thread(u64),
+}
+
+/// The panel's own state.
+///
+/// Presentation only: never in the document.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommentsPanelState {
+    /// The filter the list shows.
+    pub filter: Filter,
+    /// The sort the list is in.
+    pub sort: Sort,
+    /// The search text the list is filtered by.
+    ///
+    /// The search narrows the list as it is typed, the way figcraft's does.
+    pub query: String,
+    /// Which menu is open, if any.
+    pub menu: Option<CommentsMenu>,
+    /// The keyboard focus the search field takes.
+    focus: Option<FocusHandle>,
+}
+
+impl Default for CommentsPanelState {
+    fn default() -> Self {
+        Self {
+            // figcraft's panel opens on the open threads, sorted by date.
+            filter: Filter::Open,
+            sort: Sort::Date,
+            query: String::new(),
+            menu: None,
+            focus: None,
+        }
+    }
+}
+
+impl CommentsPanelState {
+    /// The state a section starts in.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// The Comments section, as an element.
+///
+/// Everything it needs is passed in: the model to show, the panel's own state,
+/// and the surface that runs the changes. It returns an element, so the
+/// Inspector can put it in a section of its own and a test can put it in a
+/// window on its own.
+pub fn comments_section<T: CommentsHost>(
+    model: &CommentsModel,
+    state: &Rc<RefCell<CommentsPanelState>>,
+    cx: &mut Context<T>,
+) -> AnyElement {
+    let focus = focus_of(state, cx);
+    let (filter, sort, query) = {
+        let state = state.borrow();
+        (state.filter, state.sort, state.query.clone())
+    };
+    let mut column = div().flex().flex_col().gap_2().px(px(14.0)).py(px(12.0));
+    column = column.child(header(state, cx));
+    if state.borrow().menu == Some(CommentsMenu::Header) {
+        column = column.child(header_menu(state, cx));
+    }
+    column = column.child(search_field(state, focus.as_ref(), cx));
+    // Another filter than the usual one says so, with a way back.
+    if filter != Filter::Open {
+        column = column.child(filter_notice(state, cx));
+    }
+    let threads = model.visible(filter, sort, &query);
+    if threads.is_empty() {
+        column = column.child(empty_state(model, cx));
+    } else {
+        for thread in threads {
+            column = column.child(thread_row(model, thread, state, cx));
+            if state.borrow().menu == Some(CommentsMenu::Thread(thread.comment.id)) {
+                column = column.child(thread_menu(model, thread, state, cx));
+            }
+        }
+    }
+    column = column.child(selection_block(model, cx));
+    column = column.child(note(SAVE_PATH_NOTE));
+    column.into_any_element()
+}
+
+/// The keyboard focus the search field takes.
+///
+/// Made once, when the section is first drawn: a focus handle belongs to the
+/// window it was made in, so a new one on every frame would lose the focus the
+/// user had.
+fn focus_of<T: CommentsHost>(
+    state: &Rc<RefCell<CommentsPanelState>>,
+    cx: &mut Context<T>,
+) -> Option<FocusHandle> {
+    let mut state = state.borrow_mut();
+    if state.focus.is_none() {
+        state.focus = Some(cx.focus_handle());
+    }
+    state.focus.clone()
+}
+
+/// The header: the title, and the way to filter and sort.
+fn header<T: CommentsHost>(
+    state: &Rc<RefCell<CommentsPanelState>>,
+    cx: &mut Context<T>,
+) -> AnyElement {
+    let open = state.borrow().menu == Some(CommentsMenu::Header);
+    let shared = Rc::clone(state);
+    let mut row = div().flex().items_center().justify_between().gap_2();
+    row = row.child(
+        div()
+            .id(SharedString::from("comments-title"))
+            .debug_selector(|| "comments-title".to_owned())
+            .text_xs()
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(rgb(theme::TEXT))
+            .child("Comments"),
+    );
+    row = row.child(
+        div()
+            .id(SharedString::from("comments-menu"))
+            .debug_selector(|| "comments-menu".to_owned())
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(20.0))
+            .h(px(20.0))
+            .rounded_sm()
+            .text_xs()
+            .text_color(rgb(theme::TEXT_MUTED))
+            .hover(|style| style.bg(rgb(theme::SURFACE_HOVER)))
+            .cursor_pointer()
+            .child(if open { "▾" } else { "⋯" })
+            .on_click(cx.listener(move |_host, _event, _window, cx| {
+                {
+                    let mut state = shared.borrow_mut();
+                    state.menu = if open {
+                        None
+                    } else {
+                        Some(CommentsMenu::Header)
+                    };
+                }
+                cx.notify();
+            })),
+    );
+    row.into_any_element()
+}
+
+/// The filter and sort menu, and the way to mark everything read.
+fn header_menu<T: CommentsHost>(
+    state: &Rc<RefCell<CommentsPanelState>>,
+    cx: &mut Context<T>,
+) -> AnyElement {
+    let mut menu = menu_box();
+    for filter in Filter::ALL {
+        let selected = state.borrow().filter == filter;
+        let shared = Rc::clone(state);
+        let label = format!("comments-filter-{}", filter.id());
+        menu = menu.child(
+            div()
+                .id(SharedString::from(label.clone()))
+                .debug_selector(move || label.clone())
+                .px(px(6.0))
+                .py(px(5.0))
+                .rounded_sm()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_SECONDARY))
+                .hover(|style| style.bg(rgb(theme::SURFACE_HOVER)))
+                .cursor_pointer()
+                .child(if selected {
+                    format!("✓ {}", filter.label())
+                } else {
+                    filter.label().to_owned()
+                })
+                .on_click(cx.listener(move |_host, _event, _window, cx| {
+                    {
+                        let mut state = shared.borrow_mut();
+                        state.filter = filter;
+                        state.menu = None;
+                    }
+                    cx.notify();
+                })),
+        );
+    }
+    menu = menu.child(separator());
+    for sort in Sort::ALL {
+        let selected = state.borrow().sort == sort;
+        let shared = Rc::clone(state);
+        let label = format!("comments-sort-{}", sort.id());
+        menu = menu.child(
+            div()
+                .id(SharedString::from(label.clone()))
+                .debug_selector(move || label.clone())
+                .px(px(6.0))
+                .py(px(5.0))
+                .rounded_sm()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_SECONDARY))
+                .hover(|style| style.bg(rgb(theme::SURFACE_HOVER)))
+                .cursor_pointer()
+                .child(if selected {
+                    format!("✓ {}", sort.label())
+                } else {
+                    sort.label().to_owned()
+                })
+                .on_click(cx.listener(move |_host, _event, _window, cx| {
+                    {
+                        let mut state = shared.borrow_mut();
+                        state.sort = sort;
+                        state.menu = None;
+                    }
+                    cx.notify();
+                })),
+        );
+    }
+    menu = menu.child(separator());
+    menu = menu.child(menu_item(
+        "comments-mark-all-read",
+        "Mark all as read",
+        CommentsAction::MarkAllRead,
+        cx,
+    ));
+    menu.into_any_element()
+}
+
+/// The search field.
+///
+/// The list narrows as the text is written, the way figcraft's search does,
+/// so there is nothing to commit.
+fn search_field<T: CommentsHost>(
+    state: &Rc<RefCell<CommentsPanelState>>,
+    focus: Option<&FocusHandle>,
+    cx: &mut Context<T>,
+) -> AnyElement {
+    let query = state.borrow().query.clone();
+    let empty = query.is_empty();
+    let shown = if empty {
+        SEARCH_COMMENTS.to_owned()
+    } else {
+        query.clone()
+    };
+    let shared = Rc::clone(state);
+    let mut field = div()
+        .id(SharedString::from("comments-search"))
+        .debug_selector(|| "comments-search".to_owned())
+        .flex()
+        .items_center()
+        .px(px(8.0))
+        .py(px(7.0))
+        .rounded_md()
+        .bg(rgb(theme::WINDOW))
+        .border_1()
+        .border_color(rgb(theme::BORDER_SOFT))
+        .text_xs()
+        .text_color(if empty {
+            rgb(theme::TEXT_MUTED)
+        } else {
+            rgb(theme::TEXT_SECONDARY)
+        })
+        .cursor_text()
+        .child(shown);
+    if let Some(focus) = focus {
+        field = field.track_focus(focus);
+        field = field.on_key_down(cx.listener(
+            move |_host, event: &gpui::KeyDownEvent, _window, cx| {
+                let key = event.keystroke.key.as_str();
+                let typed =
+                    if event.keystroke.modifiers.control || event.keystroke.modifiers.platform {
+                        None
+                    } else {
+                        // The character the key produced, when the platform says which
+                        // one it was. A key that is a single character and carries none
+                        // is that character: the named keys all have longer names.
+                        event.keystroke.key_char.clone().or_else(|| {
+                            if key.chars().count() == 1 {
+                                Some(key.to_owned())
+                            } else {
+                                None
+                            }
+                        })
+                    };
+                let mut state = shared.borrow_mut();
+                let handled = match key {
+                    "backspace" => {
+                        state.query.pop();
+                        true
+                    }
+                    // Escape clears the search, and only while there is one to
+                    // clear: an empty search is the shell's Escape to answer.
+                    "escape" if !state.query.is_empty() => {
+                        state.query.clear();
+                        true
+                    }
+                    _ => match typed {
+                        Some(typed) if typed.chars().count() == 1 => {
+                            state.query.push_str(&typed);
+                            true
+                        }
+                        _ => false,
+                    },
+                };
+                drop(state);
+                if handled {
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+            },
+        ));
+    }
+    field.into_any_element()
+}
+
+/// The notice that another filter is on, with the way back to the usual one.
+fn filter_notice<T: CommentsHost>(
+    state: &Rc<RefCell<CommentsPanelState>>,
+    cx: &mut Context<T>,
+) -> AnyElement {
+    let filter = state.borrow().filter;
+    let shared = Rc::clone(state);
+    div()
+        .id(SharedString::from("comments-notice"))
+        .debug_selector(|| "comments-notice".to_owned())
+        .flex()
+        .items_center()
+        .gap_2()
+        .text_xs()
+        .text_color(rgb(theme::TEXT_SECONDARY))
+        .child(filter.label().to_owned())
+        .child(
+            div()
+                .id(SharedString::from("comments-notice-open"))
+                .debug_selector(|| "comments-notice-open".to_owned())
+                .text_color(rgb(theme::ACCENT))
+                .cursor_pointer()
+                .child(SHOW_OPEN)
+                .on_click(cx.listener(move |_host, _event, _window, cx| {
+                    {
+                        let mut state = shared.borrow_mut();
+                        state.filter = Filter::Open;
+                    }
+                    cx.notify();
+                })),
+        )
+        .into_any_element()
+}
+
+/// One thread: who wrote it, when, what it says, and where it is.
+fn thread_row<T: CommentsHost>(
+    model: &CommentsModel,
+    thread: &CommentThread,
+    state: &Rc<RefCell<CommentsPanelState>>,
+    cx: &mut Context<T>,
+) -> AnyElement {
+    let id = thread.comment.id;
+    let open = state.borrow().menu == Some(CommentsMenu::Thread(id));
+    let mut row = div()
+        .id(SharedString::from(format!("comments-thread-{id}")))
+        .debug_selector(move || format!("comments-thread-{id}"))
+        .flex()
+        .flex_col()
+        .gap_1()
+        .py(px(8.0))
+        .border_b_1()
+        .border_color(rgb(theme::BORDER_SOFT))
+        .cursor_pointer();
+    // The line the author is on: the unread dot, the avatar, the name, the time.
+    let mut head = div().flex().items_center().gap_2();
+    if thread.unread {
+        head = head.child(div().size(px(7.0)).rounded_full().bg(rgb(theme::ACCENT)));
+    }
+    head = head.child(avatar(thread.author()));
+    head = head.child(
+        div()
+            .id(SharedString::from(format!("comments-thread-{id}-author")))
+            .debug_selector(move || format!("comments-thread-{id}-author"))
+            .text_xs()
+            .font_weight(if thread.unread {
+                gpui::FontWeight::MEDIUM
+            } else {
+                gpui::FontWeight::NORMAL
+            })
+            .text_color(rgb(theme::TEXT))
+            .child(thread.author().to_owned()),
+    );
+    head = head.child(
+        div()
+            .ml_auto()
+            .text_xs()
+            .text_color(rgb(theme::TEXT_MUTED))
+            .child(ago(thread.last_activity())),
+    );
+    row = row.child(head);
+    // What the comment says.
+    row = row.child(
+        div()
+            .id(SharedString::from(format!("comments-thread-{id}-text")))
+            .debug_selector(move || format!("comments-thread-{id}-text"))
+            .text_xs()
+            .text_color(rgb(theme::TEXT))
+            .line_clamp(3)
+            .child(thread.text().to_owned()),
+    );
+    // The thread's frame and page, its replies, and its state.
+    let mut meta = Vec::new();
+    if let Some(name) = &thread.frame_name {
+        meta.push(name.clone());
+    }
+    // The page is named only when the thread is on another one: the page the
+    // editor is on is the one the user is already looking at.
+    if model.page != Some(thread.page) {
+        meta.push(thread.page_name.clone());
+    }
+    if thread.replies() > 0 {
+        meta.push(plural(thread.replies(), "reply", "replies"));
+    }
+    if thread.resolved() {
+        meta.push("Resolved".to_owned());
+    }
+    if !meta.is_empty() {
+        row = row.child(
+            div()
+                .id(SharedString::from(format!("comments-thread-{id}-meta")))
+                .debug_selector(move || format!("comments-thread-{id}-meta"))
+                .text_xs()
+                .text_color(rgb(theme::TEXT_SECONDARY))
+                .child(meta.join(" · ")),
+        );
+    }
+    // The actions on the thread.
+    let shared = Rc::clone(state);
+    row = row.child(
+        div()
+            .id(SharedString::from(format!("comments-thread-{id}-menu")))
+            .debug_selector(move || format!("comments-thread-{id}-menu"))
+            .text_xs()
+            .text_color(rgb(theme::TEXT_MUTED))
+            .hover(|style| style.bg(rgb(theme::SURFACE_HOVER)))
+            .cursor_pointer()
+            .child("⋯")
+            .on_click(cx.listener(move |_host, _event, _window, cx| {
+                // The menu button is inside the row, and the row opens the
+                // thread: the button keeps the click to itself.
+                cx.stop_propagation();
+                {
+                    let mut state = shared.borrow_mut();
+                    state.menu = if open {
+                        None
+                    } else {
+                        Some(CommentsMenu::Thread(id))
+                    };
+                }
+                cx.notify();
+            })),
+    );
+    row = row.on_click(cx.listener(move |host, _event, _window, cx| {
+        host.run_comments_action(CommentsAction::Open { id }, cx);
+    }));
+    row.into_any_element()
+}
+
+/// The actions on a thread.
+fn thread_menu<T: CommentsHost>(
+    model: &CommentsModel,
+    thread: &CommentThread,
+    _state: &Rc<RefCell<CommentsPanelState>>,
+    cx: &mut Context<T>,
+) -> AnyElement {
+    let id = thread.comment.id;
+    let mut menu = menu_box();
+    menu = menu.child(menu_item(
+        &format!("comments-thread-{id}-resolve"),
+        if thread.resolved() {
+            "Mark as unresolved"
+        } else {
+            "Mark as resolved"
+        },
+        CommentsAction::Resolve {
+            id,
+            resolved: !thread.resolved(),
+        },
+        cx,
+    ));
+    menu = menu.child(menu_item(
+        &format!("comments-thread-{id}-unread"),
+        "Mark as unread",
+        CommentsAction::MarkRead { id, read: false },
+        cx,
+    ));
+    // Only the thread's author can delete it: the engine's own rule.
+    if thread.is_mine(&model.user) {
+        menu = menu.child(menu_item(
+            &format!("comments-thread-{id}-delete"),
+            "Delete thread",
+            CommentsAction::Delete { id, reply: None },
+            cx,
+        ));
+    }
+    menu.into_any_element()
+}
+
+/// The empty state, word for word.
+fn empty_state<T: CommentsHost>(model: &CommentsModel, _cx: &mut Context<T>) -> AnyElement {
+    let (title, sub) = model.empty_state();
+    let mut column = div().flex().flex_col().gap_1().py(px(16.0));
+    column = column.child(
+        div()
+            .id(SharedString::from("comments-empty"))
+            .debug_selector(|| "comments-empty".to_owned())
+            .text_xs()
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(rgb(theme::TEXT_SECONDARY))
+            .child(title.to_owned()),
+    );
+    column = column.child(
+        div()
+            .id(SharedString::from("comments-empty-sub"))
+            .debug_selector(|| "comments-empty-sub".to_owned())
+            .text_xs()
+            .text_color(rgb(theme::TEXT_MUTED))
+            .child(sub.to_owned()),
+    );
+    column.into_any_element()
+}
+
+/// The selected layers' own comment: every property, with its own reading.
+fn selection_block<T: CommentsHost>(model: &CommentsModel, _cx: &mut Context<T>) -> AnyElement {
+    let mut column = div().flex().flex_col().gap_1();
+    for property in CommentProperty::ALL {
+        let reading = model.reading(property);
+        let value = match &reading {
+            CommentState::Set(value) => property.display(value),
+            CommentState::Unset => NOT_SET.to_owned(),
+            CommentState::Mixed => MIXED.to_owned(),
+        };
+        let label = format!("comments-property-{}", property.slug());
+        let value_label = format!("{label}-value");
+        column = column.child(
+            div()
+                .id(SharedString::from(label.clone()))
+                .debug_selector(move || label.clone())
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .text_xs()
+                .child(
+                    div()
+                        .text_color(rgb(theme::TEXT_SECONDARY))
+                        .child(property.label().to_owned()),
+                )
+                .child(
+                    div()
+                        .id(SharedString::from(value_label.clone()))
+                        .debug_selector(move || value_label.clone())
+                        .text_color(rgb(theme::TEXT))
+                        .child(value),
+                ),
+        );
+    }
+    column.into_any_element()
+}
+
+/// An author's avatar: their initials in a circle.
+fn avatar(author: &str) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(px(24.0))
+        .rounded_full()
+        .bg(rgb(theme::SURFACE_RAISED))
+        .text_xs()
+        .text_color(rgb(theme::TEXT_SECONDARY))
+        .child(figcraft_engine::live::initials(author))
+}
+
+/// The box every menu is drawn in.
+fn menu_box() -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .p(px(6.0))
+        .rounded_md()
+        .bg(rgb(theme::WINDOW))
+        .border_1()
+        .border_color(rgb(theme::BORDER))
+}
+
+/// A line between the parts of a menu.
+fn separator() -> Div {
+    div().h(px(1.0)).bg(rgb(theme::BORDER))
+}
+
+/// One choice in a menu.
+fn menu_item<T: CommentsHost>(
+    selector: &str,
+    label: &str,
+    action: CommentsAction,
+    cx: &mut Context<T>,
+) -> AnyElement {
+    div()
+        .id(SharedString::from(selector.to_owned()))
+        .debug_selector(move || selector.to_owned())
+        .px(px(6.0))
+        .py(px(5.0))
+        .rounded_sm()
+        .text_xs()
+        .text_color(rgb(theme::TEXT_SECONDARY))
+        .hover(|style| style.bg(rgb(theme::SURFACE_HOVER)))
+        .cursor_pointer()
+        .child(label.to_owned())
+        .on_click(cx.listener(move |host, _event, _window, cx| {
+            host.run_comments_action(action.clone(), cx);
+        }))
+        .into_any_element()
+}
+
+/// A caption: the dim text that names a group.
+fn note(text: &str) -> Div {
+    div()
+        .text_xs()
+        .text_color(rgb(theme::TEXT_MUTED))
+        .child(text.to_owned())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // The times
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -691,13 +1355,22 @@ pub fn ago_long_at(created: u64, now: u64) -> String {
     let count = |divisor: u64| usize::try_from(ago / divisor).unwrap_or(usize::MAX);
     match ago {
         0..60 => "Just now".to_owned(),
-        60..3600 => format!("{} minutes ago", count(60)),
-        3600..86_400 => format!("{} hours ago", count(3600)),
+        60..3600 => plural(count(60), "minute ago", "minutes ago"),
+        3600..86_400 => plural(count(3600), "hour ago", "hours ago"),
         86_400..172_800 => "Yesterday".to_owned(),
-        172_800..604_800 => format!("{} days ago", count(86_400)),
-        604_800..2_592_000 => format!("{} weeks ago", count(604_800)),
-        2_592_000..31_536_000 => format!("{} months ago", count(2_592_000)),
-        _ => format!("{} years ago", count(31_536_000)),
+        172_800..604_800 => plural(count(86_400), "day ago", "days ago"),
+        604_800..2_592_000 => plural(count(604_800), "week ago", "weeks ago"),
+        2_592_000..31_536_000 => plural(count(2_592_000), "month ago", "months ago"),
+        _ => plural(count(31_536_000), "year ago", "years ago"),
+    }
+}
+
+/// A count and its noun, in figcraft's own plural rule.
+fn plural(count: usize, one: &str, other: &str) -> String {
+    if count == 1 {
+        format!("{count} {one}")
+    } else {
+        format!("{count} {other}")
     }
 }
 
@@ -707,6 +1380,7 @@ mod tests {
 
     use figcraft_doc::{Message, NodeKind};
     use figcraft_engine::cmd::comment::Query;
+    use gpui::{point, size, Entity, Render, VisualTestContext};
 
     // ── The engine's own model ───────────────────────────────────────────────
 
@@ -872,13 +1546,21 @@ mod tests {
         let (mut doc, page, node) = document_with();
 
         let model = CommentsModel::read(&doc, &[node], Some(page), "Ada");
-        assert_eq!(model.empty_state(), (NO_COMMENTS_YET, CLICK_TO_LEAVE_ONE));
+        // The words are figcraft's, written out: a test that compared the
+        // words with the constants would agree with any spelling.
+        assert_eq!(
+            model.empty_state(),
+            (
+                "No comments yet",
+                "Click anywhere on the canvas to leave one."
+            )
+        );
 
         doc.comments.push(comment(1, page, "Ada", "Hello", 100));
         let model = CommentsModel::read(&doc, &[node], Some(page), "Ada");
         assert_eq!(
             model.empty_state(),
-            (NO_MATCHING_COMMENTS, TRY_ANOTHER_SEARCH),
+            ("No matching comments", "Try another search or filter."),
             "a document that has comments says the search found nothing"
         );
     }
@@ -1057,11 +1739,279 @@ mod tests {
         );
 
         assert_eq!(ago_long_at(now, now), "Just now");
-        assert_eq!(ago_long_at(now - 60, now), "1 minutes ago");
-        assert_eq!(ago_long_at(now - 3600, now), "1 hours ago");
+        assert_eq!(ago_long_at(now - 60, now), "1 minute ago");
+        assert_eq!(ago_long_at(now - 120, now), "2 minutes ago");
+        assert_eq!(ago_long_at(now - 3600, now), "1 hour ago");
         assert_eq!(ago_long_at(now - 86_400, now), "Yesterday");
         assert_eq!(ago_long_at(now - 172_800, now), "2 days ago");
-        assert_eq!(ago_long_at(now - 2_592_000, now), "1 months ago");
-        assert_eq!(ago_long_at(now - 31_536_000, now), "1 years ago");
+        assert_eq!(ago_long_at(now - 2_592_000, now), "1 month ago");
+        assert_eq!(ago_long_at(now - 31_536_000, now), "1 year ago");
+    }
+
+    // ── The panel, in a real window ──────────────────────────────────────────────
+
+    /// A surface for the section to live on: it draws it, and remembers what it
+    /// was asked to do.
+    struct Host {
+        model: CommentsModel,
+        state: Rc<RefCell<CommentsPanelState>>,
+        asked: Rc<RefCell<Vec<CommentsAction>>>,
+    }
+
+    impl Host {
+        fn new(model: CommentsModel) -> Self {
+            Self {
+                model,
+                state: Rc::new(RefCell::new(CommentsPanelState::new())),
+                asked: Rc::new(RefCell::new(Vec::new())),
+            }
+        }
+    }
+
+    impl CommentsHost for Host {
+        fn run_comments_action(&mut self, action: CommentsAction, cx: &mut Context<Self>) {
+            self.asked.borrow_mut().push(action);
+            cx.notify();
+        }
+    }
+
+    impl Render for Host {
+        fn render(
+            &mut self,
+            _window: &mut gpui::Window,
+            cx: &mut Context<Self>,
+        ) -> impl IntoElement {
+            let model = self.model.clone();
+            let state = Rc::clone(&self.state);
+            comments_section(&model, &state, cx)
+        }
+    }
+
+    /// Open a window with the section in it, over the given model.
+    fn open_section(
+        cx: &mut gpui::TestAppContext,
+        model: CommentsModel,
+    ) -> (Entity<Host>, &mut VisualTestContext) {
+        cx.add_window_view(|_, _| Host::new(model))
+    }
+
+    /// Draw the section in the window and settle.
+    fn draw(root: &Entity<Host>, window: &mut VisualTestContext) {
+        window.draw(
+            point(px(0.0), px(0.0)),
+            size(px(320.0), px(900.0)),
+            |_, _| root.clone().into_any_element(),
+        );
+        window.run_until_parked();
+    }
+
+    /// The bounds of an element the section draws.
+    fn bounds(
+        window: &mut VisualTestContext,
+        selector: &'static str,
+    ) -> gpui::Bounds<gpui::Pixels> {
+        window
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("the section draws {selector}"))
+    }
+
+    /// Type text into whatever has the focus.
+    fn type_text(window: &mut VisualTestContext, text: &str) {
+        for character in text.chars() {
+            let keystroke = gpui::Keystroke::parse(&character.to_string()).expect("a keystroke");
+            window.update(|window, cx| window.dispatch_keystroke(keystroke, cx));
+        }
+        window.run_until_parked();
+    }
+
+    /// A document with a comment on a node, as the panel reads it.
+    fn document_with_a_comment() -> (Document, NodeId, NodeId) {
+        let (mut doc, page, node) = document_with();
+        let mut thread = comment(7, page, "Ada", "Tighten this", 100);
+        thread.anchor = Some(node);
+        doc.comments.push(thread);
+        (doc, page, node)
+    }
+
+    #[gpui::test]
+    fn the_section_draws_the_document_s_comments(cx: &mut gpui::TestAppContext) {
+        // The render test: the section, on its own, in a real window, showing the
+        // engine's own thread.
+        let (doc, page, node) = document_with_a_comment();
+        let model = CommentsModel::read(&doc, &[node], Some(page), "Ada");
+        let (root, window) = open_section(cx, model);
+        draw(&root, window);
+
+        // The title is on screen, with a real size.
+        let title = bounds(window, "comments-title");
+        assert!(
+            title.size.height > px(0.0) && title.size.width > px(0.0),
+            "the title is on screen: {title:?}"
+        );
+        // The thread is on screen, with the author and what it says.
+        let thread = bounds(window, "comments-thread-7");
+        assert!(
+            thread.size.height > px(0.0),
+            "the thread is on screen: {thread:?}"
+        );
+        let author = bounds(window, "comments-thread-7-author");
+        assert!(
+            author.size.height > px(0.0),
+            "the thread says who wrote it: {author:?}"
+        );
+        let text = bounds(window, "comments-thread-7-text");
+        assert!(
+            text.size.height > px(0.0),
+            "the thread says what it says: {text:?}"
+        );
+        // And the search field is there to narrow the list.
+        let search = bounds(window, "comments-search");
+        assert!(
+            search.size.height > px(0.0),
+            "the search field is on screen: {search:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn the_section_shows_the_empty_state_when_there_are_no_comments(cx: &mut gpui::TestAppContext) {
+        // figcraft's empty state, word for word.
+        let (doc, page, node) = document_with();
+        let model = CommentsModel::read(&doc, &[node], Some(page), "Ada");
+        let (root, window) = open_section(cx, model);
+        draw(&root, window);
+
+        let empty = bounds(window, "comments-empty");
+        assert!(
+            empty.size.height > px(0.0),
+            "the empty state is on screen: {empty:?}"
+        );
+        let sub = bounds(window, "comments-empty-sub");
+        assert!(sub.size.height > px(0.0), "and it says what to do: {sub:?}");
+        assert!(
+            window.debug_bounds("comments-thread-7").is_none(),
+            "and there is no thread to show"
+        );
+    }
+
+    #[gpui::test]
+    fn the_section_shows_the_node_s_own_comment(cx: &mut gpui::TestAppContext) {
+        // The node's own half: the properties of the layer's comment, each with
+        // its own reading.
+        let (doc, page, node) = document_with_a_comment();
+        let model = CommentsModel::read(&doc, &[node], Some(page), "Ada");
+        let (root, window) = open_section(cx, model);
+        draw(&root, window);
+
+        let author = bounds(window, "comments-property-author");
+        assert!(
+            author.size.height > px(0.0),
+            "the layer's comment is on screen: {author:?}"
+        );
+        let value = bounds(window, "comments-property-author-value");
+        assert!(
+            value.size.height > px(0.0),
+            "and it says who wrote it: {value:?}"
+        );
+        // A layer with no comment says so.
+        let (doc, page, node) = document_with();
+        let model = CommentsModel::read(&doc, &[node], Some(page), "Ada");
+        let (root, window) = open_section(cx, model);
+        draw(&root, window);
+        assert!(
+            window
+                .debug_bounds("comments-property-author-value")
+                .is_some(),
+            "a layer with no comment still has a row"
+        );
+    }
+
+    #[gpui::test]
+    fn clicking_a_thread_asks_the_engine_to_open_it(cx: &mut gpui::TestAppContext) {
+        let (doc, page, node) = document_with_a_comment();
+        let model = CommentsModel::read(&doc, &[node], Some(page), "Ada");
+        let (root, window) = open_section(cx, model);
+        draw(&root, window);
+
+        let thread = bounds(window, "comments-thread-7");
+        window.simulate_click(thread.center(), gpui::Modifiers::none());
+        window.run_until_parked();
+
+        let asked = root.read_with(cx, |host, _| host.asked.borrow().clone());
+        assert_eq!(asked.len(), 1, "the section asked for one change");
+        assert_eq!(asked[0], CommentsAction::Open { id: 7 });
+        // And the command it would run is the engine's own.
+        let (command, params) = asked[0].command();
+        assert_eq!(command, "comment.open");
+        assert_eq!(params["id"], json!(7));
+    }
+
+    #[gpui::test]
+    fn the_search_narrows_the_list(cx: &mut gpui::TestAppContext) {
+        let (mut doc, page, node) = document_with();
+        doc.comments
+            .push(comment(1, page, "Ada", "Tighten this", 100));
+        doc.comments
+            .push(comment(2, page, "Sam", "Looks good", 200));
+        let model = CommentsModel::read(&doc, &[node], Some(page), "Ada");
+        let (root, window) = open_section(cx, model);
+        draw(&root, window);
+
+        assert!(
+            window.debug_bounds("comments-thread-1").is_some(),
+            "both threads are on screen"
+        );
+        assert!(window.debug_bounds("comments-thread-2").is_some());
+
+        // Type into the search field, the way a user does.
+        let search = bounds(window, "comments-search");
+        window.simulate_click(search.center(), gpui::Modifiers::none());
+        window.run_until_parked();
+        type_text(window, "tighten");
+        draw(&root, window);
+
+        assert!(
+            window.debug_bounds("comments-thread-1").is_some(),
+            "the thread that matches is still on screen"
+        );
+        assert!(
+            window.debug_bounds("comments-thread-2").is_none(),
+            "and the one that does not is gone"
+        );
+    }
+
+    #[gpui::test]
+    fn the_filter_menu_offers_the_engines_own_filters(cx: &mut gpui::TestAppContext) {
+        let (doc, page, node) = document_with_a_comment();
+        let model = CommentsModel::read(&doc, &[node], Some(page), "Ada");
+        let (root, window) = open_section(cx, model);
+        draw(&root, window);
+
+        // The menu is closed to begin with.
+        assert!(window.debug_bounds("comments-filter-open").is_none());
+
+        let menu = bounds(window, "comments-menu");
+        window.simulate_click(menu.center(), gpui::Modifiers::none());
+        window.run_until_parked();
+
+        for filter in Filter::ALL {
+            let selector: &'static str =
+                Box::leak(format!("comments-filter-{}", filter.id()).into_boxed_str());
+            assert!(
+                window.debug_bounds(selector).is_some(),
+                "the menu offers {filter:?}"
+            );
+        }
+        for sort in Sort::ALL {
+            let selector: &'static str =
+                Box::leak(format!("comments-sort-{}", sort.id()).into_boxed_str());
+            assert!(
+                window.debug_bounds(selector).is_some(),
+                "the menu offers {sort:?}"
+            );
+        }
+        assert!(
+            window.debug_bounds("comments-mark-all-read").is_some(),
+            "and the way to mark everything read"
+        );
     }
 }
