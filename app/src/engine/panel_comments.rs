@@ -1748,6 +1748,29 @@ mod tests {
         assert_eq!(ago_long_at(now - 31_536_000, now), "1 year ago");
     }
 
+    #[test]
+    fn the_model_reads_the_engine_the_way_the_inspector_reads_it() {
+        use figcraft_engine::Session;
+
+        // The Inspector's own read path, on a real session: the document, the
+        // selection, the page, and the name comments are signed with.
+        let mut session = Session::new();
+        session
+            .execute(
+                "comment.add",
+                &json!({ "x": 10.0, "y": 20.0, "text": "Tighten this" }),
+            )
+            .expect("a comment");
+        let model = CommentsModel::read(
+            session.doc().expect("the document"),
+            &session.selection(),
+            session.page().ok(),
+            &comment::user_name(&session),
+        );
+        assert_eq!(model.threads.len(), 1, "the engine's own thread");
+        assert_eq!(model.user, "You", "the name the engine signs with");
+    }
+
     // ── The panel, in a real window ──────────────────────────────────────────────
 
     /// A surface for the section to live on: it draws it, and remembers what it
