@@ -1637,6 +1637,7 @@ impl Render for AppShell {
             // made by a click are the same edit.
             .on_action({
                 let engine_canvas = self.engine_canvas.clone();
+                let inspector = self.inspector.clone();
                 move |action: &crate::engine::keymap::RunCommand, _window, cx| {
                     let id = action.id.clone();
                     let params = action.params.clone();
@@ -1661,6 +1662,20 @@ impl Render for AppShell {
                         && !crate::engine::keymap::live_while_editing_text(&id)
                     {
                         cx.propagate();
+                        return;
+                    }
+                    // DEV MODE IS A MODE, AND THE ENGINE ONLY QUEUES A REQUEST
+                    // FOR IT.
+                    //
+                    // `view.devMode` is figcraft's Shift+D, and the engine's
+                    // command just asks for the panel to change -- it does not
+                    // change it. So the shell is what answers, the way it
+                    // answers the escape ladder: by switching the Inspector's
+                    // tab, which is what the request meant.
+                    if id == "view.devMode" {
+                        inspector.update(cx, |inspector, cx| {
+                            inspector.toggle_dev_mode(cx);
+                        });
                         return;
                     }
                     engine_canvas.update(cx, |canvas, cx| {

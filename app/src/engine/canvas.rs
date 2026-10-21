@@ -1593,6 +1593,11 @@ pub struct EngineCanvas {
     /// The Prototype tab is open, so the canvas draws the prototype's
     /// connections.
     prototype_mode: bool,
+    /// The Dev Mode tab is open, so the canvas draws the annotations' callouts
+    /// and the engine measures distances on hover.
+    dev_mode: bool,
+    /// Which annotations the canvas's callouts show.
+    dev_filter: crate::engine::panel_devmode::CategoryFilter,
     /// The engine. Shared with the panels through [`EngineCanvas::session_handle`].
     session: Rc<RefCell<Session>>,
     /// The retained render, on its own thread.
@@ -1630,6 +1635,8 @@ impl EngineCanvas {
             renderer: CanvasRenderer::new(),
             focus: cx.focus_handle(),
             prototype_mode: false,
+            dev_mode: false,
+            dev_filter: crate::engine::panel_devmode::CategoryFilter::All,
             state: CanvasState::default(),
             palette: Palette::new(),
             hitbox: Rc::new(RefCell::new(None)),
@@ -1737,6 +1744,35 @@ impl EngineCanvas {
     pub fn set_prototype_mode(&mut self, active: bool, cx: &mut gpui::Context<Self>) {
         if self.prototype_mode != active {
             self.prototype_mode = active;
+            cx.notify();
+        }
+    }
+
+    /// Turn Dev Mode on and off.
+    ///
+    /// Dev Mode is a MODE as well as a panel: while it is open the canvas
+    /// draws the annotations' callouts, and the engine measures distances on
+    /// hover without Alt held -- `tool.redlines`, which is what
+    /// `figcraft_engine::distance::hover_lines` answers.
+    pub fn set_dev_mode(&mut self, active: bool, cx: &mut gpui::Context<Self>) {
+        if self.dev_mode != active {
+            self.dev_mode = active;
+            self.session.borrow_mut().tool.redlines = active;
+            cx.notify();
+        }
+    }
+
+    /// Which annotations the canvas's callouts show.
+    ///
+    /// The Inspector owns the filter and the canvas draws the callouts it
+    /// selects, so the two have to agree.
+    pub fn set_dev_category_filter(
+        &mut self,
+        filter: crate::engine::panel_devmode::CategoryFilter,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if self.dev_filter != filter {
+            self.dev_filter = filter;
             cx.notify();
         }
     }
@@ -2652,6 +2688,22 @@ impl EngineCanvas {
 
         self.paint_pixel_grid(ov, s);
 
+        // The Dev Mode callouts, when the Dev Mode tab is open.
+        if self.dev_mode {
+            let viewport = ov.viewport;
+            crate::engine::panel_devmode::paint_dev_mode_overlay(
+                &mut *ov.window,
+                &mut *ov.app,
+                view,
+                viewport,
+                doc,
+                s.page,
+                &s.selection,
+                &pal,
+                &self.dev_filter,
+            );
+        }
+
         // The prototype's connections, when the Prototype tab is open.
         //
         // The viewport is read first: `ov.window` is borrowed mutably by the
@@ -3427,6 +3479,16 @@ impl EngineCanvas {
             world * Point::new(0.0, 0.0),
         ];
         self.state.labels.push((id, quad));
+        // The Dev Mode status badge, beside the frame's name.
+        crate::engine::panel_devmode::paint_dev_status_badge(
+            &mut *ov.window,
+            &mut *ov.app,
+            n,
+            GPoint {
+                x: at.x + w + 6.0,
+                y: at.y - height as f32 + LABEL_PT * LABEL_LINE / 2.0,
+            },
+        );
     }
 
     /// Text editing: the box, the selection, the composition underline and the caret.

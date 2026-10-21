@@ -64,6 +64,9 @@ use std::rc::Rc;
 
 use crate::engine::canvas::EngineCanvas;
 use crate::engine::inspector_model as model;
+use crate::engine::panel_a11y::{
+    self as panel_a11y, A11yAction, A11yHost, A11yModel, A11yPanelState,
+};
 use crate::engine::panel_assets::{
     self as panel_assets, AssetsAction, AssetsHost, AssetsModel, AssetsPanelState,
 };
@@ -73,6 +76,9 @@ use crate::engine::panel_colorpicker::{
 use crate::engine::panel_components::{
     self as panel_components, ComponentAction, ComponentsHost, ComponentsModel,
     ComponentsPanelState,
+};
+use crate::engine::panel_devmode::{
+    self as panel_devmode, CategoryFilter, DevAction, DevHost, DevModeModel, DevPanelState,
 };
 use crate::engine::panel_effects::EffectsPanel;
 use crate::engine::panel_export::{
@@ -139,7 +145,7 @@ const NO_STROKE: &str = "No stroke to be wide";
 ///
 /// Fixed rather than growable, so a section's slot can be baked into the click
 /// closure that toggles it.
-pub const SECTION_COUNT: usize = 9;
+pub const SECTION_COUNT: usize = 10;
 
 /// A collapsible section, addressed by a slot.
 ///
@@ -161,6 +167,7 @@ impl SectionSlot {
     pub const STYLES: Self = Self(6);
     pub const VARIABLES: Self = Self(7);
     pub const ASSETS: Self = Self(8);
+    pub const A11Y: Self = Self(9);
 
     fn index(self) -> usize {
         self.0
@@ -1426,7 +1433,12 @@ impl RenameSession {
 ///
 /// Labels only; the chrome is [`segmented`], which is also what a paint's
 /// on/off uses, so the two cannot drift into two looks for one gesture.
-const TABS: [(&str, bool); 3] = [("Design", true), ("Prototype", true), ("AI", true)];
+const TABS: [(&str, bool); 4] = [
+    ("Design", true),
+    ("Prototype", true),
+    ("Dev Mode", true),
+    ("AI", true),
+];
 
 /// Swatches offered by every colour control.
 ///
@@ -1475,6 +1487,11 @@ pub struct Inspector {
     /// The assets section's state: which image is being edited and what is
     /// being typed into it.
     assets_state: Rc<RefCell<AssetsPanelState>>,
+    /// The Dev Mode tab's own state: which menu is open, what is being typed
+    /// into it, and which annotations the canvas shows.
+    devmode_state: Rc<RefCell<DevPanelState>>,
+    /// The Accessibility section's state: what is being typed into the name.
+    a11y_state: Rc<RefCell<A11yPanelState>>,
     /// The Prototype tab's own state: which menu is open, what is being typed
     /// into it, and which interaction's editor is open.
     prototyping_state: Rc<RefCell<ProtoPanelState>>,
@@ -1528,6 +1545,8 @@ impl Inspector {
             styles_state: Rc::new(RefCell::new(StylesPanelState::default())),
             variables_state: Rc::new(RefCell::new(VariablesPanelState::default())),
             prototyping_state: Rc::new(RefCell::new(ProtoPanelState::new())),
+            devmode_state: Rc::new(RefCell::new(DevPanelState::new())),
+            a11y_state: Rc::new(RefCell::new(A11yPanelState::default())),
             assets_state: Rc::new(RefCell::new(AssetsPanelState::default())),
             typography_state: Rc::new(RefCell::new(TypographyPanelState::default())),
             color_state: Rc::new(RefCell::new(ColorPickerState::default())),
@@ -1607,6 +1626,8 @@ impl Inspector {
             || self.typography_state.borrow().is_busy()
             || self.color_state.borrow().is_busy()
             || self.assets_state.borrow().is_busy()
+            || self.devmode_state.borrow().is_busy()
+            || self.a11y_state.borrow().is_busy()
     }
 
     /// Give up whatever the Inspector is part-way through.
@@ -1660,6 +1681,16 @@ impl Inspector {
             cx.notify();
             return true;
         }
+        let devmode_cancelled = self.devmode_state.borrow_mut().cancel();
+        if devmode_cancelled {
+            cx.notify();
+            return true;
+        }
+        let a11y_cancelled = self.a11y_state.borrow_mut().cancel();
+        if a11y_cancelled {
+            cx.notify();
+            return true;
+        }
         false
     }
 
@@ -1701,6 +1732,22 @@ impl Inspector {
             let action = self.typography_state.borrow_mut().handle_key(key);
             if let Some(action) = action {
                 self.run_typography_action(action, cx);
+            }
+            cx.notify();
+            return true;
+        }
+        if self.devmode_state.borrow().is_busy() {
+            let action = self.devmode_state.borrow_mut().handle_key(key);
+            if let Some(action) = action {
+                self.run_dev_action(action, cx);
+            }
+            cx.notify();
+            return true;
+        }
+        if self.a11y_state.borrow().is_busy() {
+            let action = self.a11y_state.borrow_mut().handle_key(key);
+            if let Some(action) = action {
+                self.run_a11y_action(action, cx);
             }
             cx.notify();
             return true;
@@ -1995,9 +2042,58 @@ impl Inspector {
     pub fn open_tab(&mut self, index: usize, cx: &mut Context<Self>) {
         self.tab = index;
         if let Some(engine) = self.engine.clone() {
-            engine.update(cx, |canvas, cx| canvas.set_prototype_mode(index == 1, cx));
+            engine.update(cx, |canvas, cx| {
+                canvas.set_prototype_mode(index == 1, cx);
+                canvas.set_dev_mode(index == panel_devmode::TAB_DEV_MODE, cx);
+            });
         }
         cx.notify();
+    }
+
+    /// Dev Mode on and off.
+    ///
+    /// figcraft's `view.devMode` switches the right-hand tab between Inspect
+    /// and Design; this is the same answer.
+    pub fn toggle_dev_mode(&mut self, cx: &mut Context<Self>) {
+        let next = panel_devmode::dev_mode_tab(self.tab);
+        self.open_tab(next, cx);
+    }
+
+    /// The Dev Mode tab: the layer's handoff status, its annotations, its dev
+    /// resources, its inspected properties and its assets -- or, with nothing
+    /// selected, what is ready for dev.
+    fn dev_mode_body(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(engine) = self.engine.clone() else {
+            return empty_note("No Dev Mode yet.").into_any_element();
+        };
+        let state = self.devmode_state.clone();
+        let color_format = state.borrow().color_format;
+        let model: DevModeModel = engine.read(cx).with_session(|session| {
+            let Ok(doc) = session.doc() else {
+                return DevModeModel::default();
+            };
+            let Ok(page) = session.page() else {
+                return DevModeModel::default();
+            };
+            let focused = session.ds().ok().and_then(|ds| ds.focused());
+            DevModeModel::read(doc, page, &session.selection(), focused, color_format)
+        });
+        panel_devmode::dev_mode_panel(&model, &state, cx).into_any_element()
+    }
+
+    /// The Accessibility section: what a screen reader reads of the selection.
+    fn a11y_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(engine) = self.engine.clone() else {
+            return empty_note("Select an object on the canvas or in Layers.").into_any_element();
+        };
+        let model: A11yModel = engine.read(cx).with_session(|session| {
+            let Ok(doc) = session.doc() else {
+                return A11yModel::default();
+            };
+            A11yModel::read(doc, &session.selection())
+        });
+        let state = self.a11y_state.clone();
+        panel_a11y::a11y_section(&model, &state, cx).into_any_element()
     }
 
     /// The Prototype tab: the page's flows, the selected layers' interactions
@@ -2048,6 +2144,18 @@ impl Inspector {
         }
         let state = self.typography_state.clone();
         panel_typography::section(&model, &state, cx).into_any_element()
+    }
+
+    /// Run a Dev Mode change through the engine.
+    fn run_dev_action(&mut self, action: DevAction, cx: &mut Context<Self>) {
+        let (command, params) = action.command();
+        self.run(&command, params, cx);
+    }
+
+    /// Run an accessibility change through the engine.
+    fn run_a11y_action(&mut self, action: A11yAction, cx: &mut Context<Self>) {
+        let (command, params) = action.command();
+        self.run(&command, params, cx);
     }
 
     /// Run a styles change through the engine.
@@ -2337,6 +2445,27 @@ impl AssetsHost for Inspector {
     }
 }
 
+impl DevHost for Inspector {
+    /// Run a Dev Mode change through the engine.
+    fn run_dev_action(&mut self, action: DevAction, cx: &mut Context<Self>) {
+        Inspector::run_dev_action(self, action, cx);
+    }
+
+    /// The canvas draws the callouts the filter selects, so the canvas is told.
+    fn set_dev_category_filter(&mut self, filter: CategoryFilter, cx: &mut Context<Self>) {
+        if let Some(engine) = self.engine.clone() {
+            engine.update(cx, |canvas, cx| canvas.set_dev_category_filter(filter, cx));
+        }
+    }
+}
+
+impl A11yHost for Inspector {
+    /// Run an accessibility change through the engine.
+    fn run_a11y_action(&mut self, action: A11yAction, cx: &mut Context<Self>) {
+        Inspector::run_a11y_action(self, action, cx);
+    }
+}
+
 impl ProtoHost for Inspector {
     /// Run a prototype change through the engine.
     fn run_proto_action(&mut self, action: ProtoAction, cx: &mut Context<Self>) {
@@ -2413,8 +2542,8 @@ impl Render for Inspector {
 
         let body = match self.tab {
             1 => self.prototype_body(cx),
-            1 => self.prototype_body(cx),
-            2 => ai_body(),
+            2 => self.dev_mode_body(cx),
+            3 => ai_body(),
             _ => self.design_body(&selected, cx),
         };
 
@@ -2608,6 +2737,12 @@ impl Inspector {
                         cx,
                     ))
                     .child(self.inspector_section(
+                        "Accessibility",
+                        SectionSlot::A11Y,
+                        self.a11y_section(cx),
+                        cx,
+                    ))
+                    .child(self.inspector_section(
                         "Variables",
                         SectionSlot::VARIABLES,
                         self.variables_section(cx),
@@ -2653,6 +2788,14 @@ impl Inspector {
                     "Effects",
                     SectionSlot::EFFECTS,
                     self.effects_section(cx),
+                    cx,
+                ));
+                // The Accessibility section is here for the MULTI-selection too:
+                // that is where "Mixed" is reachable.
+                sections = sections.child(self.inspector_section(
+                    "Accessibility",
+                    SectionSlot::A11Y,
+                    self.a11y_section(cx),
                     cx,
                 ));
                 sections.into_any_element()
@@ -4073,6 +4216,7 @@ mod tests {
             SectionSlot::STYLES,
             SectionSlot::VARIABLES,
             SectionSlot::ASSETS,
+            SectionSlot::A11Y,
         ];
         assert_eq!(slots.len(), SECTION_COUNT, "every slot is accounted for");
         for (index, slot) in slots.iter().enumerate() {

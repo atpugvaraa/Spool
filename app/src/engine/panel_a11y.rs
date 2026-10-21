@@ -93,17 +93,6 @@
 //! from this panel, from the CLI and from an agent are the same edit and land
 //! in the same history.
 
-// The section is wired into the Inspector in the pass after this one — the
-// Inspector is not this slice's file — so between the slice landing and the
-// wiring, the public API here has no caller. The attribute is on the module
-// rather than on each item so that a half-wired section does not turn into a
-// wall of warnings, and so that it comes off in one place when the wiring
-// lands.
-#![allow(
-    dead_code,
-    reason = "wired into the Inspector in the pass after this one"
-)]
-
 use std::cell::RefCell;
 use std::rc::Rc;
 
