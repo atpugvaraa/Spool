@@ -30,8 +30,8 @@ use figcraft_doc::{BoolOp, Document, LayoutMode, NodeId, NodeKind};
 use figcraft_engine::{booleans, components, Session};
 use gpui::{
     canvas, div, px, rgb, svg, AnyElement, ClickEvent, Context, FocusHandle, FontWeight,
-    InteractiveElement, IntoElement, Keystroke, MouseButton, ParentElement, Render, ScrollDelta,
-    SharedString, StatefulInteractiveElement, Styled, Svg, Window,
+    InteractiveElement, IntoElement, Keystroke, Modifiers, MouseButton, ParentElement, Render,
+    ScrollDelta, SharedString, StatefulInteractiveElement, Styled, Subscription, Svg, Window,
 };
 use serde_json::{json, Value};
 
@@ -1173,11 +1173,151 @@ pub struct PanelState {
     pub context: Option<ContextTarget>,
 }
 
+impl PanelState {
+    /// What the panel is doing with the keyboard.
+    ///
+    /// One question, read off the state: a field of the panel's own has the
+    /// keyboard, or the tree does.
+    pub fn keyboard(&self) -> Keyboard {
+        if self.rename_field.is_some()
+            || self.page_rename_field.is_some()
+            || self.file_rename.is_some()
+        {
+            Keyboard::Field
+        } else if self.filter_field.is_some() {
+            Keyboard::Search
+        } else {
+            Keyboard::Tree
+        }
+    }
+}
 /// What a context menu is for.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ContextTarget {
     Layer(NodeId),
     Page(NodeId),
+}
+
+// ---------------------------------------------------------------------------
+// The keyboard
+// ---------------------------------------------------------------------------
+
+/// What the panel is doing with the keyboard.
+///
+/// The panel has one focus handle, so the state of the keyboard is one
+/// question: is a field of the panel's open, or is the tree itself the surface
+/// the user is on? figcraft answers it the same way -- the layers panel holds
+/// the keyboard while it is the surface, and the arrows move through the tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Keyboard {
+    /// The tree: the arrows move the selection through the rows.
+    Tree,
+    /// A field of the panel's own (a rename, the file name, a page name): the
+    /// characters are characters.
+    Field,
+    /// The layers search: the characters are characters, and the up and down
+    /// arrows are the editor's, as they were before the tree had the keyboard.
+    Search,
+}
+
+impl Keyboard {
+    /// Whether a key is the panel's rather than a shortcut's.
+    ///
+    /// This is the question the shell's key gate asks the Inspector, asked of
+    /// this panel instead: a character typed into the panel's field is a
+    /// character and not a tool shortcut, and the engine's keymap binds letters
+    /// as tool shortcuts -- `v`, `a`, `c`, `f`, `o`, `p`, `r`, `t`. So the
+    /// panel has to answer this BEFORE the shortcut runs.
+    ///
+    /// A CHORD IS NOT A CHARACTER, which is the Inspector's rule and this
+    /// panel's now: `⌘Z` is undo and `⌘S` is save whatever is open, so a chord
+    /// belongs to whatever answers chords and not to a field of this panel's.
+    /// The one chord the panel does own is the rename, because the rename is
+    /// the tree's own verb: in the tree it renames the row, and the name is
+    /// typed into the row.
+    pub fn claims(self, key: &str, modifiers: Modifiers) -> bool {
+        // THE RENAME CHORD IS THE TREE'S OWN VERB, in every mode.
+        //
+        // The engine's keymap binds `⌘R` and `F2` to `object.rename`, and the
+        // rename is the tree's own: the row opens for editing and the name is
+        // typed into the row. So both spellings are the panel's, in every
+        // mode -- otherwise the chord would be answered and the name would
+        // have nowhere to go.
+        if (modifiers.platform || modifiers.control) && key == "r" {
+            return true;
+        }
+        if key == "f2" {
+            return true;
+        }
+        let chord = modifiers.platform || modifiers.control || modifiers.alt;
+        match self {
+            // The tree: the arrows move the selection, and nothing else is the
+            // tree's -- a letter typed here is still the editor's tool
+            // shortcut, exactly as it is in figcraft.
+            Self::Tree => !chord && matches!(key, "up" | "down" | "left" | "right"),
+            // A field: every character is a character.
+            Self::Field => !chord,
+            // The search: every character but the arrows, which are the
+            // editor's.
+            Self::Search => !chord && !matches!(key, "up" | "down"),
+        }
+    }
+
+    /// Whether a command is the panel's, and so must not reach the editor's.
+    ///
+    /// The answer is by command rather than by key, because that is what the
+    /// engine's keymap dispatches: a command is a command, whatever chord
+    /// reached it. So the panel asks the engine's own table which commands are
+    /// CHARACTER commands -- the ones bound to a bare key, which are the
+    /// letters a field would rather have as text -- and the rename, which is
+    /// the tree's own verb.
+    pub fn owns_command(self, id: &str) -> bool {
+        // THE RENAME IS THE TREE'S, in every mode: the engine's keymap binds
+        // `⌘R` and `F2` to `object.rename`, and in the tree the rename is the
+        // row's own.
+        if id == "object.rename" {
+            return true;
+        }
+        match self {
+            // The tree: the arrows are not commands at all, so the rename is
+            // the only thing the tree owns.
+            Self::Tree => false,
+            // A field: the characters are the field's.
+            Self::Field | Self::Search => is_a_character_command(id),
+        }
+    }
+}
+
+/// Whether a command is one of the editor's CHARACTER commands.
+///
+/// The engine's keymap binds letters as tool shortcuts and digits as camera
+/// commands, and a character typed into a field is a character and not a
+/// shortcut. So the panel has to know which commands are characters, and the
+/// engine's own table is where it says so: a command with a chord that is one
+/// bare key is a character command.
+fn is_a_character_command(id: &str) -> bool {
+    let platform = figcraft_engine::keymap::Platform::current();
+    figcraft_engine::keymap::KEYS
+        .iter()
+        .filter(|binding| binding.id == id)
+        .any(|binding| {
+            binding
+                .keys(platform)
+                .iter()
+                .any(|spec| is_a_character_chord(spec))
+        })
+}
+
+/// Whether a chord is one character: one key, and nothing but the shift.
+///
+/// The engine's own spelling, so the answer is the engine's: `F` is a
+/// character and `⌘F` is not, `⇧1` is a character (the `!` it types) and `F2`
+/// is a named key rather than a character.
+fn is_a_character_chord(spec: &str) -> bool {
+    let Some((mods, key)) = figcraft_engine::keymap::parse(spec) else {
+        return false;
+    };
+    !mods.alt && !mods.cmd && !mods.ctrl && key.chars().count() == 1
 }
 
 // ---------------------------------------------------------------------------
@@ -1208,6 +1348,14 @@ pub struct LayersPanel {
     /// to a layer without walking the tree again.
     cached_rows: Arc<Vec<Row>>,
     focus: FocusHandle,
+    /// The keystroke observer: the panel's answer, given after the bindings
+    /// have run.
+    ///
+    /// Nothing reads this field; holding it is the point. A dropped
+    /// `Subscription` detaches the observer, and the panel's ownership of the
+    /// keyboard would go with it.
+    #[allow(dead_code)]
+    observer: Subscription,
     /// Where the layers viewport was, written by the probe element during the last frame's paint.
     probe_layers: Rc<Cell<Option<Viewport>>>,
     probe_pages: Rc<Cell<Option<Viewport>>>,
@@ -1218,6 +1366,42 @@ impl LayersPanel {
     /// [`EngineCanvas::session_handle`](crate::engine::canvas::EngineCanvas::session_handle).
     /// Everything it shows comes from the session; everything it changes goes through it.
     pub fn new(session: Rc<RefCell<Session>>, cx: &mut Context<Self>) -> Self {
+        let focus = cx.focus_handle();
+        // THE PANEL ANSWERS THE KEY, AND THE SHORTCUT MUST NOT RUN.
+        //
+        // GPUI dispatches a key binding BEFORE any `on_key_down` handler runs,
+        // and an action that is answered stops the key there: so a letter
+        // typed into the panel's search field would switch the tool and the
+        // character would never reach the field. The panel's own action
+        // listener answers the binding first -- it is deeper in the tree than
+        // the shell's, so it is asked before the shell is -- and the
+        // keystroke observer then hands the key to the panel, because a key
+        // whose binding was answered never reaches the key-down listeners.
+        //
+        // This is the same shape of answer as the Inspector's fix, which asks
+        // the Inspector before the shortcut runs.
+        let observer = {
+            let focus = focus.clone();
+            cx.observe_keystrokes(move |panel, event, window, cx| {
+                // Only while the panel holds the keyboard: the tree is the
+                // surface the user is on, and the editor's own chords and
+                // shortcuts are the canvas's when the canvas is.
+                if !focus.is_focused(window) {
+                    return;
+                }
+                let claimed = panel
+                    .state
+                    .keyboard()
+                    .claims(&event.keystroke.key, event.keystroke.modifiers);
+                if !claimed {
+                    return;
+                }
+                // The key is the panel's. The binding for it was answered by
+                // the panel's own action listener, so the key never reached
+                // the panel's key handler: this is where it is handled.
+                panel.handle_keystroke(&event.keystroke, cx);
+            })
+        };
         Self {
             session,
             state: PanelState {
@@ -1228,7 +1412,8 @@ impl LayersPanel {
             icons: IconCache::default(),
             cache: RowCache::default(),
             cached_rows: Arc::new(Vec::new()),
-            focus: cx.focus_handle(),
+            focus,
+            observer,
             probe_layers: Rc::new(Cell::new(None)),
             probe_pages: Rc::new(Cell::new(None)),
         }
@@ -1281,6 +1466,28 @@ impl LayersPanel {
             self.state.viewport,
             self.state.offset,
         )
+    }
+
+    /// The text in the panel's search field, as the user reads it.
+    #[cfg(test)]
+    pub fn test_filter(&self) -> String {
+        self.state
+            .filter_field
+            .as_ref()
+            .map(|f| f.text.clone())
+            .unwrap_or_default()
+    }
+
+    /// The layer the panel is renaming, if it is renaming one.
+    #[cfg(test)]
+    pub fn test_renaming(&self) -> Option<NodeId> {
+        self.state.rename.map(|rename| rename.id)
+    }
+
+    /// The text in the panel's rename field, as the user reads it.
+    #[cfg(test)]
+    pub fn test_rename_text(&self) -> Option<String> {
+        self.state.rename_field.as_ref().map(|f| f.text.clone())
     }
 
     /// Run an engine command. The only way this panel changes the document.
@@ -1842,9 +2049,40 @@ impl LayersPanel {
     /// figcraft dispatches these from the app's key handler, where they live next to the canvas
     /// shortcuts. Here the panel owns them, because the panel owns the focus.
     pub fn handle_keystroke(&mut self, ks: &Keystroke, cx: &mut Context<Self>) -> bool {
+        self.handle_key(ks, cx)
+    }
+
+    /// What the panel does with one keystroke.
+    fn handle_key(&mut self, ks: &Keystroke, cx: &mut Context<Self>) -> bool {
         let key = ks.key.clone();
         let shift = ks.modifiers.shift;
         let cmd = ks.modifiers.control || ks.modifiers.platform;
+
+        // THE RENAME CHORD IS THE TREE'S OWN VERB.
+        //
+        // The engine's keymap binds `⌘R` and `F2` to `object.rename`, and the
+        // shell answers that with the Inspector's own rename. In the tree the
+        // rename is the tree's verb: the row opens for editing and the name is
+        // typed into the row. So the tree claims the chord before the binding
+        // runs (see the action listener), and this is where the rename
+        // happens.
+        if (cmd && key == "r") || key == "f2" {
+            let ids = self.session.borrow().selection();
+            self.start_rename(&ids);
+            cx.notify();
+            return true;
+        }
+
+        // A CHORD IS NOT A CHARACTER.
+        //
+        // `⌘Z` is undo and `⌘S` is save whatever is open, so a chord belongs
+        // to whatever answers chords -- the editor's own table -- and not to a
+        // field of this panel's. This is the Inspector's rule, and the reason
+        // the panel's fields do not swallow the editor's chords.
+        if ks.modifiers.control || ks.modifiers.platform || ks.modifiers.alt {
+            return false;
+        }
+
         // An open field has the keyboard.
         if self.state.rename_field.is_some() {
             return self.handle_rename_key(&key, shift, ks, cx);
@@ -1853,17 +2091,10 @@ impl LayersPanel {
             return self.handle_page_rename_key(&key, ks, cx);
         }
         if self.state.filter_field.is_some() {
-            return self.handle_filter_key(&key, shift, cmd, ks, cx);
+            return self.handle_filter_key(&key, shift, ks, cx);
         }
         if self.state.file_rename.is_some() {
             return self.handle_file_rename_key(&key, ks, cx);
-        }
-        // Rename the selection: Cmd/Ctrl+R, as figcraft's shortcut.
-        if cmd && key == "r" {
-            let ids = self.session.borrow().selection();
-            self.start_rename(&ids);
-            cx.notify();
-            return true;
         }
         let nav = match key.as_str() {
             "up" => Some(NavKey::Up),
@@ -2001,13 +2232,9 @@ impl LayersPanel {
         &mut self,
         key: &str,
         _shift: bool,
-        cmd: bool,
         ks: &Keystroke,
         cx: &mut Context<Self>,
     ) -> bool {
-        if cmd && key == "r" {
-            return false;
-        }
         match key {
             "escape" | "enter" => {
                 self.state.filter_field = None;
@@ -2293,11 +2520,55 @@ impl Render for LayersPanel {
             .bg(rgb(theme::SURFACE))
             .text_color(rgb(theme::TEXT))
             .track_focus(&self.focus)
+            .on_action({
+                // THE PANEL'S OWN ANSWER TO THE ENGINE'S COMMANDS.
+                //
+                // The panel is deeper in the tree than the shell, so in the
+                // bubble phase it is asked before the shell is: a command the
+                // panel owns is answered here, and the shell's own handler --
+                // which would switch the tool, or open the Inspector's rename
+                // -- never sees it.
+                //
+                // Answering the action stops the key there, so the key never
+                // reaches the key-down listeners: the keystroke observer is
+                // where the panel's own key handling happens for a key whose
+                // binding was answered.
+                let panel = cx.entity().downgrade();
+                move |action: &crate::engine::keymap::RunCommand, window, cx| {
+                    let Some(panel) = panel.upgrade() else {
+                        return;
+                    };
+                    let owns = {
+                        let panel = panel.read(cx);
+                        panel.focus_handle().is_focused(window)
+                            && panel.state.keyboard().owns_command(&action.id)
+                    };
+                    if owns {
+                        cx.stop_propagation();
+                    }
+                }
+            })
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _w, cx| {
                 if this.handle_keystroke(&event.keystroke, cx) {
                     cx.stop_propagation();
                 }
             }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _e: &gpui::MouseDownEvent, window, cx| {
+                    // THE PANEL IS THE SURFACE THE USER IS ON, SO IT TAKES THE
+                    // KEYBOARD.
+                    //
+                    // The tree's arrow keys, its rename chord and its search
+                    // field are all the panel's own, and a key only reaches the
+                    // nodes on the path from the focused node up to the root.
+                    // GPUI focuses a focusable element on the mouse-down by
+                    // itself, and this says the same thing explicitly, so the
+                    // panel's ownership of the keyboard does not depend on
+                    // which of its children the pointer happened to land on.
+                    this.focus.focus(window, cx);
+                }),
+            )
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, e: &gpui::MouseUpEvent, _w, cx| {
@@ -2696,6 +2967,7 @@ impl LayersPanel {
             .child(
                 div()
                     .id("layer-search")
+                    .debug_selector(|| "layer-search".to_string())
                     .w(px(24.0))
                     .h(px(24.0))
                     .flex()
@@ -3811,6 +4083,86 @@ mod tests {
             ),
             NavOutcome::None
         );
+    }
+
+    // --- the keyboard -------------------------------------------------------
+
+    /// A keystroke with no modifiers.
+    fn bare() -> Modifiers {
+        Modifiers::none()
+    }
+
+    /// A keystroke with the command modifier.
+    fn cmd() -> Modifiers {
+        Modifiers {
+            platform: true,
+            ..Modifiers::none()
+        }
+    }
+
+    #[test]
+    fn the_tree_owns_the_arrows_and_the_rename_chord() {
+        for key in ["up", "down", "left", "right"] {
+            assert!(
+                Keyboard::Tree.claims(key, bare()),
+                "the tree owns the {key} key"
+            );
+        }
+        assert!(
+            Keyboard::Tree.claims("r", cmd()),
+            "the tree owns the rename chord"
+        );
+        // A letter typed in the tree is the editor's tool shortcut, exactly as
+        // it is in figcraft: the tree has no use for it.
+        for key in ["v", "a", "c", "f", "o", "p", "r", "t"] {
+            assert!(
+                !Keyboard::Tree.claims(key, bare()),
+                "the tree does not own the {key} key"
+            );
+        }
+    }
+
+    #[test]
+    fn a_field_owns_the_characters_and_not_the_chords() {
+        for key in ["f", "v", "1", "z"] {
+            assert!(
+                Keyboard::Field.claims(key, bare()),
+                "a field owns the {key} key"
+            );
+        }
+        // A chord is not a character: it belongs to whatever answers chords.
+        for key in ["z", "s", "a"] {
+            assert!(
+                !Keyboard::Field.claims(key, cmd()),
+                "a field does not own the ⌘{key} chord"
+            );
+        }
+    }
+
+    #[test]
+    fn the_search_leaves_the_arrows_to_the_editor() {
+        assert!(Keyboard::Search.claims("f", bare()));
+        assert!(!Keyboard::Search.claims("down", bare()));
+        assert!(!Keyboard::Search.claims("f", cmd()));
+    }
+
+    #[test]
+    fn the_tree_owns_the_rename_and_a_field_owns_the_letters() {
+        // The rename is the tree's own verb, in every mode.
+        for keyboard in [Keyboard::Tree, Keyboard::Field, Keyboard::Search] {
+            assert!(
+                keyboard.owns_command("object.rename"),
+                "{keyboard:?} owns the rename"
+            );
+        }
+        // The letters are the tool shortcuts, so a field owns them and the
+        // tree does not.
+        assert!(Keyboard::Field.owns_command("tool.frame"));
+        assert!(Keyboard::Search.owns_command("tool.frame"));
+        assert!(!Keyboard::Tree.owns_command("tool.frame"));
+        // A chord is the editor's: undo is undo wherever the keyboard is.
+        assert!(!Keyboard::Field.owns_command("edit.undo"));
+        assert!(!Keyboard::Search.owns_command("edit.undo"));
     }
 
     // --- expand helpers ----------------------------------------------------

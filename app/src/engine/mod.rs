@@ -53,6 +53,8 @@ pub mod canvas;
 pub mod inspector_model;
 pub mod keymap;
 pub mod layers;
+#[cfg(test)]
+mod layers_focus_tests;
 pub mod menus;
 pub mod palette;
 pub mod panel_a11y;

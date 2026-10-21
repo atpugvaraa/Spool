@@ -72,16 +72,16 @@
 //! tool. Spool has no such surface yet, and a button that runs a command
 //! nothing answers is a button that lies.
 
-use std::cell::RefCell;
-use std::rc::Rc;
-
 use figcraft_doc::color::{ColorProfile, Hsb, Hsl, Paint};
 use figcraft_doc::{Document, Node, NodeId};
 use gpui::{
-    checkerboard, div, linear_color_stop, linear_gradient, prelude::*, px, rgb, rgba, AnyElement,
-    Bounds, Context, Entity, Hsla, MouseButton, Pixels, Point, SharedString,
+    canvas, checkerboard, div, linear_color_stop, linear_gradient, point, prelude::*, px, rgb,
+    rgba, size, AnyElement, Bounds, Context, Corners, Entity, Hsla, MouseButton, PaintQuad, Pixels,
+    Point, SharedString,
 };
 use serde_json::Value as JsonValue;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use crate::engine::canvas::EngineCanvas;
 use crate::theme;
@@ -902,6 +902,11 @@ const ALPHA_HEIGHT: f32 = 16.0;
 /// The width of the hue and alpha sliders.
 const SLIDER: f32 = SQUARE;
 
+/// The number of segments in the hue strip.
+///
+/// figcraft's `hue_slider` builds twelve: one for every thirty degrees of hue.
+pub const HUE_SEGMENTS: usize = 12;
+
 /// The diameter of a slider's knob.
 const KNOB: f32 = 12.0;
 
@@ -1156,7 +1161,29 @@ fn square<T: ColorHost>(
         )
 }
 
+// THE SEGMENTS THE HUE STRIP WAS PAINTED WITH.
+//
+// The paint records what it puts down, so a test can read the strip the way
+// the screen shows it rather than the way the code means it. A thread-local,
+// because the paint happens on the thread that draws the window.
+#[cfg(test)]
+thread_local! {
+    static HUE_PAINTED: RefCell<Vec<HueSegment>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The segments the last hue strip painted, and an empty list again.
+#[cfg(test)]
+fn take_painted_hue() -> Vec<HueSegment> {
+    HUE_PAINTED.with(|painted| std::mem::take(&mut *painted.borrow_mut()))
+}
+
 /// The hue slider.
+///
+/// The strip is a rainbow: figcraft's `hue_slider` walks the hue from 0 to 360
+/// in twelve steps and puts a vertex at each, so the colour at a point is the
+/// hue at that point. The port drew a gradient between the two ends of the hue
+/// instead, and the two ends are the same colour -- so the strip was a flat
+/// red bar, and the only way to pick a hue was to drag a knob along it.
 fn hue_slider<T: ColorHost>(
     model: &ColorPickerModel,
     areas: &DragAreas,
@@ -1167,11 +1194,33 @@ fn hue_slider<T: ColorHost>(
     let writer = areas.hue.clone();
     let dragging = state.clone();
     let areas = areas.clone();
-    let gradient = div().absolute().inset_0().bg(linear_gradient(
-        90.,
-        linear_color_stop(hue_color(0.0), 0.0),
-        linear_color_stop(hue_color(360.0), 1.0),
-    ));
+    let strip = canvas(
+        |_bounds, _window, _cx| {},
+        move |bounds, _prepaint, window, _cx| {
+            // The last frame is the strip as it is on the screen: a window
+            // draws more than once, and the test wants what is showing.
+            #[cfg(test)]
+            HUE_PAINTED.with(|painted| painted.borrow_mut().clear());
+            for segment in hue_segments(bounds) {
+                window.paint_quad(PaintQuad {
+                    bounds: segment.bounds,
+                    corner_radii: Corners::all(px(0.0)),
+                    background: linear_gradient(
+                        90.,
+                        linear_color_stop(segment.from, 0.0),
+                        linear_color_stop(segment.to, 1.0),
+                    ),
+                    border_widths: Default::default(),
+                    border_color: gpui::transparent_black(),
+                    border_style: Default::default(),
+                });
+                #[cfg(test)]
+                HUE_PAINTED.with(|painted| painted.borrow_mut().push(segment));
+            }
+        },
+    )
+    .absolute()
+    .inset_0();
     let knob = knob_at((hsb.h / 360.0) * SLIDER, 0.0, gpui_color(model.working));
     let target = model.target;
     let ids = model.ids.clone();
@@ -1189,7 +1238,7 @@ fn hue_slider<T: ColorHost>(
         .h(px(HUE_HEIGHT))
         .rounded_sm()
         .overflow_hidden()
-        .child(gradient)
+        .child(strip)
         .child(knob)
         .on_mouse_down(
             MouseButton::Left,
@@ -1512,6 +1561,10 @@ fn knob_at(x: f32, y: f32, color: Hsla) -> impl IntoElement {
 }
 
 /// The colour at a hue, at full saturation and brightness.
+///
+/// The engine's own conversion, unchanged: `figcraft_doc::color::Hsb` is the
+/// model the picker's fields show and the one its squares are drawn from, so
+/// the strip and the square cannot disagree about a hue.
 fn hue_color(hue: f32) -> Hsla {
     gpui_color(
         Hsb {
@@ -1521,6 +1574,55 @@ fn hue_color(hue: f32) -> Hsla {
         }
         .to_color(),
     )
+}
+
+/// The colours the hue strip is drawn from, one per boundary.
+///
+/// figcraft's `hue_slider` walks the hue from 0 to 360 in `n` steps and puts a
+/// vertex at each, so the strip is a rainbow. A gradient between the two ends
+/// of the hue would be a gradient between red and red, because the hue comes
+/// back round to where it started: the strip was a flat red bar.
+pub fn hue_strip() -> [Hsla; HUE_SEGMENTS + 1] {
+    let mut strip = [gpui::white(); HUE_SEGMENTS + 1];
+    for (index, slot) in strip.iter_mut().enumerate() {
+        let hue = (index as f32 / HUE_SEGMENTS as f32) * 360.0;
+        *slot = hue_color(hue);
+    }
+    strip
+}
+
+/// One segment of the hue strip: the box it covers and the colours at its two
+/// ends.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HueSegment {
+    /// The box the segment covers.
+    pub bounds: Bounds<Pixels>,
+    /// The colour at the segment's left edge.
+    pub from: Hsla,
+    /// The colour at the segment's right edge.
+    pub to: Hsla,
+}
+
+/// The segments the hue strip is painted with.
+///
+/// The same shape as figcraft's mesh: a vertex every thirty degrees of hue,
+/// and a band between each pair. The bands are what the strip is drawn from,
+/// so a test can ask the strip what colour it is at a point.
+pub fn hue_segments(bounds: Bounds<Pixels>) -> Vec<HueSegment> {
+    let strip = hue_strip();
+    let width = f32::from(bounds.size.width) / HUE_SEGMENTS as f32;
+    (0..HUE_SEGMENTS)
+        .map(|index| HueSegment {
+            bounds: Bounds {
+                origin: point(bounds.origin.x + px(width * index as f32), bounds.origin.y),
+                // A half point of overlap, so two neighbouring bands cannot
+                // leave a hairline between them.
+                size: size(px(width + 0.5), bounds.size.height),
+            },
+            from: strip[index],
+            to: strip[index + 1],
+        })
+        .collect()
 }
 
 /// The engine's colour, as the panel draws it.
@@ -2112,6 +2214,144 @@ mod tests {
         assert!(
             window.debug_bounds("color-picker-square").is_some(),
             "the picker is drawn for a mixed selection too"
+        );
+    }
+
+    // ── The hue strip ──────────────────────────────────────────────────────
+
+    /// The colour as the panel's own eight-bit spelling, `RRGGBB`.
+    fn hex_of(color: Hsla) -> String {
+        let rgba = color.to_rgb();
+        let channel = |value: f32| format!("{:02X}", (value.clamp(0.0, 1.0) * 255.0).round() as u8);
+        format!("{}{}{}", channel(rgba.r), channel(rgba.g), channel(rgba.b))
+    }
+
+    /// The hue strip is a rainbow.
+    ///
+    /// The bug: the strip was a gradient between the two ends of the hue, and
+    /// the two ends of the hue are the same colour -- so it was a flat red
+    /// bar, and the only way to pick a hue was to drag a knob along it and
+    /// hope. The test samples the strip the way the screen shows it: the
+    /// colours the paint actually put down.
+    ///
+    /// A strip that is one colour at both ends FAILS this test, which is the
+    /// whole point of it.
+    #[gpui::test]
+    fn the_hue_bar_is_a_rainbow(cx: &mut TestAppContext) {
+        let (doc, id) = document_with_a_filled_rectangle();
+        let model = ColorPickerModel::read(&doc, &[id], ColorTarget::Fill, None, &[]);
+        let (_host, window) = draw_picker(cx, model);
+        let strip = window
+            .debug_bounds("color-picker-hue")
+            .expect("the hue strip is laid out");
+        assert!(
+            strip.size.width > px(0.0) && strip.size.height > px(0.0),
+            "the strip has a real size: {:?}",
+            strip.size
+        );
+
+        let painted = take_painted_hue();
+        assert_eq!(
+            painted.len(),
+            HUE_SEGMENTS,
+            "the strip is painted as twelve bands, one for every thirty degrees"
+        );
+
+        // The rainbow, sampled every sixty degrees: red, yellow, green, cyan,
+        // blue, magenta, and back to red.
+        for (index, expected) in [
+            "FF0000", "FFFF00", "00FF00", "00FFFF", "0000FF", "FF00FF", "FF0000",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let at = index * (HUE_SEGMENTS / 6);
+            let colour = if at == HUE_SEGMENTS {
+                painted[HUE_SEGMENTS - 1].to
+            } else {
+                painted[at].from
+            };
+            assert_eq!(
+                hex_of(colour),
+                *expected,
+                "the strip at {} degrees",
+                index * 60
+            );
+        }
+
+        // And no two neighbouring bands start at the same colour: a strip that
+        // is one colour all the way along is a flat bar.
+        for pair in painted.windows(2) {
+            assert_ne!(
+                hex_of(pair[0].from),
+                hex_of(pair[1].from),
+                "two neighbouring bands start at the same colour"
+            );
+        }
+    }
+
+    /// The hue the strip shows is the hue the fields show.
+    ///
+    /// The picker's fields read the hue out of the colour with the engine's
+    /// own conversion, and the strip draws the hue with the same one, so the
+    /// two cannot disagree about a colour.
+    #[test]
+    fn the_hue_conversion_is_exact() {
+        // The standard HSV to RGB, sector by sector: 0 is red, 60 is yellow,
+        // 120 is green, 180 is cyan, 240 is blue, 300 is magenta, and back to
+        // red at 360.
+        for (hue, expected) in [
+            (0.0, "FF0000"),
+            (60.0, "FFFF00"),
+            (120.0, "00FF00"),
+            (180.0, "00FFFF"),
+            (240.0, "0000FF"),
+            (300.0, "FF00FF"),
+            (360.0, "FF0000"),
+        ] {
+            let color = Hsb {
+                h: hue,
+                s: 1.0,
+                b: 1.0,
+            }
+            .to_color();
+            assert_eq!(color.to_hex(), expected, "the colour at {hue} degrees");
+            assert_eq!(
+                hex_of(hue_color(hue)),
+                expected,
+                "and the strip shows the same colour at {hue} degrees"
+            );
+        }
+    }
+
+    /// The picker's own fields agree with the colour they describe.
+    ///
+    /// The hue field reads the hue out of the colour and the HSB field turns a
+    /// typed hue back into a colour, so the two have to be the same hue or the
+    /// field would describe a colour the document does not hold.
+    #[test]
+    fn the_hsb_fields_agree_with_the_colour_they_describe() {
+        let color = EngineColor::from_rgb8_const(0x00, 0xFF, 0x00);
+        let hsb = Hsb::from_color(color);
+        assert_eq!(hsb.h, 120.0, "green is 120 degrees");
+        assert_eq!(
+            field_text(ColorModel::Hsb, ColorField::Hue, color),
+            "120",
+            "the hue field says so"
+        );
+        // The same hue typed back, on a colour that is already saturated: the
+        // hue changes and the saturation stays.
+        let typed = field_value(
+            ColorModel::Hsb,
+            ColorField::Hue,
+            "120",
+            EngineColor::from_rgb8_const(0xFF, 0x00, 0x00),
+        )
+        .expect("a hue is a colour");
+        assert_eq!(
+            typed.to_hex(),
+            "00FF00",
+            "and typing it back gives the colour it described"
         );
     }
 }
