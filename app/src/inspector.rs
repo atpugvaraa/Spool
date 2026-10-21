@@ -1551,7 +1551,13 @@ impl Inspector {
     /// it. Two separate questions, so the ladder can be decided from state
     /// rather than from whatever happened to be cancelled first.
     pub fn is_busy(&self) -> bool {
-        self.edit.is_some() || self.rename.is_some() || self.scrub.is_some()
+        self.edit.is_some()
+            || self.rename.is_some()
+            || self.scrub.is_some()
+            // The Export section's own fields: a size, a suffix or a bleed
+            // being typed. It is a text buffer like any other, and the editor's
+            // Escape ladder has to know it is open.
+            || self.export_state.borrow().is_busy()
     }
 
     /// Give up whatever the Inspector is part-way through.
@@ -1575,6 +1581,13 @@ impl Inspector {
             cx.notify();
             return true;
         }
+        // The Export section's draft. The read and the write are SEPARATE
+        // statements: a RefCell borrow alive across the `if` body would panic.
+        let export_cancelled = self.export_state.borrow_mut().cancel();
+        if export_cancelled {
+            cx.notify();
+            return true;
+        }
         false
     }
 
@@ -1592,6 +1605,17 @@ impl Inspector {
     pub fn handle_key(&mut self, key: &str, shift: bool, cx: &mut Context<Self>) -> bool {
         if key == "escape" {
             return false;
+        }
+        // The Export section's own text fields: a size, a suffix or a bleed
+        // being typed. The section owns the buffer; the Inspector routes the key
+        // to it and runs the change it asks for.
+        if self.export_state.borrow().is_busy() {
+            let action = self.export_state.borrow_mut().handle_key(key);
+            if let Some(action) = action {
+                self.run_export_action(action, cx);
+            }
+            cx.notify();
+            return true;
         }
         if self.rename.is_some() {
             return self.rename_key(key, cx);
@@ -1787,7 +1811,7 @@ impl Inspector {
     ///
     /// It is an entity, so the section's own state -- which row is open, which
     /// field is being typed into -- lives with it and keeps its focus.
-    fn effects_section(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn effects_section(&self, _cx: &mut Context<Self>) -> AnyElement {
         match self.effects.clone() {
             Some(panel) => panel.into_any_element(),
             None => empty_note("No effects yet.").into_any_element(),
