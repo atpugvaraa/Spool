@@ -64,6 +64,9 @@ use std::rc::Rc;
 
 use crate::engine::canvas::EngineCanvas;
 use crate::engine::inspector_model as model;
+use crate::engine::panel_colorpicker::{
+    self as panel_colorpicker, ColorAction, ColorHost, ColorPickerModel, ColorPickerState,
+};
 use crate::engine::panel_components::{
     self as panel_components, ComponentAction, ComponentsHost, ComponentsModel,
     ComponentsPanelState,
@@ -71,6 +74,13 @@ use crate::engine::panel_components::{
 use crate::engine::panel_effects::EffectsPanel;
 use crate::engine::panel_export::{
     self as panel_export, ExportAction, ExportHost, ExportModel, ExportPanelState,
+};
+use crate::engine::panel_styles::{
+    self as panel_styles, StylesAction, StylesHost, StylesModel, StylesPanelState,
+};
+use crate::engine::panel_typography::{
+    self as panel_typography, TypographyAction, TypographyHost, TypographyModel,
+    TypographyPanelState,
 };
 use crate::theme;
 
@@ -120,7 +130,7 @@ const NO_STROKE: &str = "No stroke to be wide";
 ///
 /// Fixed rather than growable, so a section's slot can be baked into the click
 /// closure that toggles it.
-pub const SECTION_COUNT: usize = 6;
+pub const SECTION_COUNT: usize = 8;
 
 /// A collapsible section, addressed by a slot.
 ///
@@ -139,6 +149,8 @@ impl SectionSlot {
     pub const TYPOGRAPHY: Self = Self(3);
     pub const EFFECTS: Self = Self(4);
     pub const EXPORT: Self = Self(5);
+    pub const STYLES: Self = Self(6);
+    pub const COLOUR: Self = Self(7);
 
     fn index(self) -> usize {
         self.0
@@ -1447,6 +1459,14 @@ pub struct Inspector {
     /// The export section's state: which row is being edited, and what is being
     /// typed into it.
     export_state: Rc<RefCell<ExportPanelState>>,
+    /// The styles section's state: which slot's browser is open, what is being
+    /// typed into it, and which folders are folded away.
+    styles_state: Rc<RefCell<StylesPanelState>>,
+    /// The typography section's state: which menu is open and what is being
+    /// typed into it.
+    typography_state: Rc<RefCell<TypographyPanelState>>,
+    /// The colour picker's state: the colour being edited and the draft.
+    color_state: Rc<RefCell<ColorPickerState>>,
     tab: usize,
     sections: Sections,
     /// The property the arrow keys move, once a field has been touched.
@@ -1486,6 +1506,9 @@ impl Inspector {
             effects: None,
             components_state: Rc::new(RefCell::new(ComponentsPanelState::default())),
             export_state: Rc::new(RefCell::new(ExportPanelState::default())),
+            styles_state: Rc::new(RefCell::new(StylesPanelState::default())),
+            typography_state: Rc::new(RefCell::new(TypographyPanelState::default())),
+            color_state: Rc::new(RefCell::new(ColorPickerState::default())),
             tab: 0,
             sections: Sections::new(),
             focus: None,
@@ -1558,6 +1581,9 @@ impl Inspector {
             // being typed. It is a text buffer like any other, and the editor's
             // Escape ladder has to know it is open.
             || self.export_state.borrow().is_busy()
+            || self.styles_state.borrow().is_busy()
+            || self.typography_state.borrow().is_busy()
+            || self.color_state.borrow().is_busy()
     }
 
     /// Give up whatever the Inspector is part-way through.
@@ -1588,6 +1614,24 @@ impl Inspector {
             cx.notify();
             return true;
         }
+        // The styles, typography and colour sections' own drafts. The read and
+        // the write are SEPARATE statements: a RefCell borrow alive across the
+        // body would panic.
+        let styles_cancelled = self.styles_state.borrow_mut().cancel();
+        if styles_cancelled {
+            cx.notify();
+            return true;
+        }
+        let typography_cancelled = self.typography_state.borrow_mut().cancel();
+        if typography_cancelled {
+            cx.notify();
+            return true;
+        }
+        let colour_cancelled = self.color_state.borrow_mut().cancel();
+        if colour_cancelled {
+            cx.notify();
+            return true;
+        }
         false
     }
 
@@ -1613,6 +1657,30 @@ impl Inspector {
             let action = self.export_state.borrow_mut().handle_key(key);
             if let Some(action) = action {
                 self.run_export_action(action, cx);
+            }
+            cx.notify();
+            return true;
+        }
+        if self.styles_state.borrow().is_busy() {
+            let action = self.styles_state.borrow_mut().handle_key(key);
+            if let Some(action) = action {
+                self.run_styles_action(action, cx);
+            }
+            cx.notify();
+            return true;
+        }
+        if self.typography_state.borrow().is_busy() {
+            let action = self.typography_state.borrow_mut().handle_key(key);
+            if let Some(action) = action {
+                self.run_typography_action(action, cx);
+            }
+            cx.notify();
+            return true;
+        }
+        if self.color_state.borrow().is_busy() {
+            let action = self.color_state.borrow_mut().handle_key(key);
+            if let Some(action) = action {
+                self.run_color_action(action, cx);
             }
             cx.notify();
             return true;
@@ -1850,6 +1918,85 @@ impl Inspector {
         });
         let state = self.components_state.clone();
         panel_components::components_section(&model, &state, cx)
+    }
+
+    /// The styles section: the selected layers' style links, and the browser
+    /// of the styles a slot offers.
+    fn styles_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(engine) = self.engine.clone() else {
+            return empty_note("No styles yet.").into_any_element();
+        };
+        let model: StylesModel = engine.read(cx).with_session(|session| {
+            let Ok(doc) = session.doc() else {
+                return StylesModel::default();
+            };
+            StylesModel::read(doc, &session.selection())
+        });
+        let state = self.styles_state.clone();
+        panel_styles::styles_section(&model, &state, cx).into_any_element()
+    }
+
+    /// The typography section: the selection's text layers and their type.
+    fn typography_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(engine) = self.engine.clone() else {
+            return empty_note("This layer has no text").into_any_element();
+        };
+        let model: TypographyModel = engine.read(cx).with_session(|session| {
+            let Ok(doc) = session.doc() else {
+                return TypographyModel::default();
+            };
+            TypographyModel::read(doc, &session.selection(), None)
+        });
+        if !model.has_text {
+            return empty_note("This layer has no text").into_any_element();
+        }
+        let state = self.typography_state.clone();
+        panel_typography::section(&model, &state, cx).into_any_element()
+    }
+
+    /// The colour picker, editing the selection's fill.
+    ///
+    /// The picker is the engine's colour, read and written through the engine's
+    /// own prop names -- `fill`, `stroke` and `textFills` -- so a colour chosen
+    /// here is the colour the engine draws.
+    fn color_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(engine) = self.engine.clone() else {
+            return div().into_any_element();
+        };
+        let model = engine.read(cx).with_session(|session| {
+            session.doc().ok().map(|doc| {
+                ColorPickerModel::read(
+                    doc,
+                    &session.selection(),
+                    panel_colorpicker::ColorTarget::Fill,
+                    None,
+                    &[],
+                )
+            })
+        });
+        let Some(model) = model else {
+            return div().into_any_element();
+        };
+        let state = self.color_state.clone();
+        panel_colorpicker::panel(&model, state, cx)
+    }
+
+    /// Run a styles change through the engine.
+    fn run_styles_action(&mut self, action: StylesAction, cx: &mut Context<Self>) {
+        let (command, params) = action.command();
+        self.run(&command, params, cx);
+    }
+
+    /// Run a typography change through the engine.
+    fn run_typography_action(&mut self, action: TypographyAction, cx: &mut Context<Self>) {
+        let (command, params) = action.command();
+        self.run(&command, params, cx);
+    }
+
+    /// Run a colour change through the engine.
+    fn run_color_action(&mut self, action: ColorAction, cx: &mut Context<Self>) {
+        let (command, params) = action.command();
+        self.run(&command, params, cx);
     }
 
     /// Run a component change through the engine.
@@ -2113,6 +2260,41 @@ impl Inspector {
     }
 }
 
+impl StylesHost for Inspector {
+    /// Run a styles change through the engine.
+    fn run_styles_action(&mut self, action: StylesAction, cx: &mut Context<Self>) {
+        Inspector::run_styles_action(self, action, cx);
+    }
+}
+
+impl TypographyHost for Inspector {
+    /// Run a typography change through the engine.
+    fn run_typography_action(&mut self, action: TypographyAction, cx: &mut Context<Self>) {
+        Inspector::run_typography_action(self, action, cx);
+    }
+}
+
+impl ColorHost for Inspector {
+    /// Run a colour change through the engine.
+    fn run_color_action(&mut self, action: ColorAction, cx: &mut Context<Self>) {
+        Inspector::run_color_action(self, action, cx);
+    }
+
+    /// Open a gesture: the engine holds ONE undo step open for it.
+    ///
+    /// A drag on the colour square is one operation, not one per pointer
+    /// movement, and the engine's own canvas drags work the same way -- so the
+    /// history reads the same either way.
+    fn begin_color_gesture(&mut self, label: &str, cx: &mut Context<Self>) -> bool {
+        self.begin_gesture(label, cx)
+    }
+
+    /// Close a gesture as one undo step.
+    fn commit_color_gesture(&mut self, cx: &mut Context<Self>) {
+        self.commit_gesture(cx);
+    }
+}
+
 impl ExportHost for Inspector {
     /// Run an export change through the engine.
     fn run_export_action(&mut self, action: ExportAction, cx: &mut Context<Self>) {
@@ -2315,6 +2497,18 @@ impl Inspector {
                         "Export",
                         SectionSlot::EXPORT,
                         self.export_section(cx),
+                        cx,
+                    ))
+                    .child(self.inspector_section(
+                        "Styles",
+                        SectionSlot::STYLES,
+                        self.styles_section(cx),
+                        cx,
+                    ))
+                    .child(self.inspector_section(
+                        "Colour",
+                        SectionSlot::COLOUR,
+                        self.color_section(cx),
                         cx,
                     ))
                     .child(self.components_section(cx))
@@ -3835,6 +4029,8 @@ mod tests {
             SectionSlot::TYPOGRAPHY,
             SectionSlot::EFFECTS,
             SectionSlot::EXPORT,
+            SectionSlot::STYLES,
+            SectionSlot::COLOUR,
         ];
         assert_eq!(slots.len(), SECTION_COUNT, "every slot is accounted for");
         for (index, slot) in slots.iter().enumerate() {
