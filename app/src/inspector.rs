@@ -73,6 +73,9 @@ use crate::engine::panel_assets::{
 use crate::engine::panel_colorpicker::{
     self as panel_colorpicker, ColorAction, ColorHost, ColorPickerState,
 };
+use crate::engine::panel_comments::{
+    self as panel_comments, CommentsAction, CommentsHost, CommentsModel, CommentsPanelState,
+};
 use crate::engine::panel_components::{
     self as panel_components, ComponentAction, ComponentsHost, ComponentsModel,
     ComponentsPanelState,
@@ -1487,6 +1490,9 @@ pub struct Inspector {
     /// The assets section's state: which image is being edited and what is
     /// being typed into it.
     assets_state: Rc<RefCell<AssetsPanelState>>,
+    /// The Comments section's state: which menu is open, what the list is
+    /// filtered by, and what is being typed into the search field.
+    comments_state: Rc<RefCell<CommentsPanelState>>,
     /// The Dev Mode tab's own state: which menu is open, what is being typed
     /// into it, and which annotations the canvas shows.
     devmode_state: Rc<RefCell<DevPanelState>>,
@@ -1546,6 +1552,7 @@ impl Inspector {
             variables_state: Rc::new(RefCell::new(VariablesPanelState::default())),
             prototyping_state: Rc::new(RefCell::new(ProtoPanelState::new())),
             devmode_state: Rc::new(RefCell::new(DevPanelState::new())),
+            comments_state: Rc::new(RefCell::new(CommentsPanelState::new())),
             a11y_state: Rc::new(RefCell::new(A11yPanelState::default())),
             assets_state: Rc::new(RefCell::new(AssetsPanelState::default())),
             typography_state: Rc::new(RefCell::new(TypographyPanelState::default())),
@@ -2081,6 +2088,24 @@ impl Inspector {
         panel_devmode::dev_mode_panel(&model, &state, cx).into_any_element()
     }
 
+    /// The Comments section: the document's comment threads, and the selected
+    /// layers' own comment.
+    fn comments_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(engine) = self.engine.clone() else {
+            return empty_note("No comments yet.").into_any_element();
+        };
+        let model: CommentsModel = engine.read(cx).with_session(|session| {
+            let Ok(doc) = session.doc() else {
+                return CommentsModel::default();
+            };
+            let page = session.page().ok();
+            let user = figcraft_engine::cmd::comment::user_name(session);
+            CommentsModel::read(doc, &session.selection(), page, &user)
+        });
+        let state = self.comments_state.clone();
+        panel_comments::comments_section(&model, &state, cx).into_any_element()
+    }
+
     /// The Accessibility section: what a screen reader reads of the selection.
     fn a11y_section(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(engine) = self.engine.clone() else {
@@ -2445,6 +2470,14 @@ impl AssetsHost for Inspector {
     }
 }
 
+impl CommentsHost for Inspector {
+    /// Run a comments change through the engine.
+    fn run_comments_action(&mut self, action: CommentsAction, cx: &mut Context<Self>) {
+        let (command, params) = action.command();
+        self.run(&command, params, cx);
+    }
+}
+
 impl DevHost for Inspector {
     /// Run a Dev Mode change through the engine.
     fn run_dev_action(&mut self, action: DevAction, cx: &mut Context<Self>) {
@@ -2749,6 +2782,7 @@ impl Inspector {
                         cx,
                     ))
                     .child(self.components_section(cx))
+                    .child(self.comments_section(cx))
                     .into_any_element()
             }
             _ => {
