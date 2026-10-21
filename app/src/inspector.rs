@@ -70,7 +70,7 @@ use crate::engine::panel_components::{
 };
 use crate::engine::panel_effects::EffectsPanel;
 use crate::engine::panel_export::{
-    self as panel_export, ExportAction, ExportModel, ExportPanelState,
+    self as panel_export, ExportAction, ExportHost, ExportModel, ExportPanelState,
 };
 use crate::theme;
 
@@ -1444,11 +1444,9 @@ pub struct Inspector {
     /// The section is a function, not an entity, so the state lives here and
     /// the section is handed a handle to it.
     components_state: Rc<RefCell<ComponentsPanelState>>,
-    /// The export section's state: which row is being edited.
-    ///
-    /// The HOST owns it. The section is handed a snapshot and asks for changes
-    /// through an action, so there is one state and not two.
-    export_state: ExportPanelState,
+    /// The export section's state: which row is being edited, and what is being
+    /// typed into it.
+    export_state: Rc<RefCell<ExportPanelState>>,
     tab: usize,
     sections: Sections,
     /// The property the arrow keys move, once a field has been touched.
@@ -1487,7 +1485,7 @@ impl Inspector {
             engine: None,
             effects: None,
             components_state: Rc::new(RefCell::new(ComponentsPanelState::default())),
-            export_state: ExportPanelState::default(),
+            export_state: Rc::new(RefCell::new(ExportPanelState::default())),
             tab: 0,
             sections: Sections::new(),
             focus: None,
@@ -1807,13 +1805,8 @@ impl Inspector {
             };
             panel_export::selected_exports(doc, &session.selection())
         });
-        // The section is handed a SNAPSHOT and asks for changes through an
-        // action, so there is one state and not two.
         let state = self.export_state.clone();
-        panel_export::section(&model, &state, cx, |this, cx, action| {
-            this.run_export_action(action, cx);
-        })
-        .into_any_element()
+        panel_export::section(&model, &state, cx).into_any_element()
     }
 
     /// The components section: what the selected layer is, in the components
@@ -1847,16 +1840,12 @@ impl Inspector {
 
     /// Run an export change through the engine.
     ///
-    /// Two things, and they are different: a COMMAND changes the document, and
-    /// a STATE change changes what the section remembers.
+    /// The engine's commands are the operation surface, so a change made from
+    /// the section is the same change the CLI or a shortcut would make, and it
+    /// lands in the same history.
     fn run_export_action(&mut self, action: ExportAction, cx: &mut Context<Self>) {
-        if let Some(command) = action.command {
-            self.run(command.id, command.params.clone(), cx);
-        }
-        if let Some(state) = action.state {
-            self.export_state = state;
-        }
-        cx.notify();
+        let (command, params) = action.command();
+        self.run(&command, params, cx);
     }
 
     /// Write one property of one layer's box.
@@ -2097,6 +2086,13 @@ impl Inspector {
             return Availability::Disabled(NO_STROKE);
         }
         Availability::Supported
+    }
+}
+
+impl ExportHost for Inspector {
+    /// Run an export change through the engine.
+    fn run_export_action(&mut self, action: ExportAction, cx: &mut Context<Self>) {
+        Inspector::run_export_action(self, action, cx);
     }
 }
 

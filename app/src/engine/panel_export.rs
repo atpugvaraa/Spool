@@ -42,10 +42,11 @@
 //! itself is one keystroke away; what the Inspector owns is the settings that
 //! decide what an export would be.
 
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use figcraft_doc::{Document, ExportFormat, ExportSetting, ExportSize, NodeId, PrintSettings};
-use gpui::{div, prelude::*, px, rgb, Context, Div, IntoElement, SharedString};
+use gpui::{div, prelude::*, px, rgb, AnyElement, Context, Div, SharedString};
 use serde_json::{json, Value};
 
 use crate::theme;
@@ -220,37 +221,18 @@ impl ExportModel {
     /// last: 1x first, then one scale step up with a matching "@2x"-style
     /// suffix. A selection whose settings disagree gets one default setting
     /// instead, which is the only way to make a mixed selection agree.
-    pub fn add_command(&self) -> ExportCommand {
-        if self.mixed {
-            ExportCommand {
-                id: "node.set",
-                params: json!({
-                    "ids": self.ids,
-                    "props": { "exports": [default_setting()] }
-                }),
-            }
-        } else {
-            ExportCommand {
-                id: "export.add",
-                params: json!({ "ids": self.ids }),
-            }
-        }
+    pub fn add_command(&self) -> (String, Value) {
+        add_command(&self.ids, self.mixed)
     }
 
     /// The command that removes one export setting from the selection.
-    pub fn remove_command(&self, index: usize) -> ExportCommand {
-        ExportCommand {
-            id: "export.remove",
-            params: json!({ "ids": self.ids, "index": index }),
-        }
+    pub fn remove_command(&self, index: usize) -> (String, Value) {
+        remove_command(&self.ids, index)
     }
 
     /// The command that changes one property of one export setting.
-    pub fn update_command(&self, index: usize, edit: &ExportEdit) -> ExportCommand {
-        ExportCommand {
-            id: "export.update",
-            params: update_params(&self.ids, index, edit),
-        }
+    pub fn update_command(&self, index: usize, edit: &ExportEdit) -> (String, Value) {
+        update_command(&self.ids, index, edit)
     }
 }
 
@@ -381,17 +363,52 @@ fn suffix_of(setting: &ExportSetting) -> Option<String> {
 // The commands
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// A command the section asks the engine to run.
+/// A change the export panel can ask for.
 ///
-/// The engine's command surface is the one operation boundary: an edit made
-/// from this panel, from a shortcut, from the CLI and from an agent are the
-/// same edit and land in the same history.
+/// One variant per thing the panel can change, so a change the engine has no
+/// command for cannot be written down as though it had one.
 #[derive(Clone, Debug, PartialEq)]
-pub struct ExportCommand {
-    /// The engine's command id.
-    pub id: &'static str,
-    /// The command's parameters.
-    pub params: Value,
+pub enum ExportAction {
+    /// Add an export setting to the selection.
+    Add {
+        /// The layers to add it to.
+        ids: Vec<NodeId>,
+        /// Whether the selection's settings disagree.
+        ///
+        /// A selection that disagrees is replaced by one default setting: that
+        /// is the only way to make it agree.
+        mixed: bool,
+    },
+    /// Remove the export setting at an index.
+    Remove {
+        /// The layers to remove it from.
+        ids: Vec<NodeId>,
+        /// Which setting.
+        index: usize,
+    },
+    /// Change one property of one export setting.
+    Update {
+        /// The layers to change it on.
+        ids: Vec<NodeId>,
+        /// Which setting.
+        index: usize,
+        /// What to change.
+        edit: ExportEdit,
+    },
+}
+
+impl ExportAction {
+    /// The engine's command id and parameters for this change.
+    ///
+    /// The engine's own spellings, so a change made from the panel is the
+    /// same change the CLI, the keymap and an agent would make.
+    pub fn command(&self) -> (String, Value) {
+        match self {
+            Self::Add { ids, mixed } => add_command(ids, *mixed),
+            Self::Remove { ids, index } => remove_command(ids, *index),
+            Self::Update { ids, index, edit } => update_command(ids, *index, edit),
+        }
+    }
 }
 
 /// One change to one export setting.
@@ -428,6 +445,34 @@ pub enum PrintEdit {
     BleedMarks(bool),
     /// CMYK colour instead of RGB.
     Cmyk(bool),
+}
+
+/// The command that adds an export setting to a selection.
+pub fn add_command(ids: &[NodeId], mixed: bool) -> (String, Value) {
+    if mixed {
+        (
+            "node.set".to_owned(),
+            json!({
+                "ids": ids,
+                "props": { "exports": [default_setting()] }
+            }),
+        )
+    } else {
+        ("export.add".to_owned(), json!({ "ids": ids }))
+    }
+}
+
+/// The command that removes one export setting from a selection.
+pub fn remove_command(ids: &[NodeId], index: usize) -> (String, Value) {
+    (
+        "export.remove".to_owned(),
+        json!({ "ids": ids, "index": index }),
+    )
+}
+
+/// The command that changes one property of one export setting.
+pub fn update_command(ids: &[NodeId], index: usize, edit: &ExportEdit) -> (String, Value) {
+    ("export.update".to_owned(), update_params(ids, index, edit))
 }
 
 /// The parameters of an `export.update` that changes one property.
@@ -514,29 +559,16 @@ pub struct ExportDraft {
     pub select_all: bool,
 }
 
-/// What the section remembers between two draws.
+/// The panel's own state.
 ///
-/// Presentation, never the document: which menu is open and what is being
-/// typed are the user's place inside a control, not a fact about the design.
+/// The state is a cell the surface that hosts the panel owns, so a menu stays
+/// open across repaints while the panel itself stays a function.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ExportPanelState {
     /// Which menu is open, if any.
     pub open: Option<ExportMenu>,
     /// The text being typed, if any.
     pub draft: Option<ExportDraft>,
-}
-
-/// What the section asks its host to do.
-///
-/// Two things, and they are different: a command changes the document, and a
-/// state change changes what the section remembers. The section does neither
-/// itself — the host owns the document, and the host owns the state.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct ExportAction {
-    /// The engine command to run, if any.
-    pub command: Option<ExportCommand>,
-    /// The section's new state, if it changed.
-    pub state: Option<ExportPanelState>,
 }
 
 impl ExportPanelState {
@@ -564,7 +596,7 @@ impl ExportPanelState {
 
     /// Handle one keystroke.
     ///
-    /// Returns what the section wants to happen, if the key was its own.
+    /// Returns the change the key asks for, if the key was the section's own.
     /// Escape is not claimed: it belongs to the editor's ladder, which walks
     /// down from the topmost thing, and this draft is one of the rungs the
     /// ladder knows about.
@@ -573,10 +605,7 @@ impl ExportPanelState {
         match key {
             "enter" | "return" => {
                 let draft = self.draft.take()?;
-                Some(ExportAction {
-                    command: commit_draft(&draft),
-                    state: None,
-                })
+                commit_draft(&draft)
             }
             "backspace" => {
                 // With the text selected, Backspace deletes the selection —
@@ -589,30 +618,30 @@ impl ExportPanelState {
                 } else {
                     draft.text.pop();
                 }
-                Some(ExportAction::default())
+                None
             }
             // Arrows are not characters. The section has no nudge to make, so
             // the key is swallowed rather than typed into the field.
-            "up" | "down" | "left" | "right" => Some(ExportAction::default()),
+            "up" | "down" | "left" | "right" => None,
             other if other.chars().count() == 1 => {
                 if draft.select_all {
                     draft.text.clear();
                     draft.select_all = false;
                 }
                 draft.text.push_str(other);
-                Some(ExportAction::default())
+                None
             }
             // A modifier combination is an editor shortcut, not a character.
-            _ => Some(ExportAction::default()),
+            _ => None,
         }
     }
 }
 
-/// The command that commits a typed value, if it is one the engine accepts.
+/// The change a typed value asks for, if it is one the engine accepts.
 ///
 /// `None` for a value the engine would refuse: a size that is not a size and
 /// a bleed longer than two inches leave the setting exactly as it was.
-fn commit_draft(draft: &ExportDraft) -> Option<ExportCommand> {
+fn commit_draft(draft: &ExportDraft) -> Option<ExportAction> {
     let index = match draft.field {
         ExportField::Size(index) | ExportField::Suffix(index) | ExportField::Bleed(index) => index,
     };
@@ -627,9 +656,10 @@ fn commit_draft(draft: &ExportDraft) -> Option<ExportCommand> {
             ExportEdit::Print(PrintEdit::Bleed(bleed))
         }
     };
-    Some(ExportCommand {
-        id: "export.update",
-        params: update_params(&draft.ids, index, &edit),
+    Some(ExportAction::Update {
+        ids: draft.ids.clone(),
+        index,
+        edit,
     })
 }
 
@@ -637,32 +667,36 @@ fn commit_draft(draft: &ExportDraft) -> Option<ExportCommand> {
 // The panel
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// How the section asks its host for a change.
-type Run<T> = Rc<dyn Fn(&mut T, &mut Context<T>, ExportAction)>;
-
-/// The Export section.
+/// What a surface that hosts the export panel must be able to do.
 ///
-/// `model` is what the section shows and `state` is what it remembers; `run`
-/// is how it asks for a change — a command for the engine, a new state for
-/// the host that owns this one. The section never changes the document
-/// itself: it says what it wants, and the host that owns the document decides
-/// whether to do it.
-pub fn section<T: 'static>(
+/// The panel draws and asks; the surface owns the engine and runs the changes.
+/// The panel never touches the document itself, so the engine's command surface
+/// stays the one operation boundary.
+pub trait ExportHost: Sized + 'static {
+    /// Run a change through the engine.
+    fn run_export_action(&mut self, action: ExportAction, cx: &mut Context<Self>);
+}
+
+/// The Export section, as an element.
+///
+/// Everything it needs is passed in: the model to show, the panel's own state,
+/// and the surface that runs the changes. It returns an element, so the
+/// Inspector can put it in a section of its own and a test can put it in a
+/// window on its own.
+pub fn section<T: ExportHost>(
     model: &ExportModel,
-    state: &ExportPanelState,
+    state: &Rc<RefCell<ExportPanelState>>,
     cx: &mut Context<T>,
-    run: impl Fn(&mut T, &mut Context<T>, ExportAction) + 'static,
-) -> impl IntoElement {
-    let run: Run<T> = Rc::new(run);
-    let mut body = column().gap_2().px(px(14.0)).py(px(12.0));
-    body = body.child(add_row(model, cx, &run));
+) -> AnyElement {
+    let mut column = div().flex().flex_col().gap_2().px(px(14.0)).py(px(12.0));
+    column = column.child(add_row(model, cx));
     if model.mixed {
-        body = body.child(note("Click + to replace mixed content"));
+        column = column.child(note("Click + to replace mixed content"));
     }
     for row in &model.rows {
-        body = body.child(setting_row(model, row, state, cx, &run));
+        column = column.child(setting_row(model, row, state, cx));
     }
-    body
+    column.into_any_element()
 }
 
 /// The row that adds an export setting.
@@ -670,14 +704,16 @@ pub fn section<T: 'static>(
 /// figcraft puts the "+" in the section header; Spool's Inspector draws its
 /// own header, so the button is the first row of the body — the same control,
 /// in the place Spool has for it.
-fn add_row<T: 'static>(model: &ExportModel, cx: &mut Context<T>, run: &Run<T>) -> impl IntoElement {
+fn add_row<T: ExportHost>(model: &ExportModel, cx: &mut Context<T>) -> impl IntoElement {
     let label = if model.mixed {
         "Replace mixed export settings"
     } else {
         "Add export setting"
     };
-    let command = model.add_command();
-    let run = run.clone();
+    let action = ExportAction::Add {
+        ids: model.ids.clone(),
+        mixed: model.mixed,
+    };
     div()
         .id("export-add")
         .debug_selector(|| "export-add".to_owned())
@@ -696,26 +732,18 @@ fn add_row<T: 'static>(model: &ExportModel, cx: &mut Context<T>, run: &Run<T>) -
         .hover(|style| style.bg(rgb(theme::SURFACE_HOVER)))
         .child("＋")
         .child(label)
-        .on_click(cx.listener(move |this, _event, _window, cx| {
-            run(
-                this,
-                cx,
-                ExportAction {
-                    command: Some(command.clone()),
-                    state: None,
-                },
-            );
+        .on_click(cx.listener(move |host, _event, _window, cx| {
+            host.run_export_action(action.clone(), cx);
         }))
 }
 
 /// One export setting: its size, suffix, format, options and remove button.
 /// A PDF setting has its print settings underneath.
-fn setting_row<T: 'static>(
+fn setting_row<T: ExportHost>(
     model: &ExportModel,
     row: &ExportRow,
-    state: &ExportPanelState,
+    state: &Rc<RefCell<ExportPanelState>>,
     cx: &mut Context<T>,
-    run: &Run<T>,
 ) -> impl IntoElement {
     let index = row.index;
     let mut block = column()
@@ -726,39 +754,39 @@ fn setting_row<T: 'static>(
         div()
             .flex()
             .gap_2()
-            .child(size_field(model, row, state, cx, run))
-            .child(suffix_field(model, row, state, cx, run)),
+            .child(size_field(model, row, state, cx))
+            .child(suffix_field(model, row, state, cx)),
     );
     block = block.child(
         div()
             .flex()
             .gap_2()
-            .child(format_field(row, state, cx, run))
-            .child(options_button(row, state, cx, run))
-            .child(remove_button(model, row, cx, run)),
+            .child(format_field(row, state, cx))
+            .child(options_button(row, state, cx))
+            .child(remove_button(model, row, cx)),
     );
-    if state.open == Some(ExportMenu::Size(index)) {
-        block = block.child(size_menu(model, row, cx, run));
+    let open = state.borrow().open;
+    if open == Some(ExportMenu::Size(index)) {
+        block = block.child(size_menu(model, row, cx));
     }
-    if state.open == Some(ExportMenu::Format(index)) {
-        block = block.child(format_menu(model, row, cx, run));
+    if open == Some(ExportMenu::Format(index)) {
+        block = block.child(format_menu(model, row, cx));
     }
-    if state.open == Some(ExportMenu::Options(index)) {
-        block = block.child(options_menu(model, row, cx, run));
+    if open == Some(ExportMenu::Options(index)) {
+        block = block.child(options_menu(model, row, cx));
     }
     if row.format.value() == Some(&ExportFormat::Pdf) {
-        block = block.child(print_row(model, row, state, cx, run));
+        block = block.child(print_row(model, row, state, cx));
     }
     block
 }
 
 /// The size field: the size, typed into or picked from the presets.
-fn size_field<T: 'static>(
+fn size_field<T: ExportHost>(
     model: &ExportModel,
     row: &ExportRow,
-    state: &ExportPanelState,
+    state: &Rc<RefCell<ExportPanelState>>,
     cx: &mut Context<T>,
-    run: &Run<T>,
 ) -> impl IntoElement {
     let index = row.index;
     let current = match &row.size {
@@ -771,21 +799,16 @@ fn size_field<T: 'static>(
         ExportValue::Mixed => MIXED.to_owned(),
     };
     let shown = field_text(state, ExportField::Size(index), value_text.clone());
-    let editing = state
-        .draft
-        .as_ref()
-        .is_some_and(|draft| draft.field == ExportField::Size(index));
+    let editing = is_editing(state, ExportField::Size(index));
     // Typing into the field replaces the size; the chevron beside it picks
     // one of the presets instead.
-    let mut typing = state.clone();
-    typing.open = None;
-    typing.draft = Some(ExportDraft {
+    let draft = ExportDraft {
         field: ExportField::Size(index),
         text: current.unwrap_or_default(),
         ids: model.ids.clone(),
         select_all: true,
-    });
-    let runner = Rc::clone(run);
+    };
+    let shared = Rc::clone(state);
     let field = field_box(
         shown,
         Some(78.0),
@@ -794,27 +817,15 @@ fn size_field<T: 'static>(
     )
     .id(SharedString::from(format!("export-size-{index}")))
     .debug_selector(move || format!("export-size-{index}"))
-    .on_click(cx.listener({
-        let run = runner.clone();
-        move |this, _event, _window, cx| {
-            run(
-                this,
-                cx,
-                ExportAction {
-                    command: None,
-                    state: Some(typing.clone()),
-                },
-            );
+    .on_click(cx.listener(move |_host, _event, _window, cx| {
+        {
+            let mut state = shared.borrow_mut();
+            state.open = None;
+            state.draft = Some(draft.clone());
         }
+        cx.notify();
     }));
-    let mut menu = state.clone();
-    menu.open = if state.open == Some(ExportMenu::Size(index)) {
-        None
-    } else {
-        Some(ExportMenu::Size(index))
-    };
-    menu.draft = None;
-    let runner = Rc::clone(run);
+    let shared = Rc::clone(state);
     let chevron = div()
         .id(SharedString::from(format!("export-size-menu-{index}")))
         .debug_selector(move || format!("export-size-menu-{index}"))
@@ -822,32 +833,30 @@ fn size_field<T: 'static>(
         .text_color(rgb(theme::TEXT_MUTED))
         .cursor_pointer()
         .child("▾")
-        .on_click(cx.listener({
-            let run = runner.clone();
-            move |this, _event, _window, cx| {
-                // The chevron is inside the field, so the field's own click
-                // would otherwise open the editor as well as the menu.
-                cx.stop_propagation();
-                run(
-                    this,
-                    cx,
-                    ExportAction {
-                        command: None,
-                        state: Some(menu.clone()),
-                    },
-                );
+        .on_click(cx.listener(move |_host, _event, _window, cx| {
+            // The chevron is inside the field, so the field's own click would
+            // otherwise open the editor as well as the menu.
+            cx.stop_propagation();
+            {
+                let mut state = shared.borrow_mut();
+                state.open = if state.open == Some(ExportMenu::Size(index)) {
+                    None
+                } else {
+                    Some(ExportMenu::Size(index))
+                };
+                state.draft = None;
             }
+            cx.notify();
         }));
     field.child(chevron)
 }
 
 /// The suffix field: what the exported file's name gets after the layer's.
-fn suffix_field<T: 'static>(
+fn suffix_field<T: ExportHost>(
     model: &ExportModel,
     row: &ExportRow,
-    state: &ExportPanelState,
+    state: &Rc<RefCell<ExportPanelState>>,
     cx: &mut Context<T>,
-    run: &Run<T>,
 ) -> impl IntoElement {
     let index = row.index;
     let current = match &row.suffix {
@@ -860,19 +869,14 @@ fn suffix_field<T: 'static>(
         ExportValue::Mixed => MIXED.to_owned(),
     };
     let shown = field_text(state, ExportField::Suffix(index), value_text.clone());
-    let editing = state
-        .draft
-        .as_ref()
-        .is_some_and(|draft| draft.field == ExportField::Suffix(index));
-    let mut typing = state.clone();
-    typing.open = None;
-    typing.draft = Some(ExportDraft {
+    let editing = is_editing(state, ExportField::Suffix(index));
+    let draft = ExportDraft {
         field: ExportField::Suffix(index),
         text: current.unwrap_or_default(),
         ids: model.ids.clone(),
         select_all: true,
-    });
-    let run = run.clone();
+    };
+    let shared = Rc::clone(state);
     field_box(
         shown,
         None,
@@ -881,24 +885,21 @@ fn suffix_field<T: 'static>(
     )
     .id(SharedString::from(format!("export-suffix-{index}")))
     .debug_selector(move || format!("export-suffix-{index}"))
-    .on_click(cx.listener(move |this, _event, _window, cx| {
-        run(
-            this,
-            cx,
-            ExportAction {
-                command: None,
-                state: Some(typing.clone()),
-            },
-        );
+    .on_click(cx.listener(move |_host, _event, _window, cx| {
+        {
+            let mut state = shared.borrow_mut();
+            state.open = None;
+            state.draft = Some(draft.clone());
+        }
+        cx.notify();
     }))
 }
 
 /// The format field: the file format, picked from a list.
-fn format_field<T: 'static>(
+fn format_field<T: ExportHost>(
     row: &ExportRow,
-    state: &ExportPanelState,
+    state: &Rc<RefCell<ExportPanelState>>,
     cx: &mut Context<T>,
-    run: &Run<T>,
 ) -> impl IntoElement {
     let index = row.index;
     let value_text = match &row.format {
@@ -906,14 +907,7 @@ fn format_field<T: 'static>(
         ExportValue::Unset => NOT_SET.to_owned(),
         ExportValue::Mixed => MIXED.to_owned(),
     };
-    let mut menu = state.clone();
-    menu.open = if state.open == Some(ExportMenu::Format(index)) {
-        None
-    } else {
-        Some(ExportMenu::Format(index))
-    };
-    menu.draft = None;
-    let run = run.clone();
+    let shared = Rc::clone(state);
     field_box(
         value_text.clone(),
         None,
@@ -924,34 +918,28 @@ fn format_field<T: 'static>(
     .debug_selector(move || format!("export-format-{index}"))
     .cursor_pointer()
     .hover(|style| style.bg(rgb(theme::SURFACE_HOVER)))
-    .on_click(cx.listener(move |this, _event, _window, cx| {
-        run(
-            this,
-            cx,
-            ExportAction {
-                command: None,
-                state: Some(menu.clone()),
-            },
-        );
+    .on_click(cx.listener(move |_host, _event, _window, cx| {
+        {
+            let mut state = shared.borrow_mut();
+            state.open = if state.open == Some(ExportMenu::Format(index)) {
+                None
+            } else {
+                Some(ExportMenu::Format(index))
+            };
+            state.draft = None;
+        }
+        cx.notify();
     }))
 }
 
 /// The button that opens a setting's advanced options.
-fn options_button<T: 'static>(
+fn options_button<T: ExportHost>(
     row: &ExportRow,
-    state: &ExportPanelState,
+    state: &Rc<RefCell<ExportPanelState>>,
     cx: &mut Context<T>,
-    run: &Run<T>,
 ) -> impl IntoElement {
     let index = row.index;
-    let mut menu = state.clone();
-    menu.open = if state.open == Some(ExportMenu::Options(index)) {
-        None
-    } else {
-        Some(ExportMenu::Options(index))
-    };
-    menu.draft = None;
-    let run = run.clone();
+    let shared = Rc::clone(state);
     div()
         .id(SharedString::from(format!("export-options-{index}")))
         .debug_selector(move || format!("export-options-{index}"))
@@ -969,28 +957,31 @@ fn options_button<T: 'static>(
         .cursor_pointer()
         .hover(|style| style.bg(rgb(theme::SURFACE_HOVER)))
         .child("⋯")
-        .on_click(cx.listener(move |this, _event, _window, cx| {
-            run(
-                this,
-                cx,
-                ExportAction {
-                    command: None,
-                    state: Some(menu.clone()),
-                },
-            );
+        .on_click(cx.listener(move |_host, _event, _window, cx| {
+            {
+                let mut state = shared.borrow_mut();
+                state.open = if state.open == Some(ExportMenu::Options(index)) {
+                    None
+                } else {
+                    Some(ExportMenu::Options(index))
+                };
+                state.draft = None;
+            }
+            cx.notify();
         }))
 }
 
 /// The button that removes a setting.
-fn remove_button<T: 'static>(
+fn remove_button<T: ExportHost>(
     model: &ExportModel,
     row: &ExportRow,
     cx: &mut Context<T>,
-    run: &Run<T>,
 ) -> impl IntoElement {
     let index = row.index;
-    let command = model.remove_command(index);
-    let run = run.clone();
+    let action = ExportAction::Remove {
+        ids: model.ids.clone(),
+        index,
+    };
     div()
         .id(SharedString::from(format!("export-remove-{index}")))
         .debug_selector(move || format!("export-remove-{index}"))
@@ -1008,24 +999,16 @@ fn remove_button<T: 'static>(
         .cursor_pointer()
         .hover(|style| style.bg(rgb(theme::SURFACE_HOVER)))
         .child("−")
-        .on_click(cx.listener(move |this, _event, _window, cx| {
-            run(
-                this,
-                cx,
-                ExportAction {
-                    command: Some(command.clone()),
-                    state: None,
-                },
-            );
+        .on_click(cx.listener(move |host, _event, _window, cx| {
+            host.run_export_action(action.clone(), cx);
         }))
 }
 
 /// The size presets, for picking a size.
-fn size_menu<T: 'static>(
+fn size_menu<T: ExportHost>(
     model: &ExportModel,
     row: &ExportRow,
     cx: &mut Context<T>,
-    run: &Run<T>,
 ) -> impl IntoElement {
     let index = row.index;
     let mut choices = Vec::new();
@@ -1034,9 +1017,10 @@ fn size_menu<T: 'static>(
         choices.push(Choice {
             label: size.label(),
             selector: format!("export-size-preset-{index}-{}", size.label()),
-            action: ExportAction {
-                command: Some(model.update_command(index, &ExportEdit::Size(size))),
-                state: closed_state(),
+            action: ExportAction::Update {
+                ids: model.ids.clone(),
+                index,
+                edit: ExportEdit::Size(size),
             },
         });
     }
@@ -1047,21 +1031,21 @@ fn size_menu<T: 'static>(
         choices.push(Choice {
             label: size.label(),
             selector: format!("export-size-preset-{index}-{}", size.label()),
-            action: ExportAction {
-                command: Some(model.update_command(index, &ExportEdit::Size(size))),
-                state: closed_state(),
+            action: ExportAction::Update {
+                ids: model.ids.clone(),
+                index,
+                edit: ExportEdit::Size(size),
             },
         });
     }
-    menu(choices, cx, run)
+    menu(choices, cx)
 }
 
 /// The formats, for picking one.
-fn format_menu<T: 'static>(
+fn format_menu<T: ExportHost>(
     model: &ExportModel,
     row: &ExportRow,
     cx: &mut Context<T>,
-    run: &Run<T>,
 ) -> impl IntoElement {
     let index = row.index;
     let mut choices = Vec::new();
@@ -1069,22 +1053,22 @@ fn format_menu<T: 'static>(
         choices.push(Choice {
             label: format.label().to_owned(),
             selector: format!("export-format-choice-{index}-{}", format.ext()),
-            action: ExportAction {
-                command: Some(model.update_command(index, &ExportEdit::Format(format))),
-                state: closed_state(),
+            action: ExportAction::Update {
+                ids: model.ids.clone(),
+                index,
+                edit: ExportEdit::Format(format),
             },
         });
     }
-    menu(choices, cx, run)
+    menu(choices, cx)
 }
 
 /// A setting's advanced options: contents only, include bounding box, and for
 /// an SVG the three SVG options.
-fn options_menu<T: 'static>(
+fn options_menu<T: ExportHost>(
     model: &ExportModel,
     row: &ExportRow,
     cx: &mut Context<T>,
-    run: &Run<T>,
 ) -> impl IntoElement {
     let index = row.index;
     let ids = model.ids.clone();
@@ -1096,7 +1080,6 @@ fn options_menu<T: 'static>(
         ids.clone(),
         index,
         cx,
-        run,
     ));
     list = list.child(checkbox_row(
         "Include bounding box",
@@ -1105,7 +1088,6 @@ fn options_menu<T: 'static>(
         ids.clone(),
         index,
         cx,
-        run,
     ));
     if row.format.value() == Some(&ExportFormat::Svg) {
         list = list.child(checkbox_row(
@@ -1115,7 +1097,6 @@ fn options_menu<T: 'static>(
             ids.clone(),
             index,
             cx,
-            run,
         ));
         list = list.child(checkbox_row(
             "Include id attribute",
@@ -1124,7 +1105,6 @@ fn options_menu<T: 'static>(
             ids.clone(),
             index,
             cx,
-            run,
         ));
         list = list.child(checkbox_row(
             "Simplify stroke",
@@ -1133,30 +1113,21 @@ fn options_menu<T: 'static>(
             ids,
             index,
             cx,
-            run,
         ));
     }
     list
 }
 
 /// A PDF setting's print settings: a summary that opens them.
-fn print_row<T: 'static>(
+fn print_row<T: ExportHost>(
     model: &ExportModel,
     row: &ExportRow,
-    state: &ExportPanelState,
+    state: &Rc<RefCell<ExportPanelState>>,
     cx: &mut Context<T>,
-    run: &Run<T>,
 ) -> impl IntoElement {
     let index = row.index;
     let summary = print_summary(&row.print);
-    let mut menu = state.clone();
-    menu.open = if state.open == Some(ExportMenu::Print(index)) {
-        None
-    } else {
-        Some(ExportMenu::Print(index))
-    };
-    menu.draft = None;
-    let runner = Rc::clone(run);
+    let shared = Rc::clone(state);
     let mut block = column().gap_1();
     block = block.child(
         div()
@@ -1177,38 +1148,36 @@ fn print_row<T: 'static>(
             .hover(|style| style.bg(rgb(theme::SURFACE_HOVER)))
             .child(div().flex_1().child(summary))
             .child("⋯")
-            .on_click(cx.listener({
-                let run = runner.clone();
-                move |this, _event, _window, cx| {
-                    run(
-                        this,
-                        cx,
-                        ExportAction {
-                            command: None,
-                            state: Some(menu.clone()),
-                        },
-                    );
+            .on_click(cx.listener(move |_host, _event, _window, cx| {
+                {
+                    let mut state = shared.borrow_mut();
+                    state.open = if state.open == Some(ExportMenu::Print(index)) {
+                        None
+                    } else {
+                        Some(ExportMenu::Print(index))
+                    };
+                    state.draft = None;
                 }
+                cx.notify();
             })),
     );
-    if state.open == Some(ExportMenu::Print(index)) {
-        block = block.child(print_options(model, row, state, cx, run));
+    if state.borrow().open == Some(ExportMenu::Print(index)) {
+        block = block.child(print_options(model, row, state, cx));
     }
     block
 }
 
 /// A PDF setting's print options: the bleed, the marks and the colour.
-fn print_options<T: 'static>(
+fn print_options<T: ExportHost>(
     model: &ExportModel,
     row: &ExportRow,
-    state: &ExportPanelState,
+    state: &Rc<RefCell<ExportPanelState>>,
     cx: &mut Context<T>,
-    run: &Run<T>,
 ) -> impl IntoElement {
     let index = row.index;
     let ids = model.ids.clone();
     let mut list = menu_box();
-    list = list.child(bleed_field(model, row, state, cx, run));
+    list = list.child(bleed_field(model, row, state, cx));
     list = list.child(checkbox_row(
         "Crop marks",
         row.print.crop_marks,
@@ -1216,7 +1185,6 @@ fn print_options<T: 'static>(
         ids.clone(),
         index,
         cx,
-        run,
     ));
     list = list.child(checkbox_row(
         "Bleed marks",
@@ -1225,7 +1193,6 @@ fn print_options<T: 'static>(
         ids.clone(),
         index,
         cx,
-        run,
     ));
     list = list.child(checkbox_row(
         "CMYK colour",
@@ -1234,7 +1201,6 @@ fn print_options<T: 'static>(
         ids,
         index,
         cx,
-        run,
     ));
     // Bleed marks with no bleed are marks with nothing to mark: the engine
     // would draw them outside a bleed that is not there.
@@ -1246,12 +1212,11 @@ fn print_options<T: 'static>(
 }
 
 /// The bleed field: a length with a unit, typed in.
-fn bleed_field<T: 'static>(
+fn bleed_field<T: ExportHost>(
     model: &ExportModel,
     row: &ExportRow,
-    state: &ExportPanelState,
+    state: &Rc<RefCell<ExportPanelState>>,
     cx: &mut Context<T>,
-    run: &Run<T>,
 ) -> impl IntoElement {
     let index = row.index;
     let current = row
@@ -1266,19 +1231,14 @@ fn bleed_field<T: 'static>(
         ExportValue::Mixed => MIXED.to_owned(),
     };
     let shown = field_text(state, ExportField::Bleed(index), value_text.clone());
-    let editing = state
-        .draft
-        .as_ref()
-        .is_some_and(|draft| draft.field == ExportField::Bleed(index));
-    let mut typing = state.clone();
-    typing.open = None;
-    typing.draft = Some(ExportDraft {
+    let editing = is_editing(state, ExportField::Bleed(index));
+    let draft = ExportDraft {
         field: ExportField::Bleed(index),
         text: current.unwrap_or_default(),
         ids: model.ids.clone(),
         select_all: true,
-    });
-    let run = run.clone();
+    };
+    let shared = Rc::clone(state);
     let field = field_box(
         shown,
         None,
@@ -1287,15 +1247,13 @@ fn bleed_field<T: 'static>(
     )
     .id(SharedString::from(format!("export-bleed-{index}")))
     .debug_selector(move || format!("export-bleed-{index}"))
-    .on_click(cx.listener(move |this, _event, _window, cx| {
-        run(
-            this,
-            cx,
-            ExportAction {
-                command: None,
-                state: Some(typing.clone()),
-            },
-        );
+    .on_click(cx.listener(move |_host, _event, _window, cx| {
+        {
+            let mut state = shared.borrow_mut();
+            state.open = None;
+            state.draft = Some(draft.clone());
+        }
+        cx.notify();
     }));
     div()
         .flex()
@@ -1311,24 +1269,23 @@ fn bleed_field<T: 'static>(
 }
 
 /// One option: a box that is on, off, or neither, and its label.
-fn checkbox_row<T: 'static>(
+fn checkbox_row<T: ExportHost>(
     label: &'static str,
     value: ExportValue<bool>,
     make_edit: impl Fn(bool) -> ExportEdit + 'static,
     ids: Vec<NodeId>,
     index: usize,
     cx: &mut Context<T>,
-    run: &Run<T>,
 ) -> impl IntoElement {
     // A disagreement has no answer to invert, so turning the option on is the
     // one answer that means something for a selection that disagrees.
     let on = value.value().copied().unwrap_or(false);
     let next = !on;
-    let command = ExportCommand {
-        id: "export.update",
-        params: update_params(&ids, index, &make_edit(next)),
+    let action = ExportAction::Update {
+        ids,
+        index,
+        edit: make_edit(next),
     };
-    let run = run.clone();
     div()
         .flex()
         .items_center()
@@ -1354,15 +1311,8 @@ fn checkbox_row<T: 'static>(
         } else {
             div()
         })
-        .on_click(cx.listener(move |this, _event, _window, cx| {
-            run(
-                this,
-                cx,
-                ExportAction {
-                    command: Some(command.clone()),
-                    state: None,
-                },
-            );
+        .on_click(cx.listener(move |host, _event, _window, cx| {
+            host.run_export_action(action.clone(), cx);
         }))
 }
 
@@ -1446,12 +1396,11 @@ struct Choice {
 }
 
 /// A menu: a list of choices under the control that opened it.
-fn menu<T: 'static>(choices: Vec<Choice>, cx: &mut Context<T>, run: &Run<T>) -> impl IntoElement {
+fn menu<T: ExportHost>(choices: Vec<Choice>, cx: &mut Context<T>) -> impl IntoElement {
     let mut list = menu_box();
     for choice in choices {
         let action = choice.action.clone();
         let selector = choice.selector.clone();
-        let run = run.clone();
         let item = div()
             .id(SharedString::from(selector.clone()))
             .debug_selector(move || selector.clone())
@@ -1463,8 +1412,8 @@ fn menu<T: 'static>(choices: Vec<Choice>, cx: &mut Context<T>, run: &Run<T>) -> 
             .hover(|style| style.bg(rgb(theme::SURFACE_HOVER)))
             .cursor_pointer()
             .child(choice.label)
-            .on_click(cx.listener(move |this, _event, _window, cx| {
-                run(this, cx, action.clone());
+            .on_click(cx.listener(move |host, _event, _window, cx| {
+                host.run_export_action(action.clone(), cx);
             }));
         list = list.child(item);
     }
@@ -1520,11 +1469,21 @@ fn field_box(text: String, width: Option<f32>, editing: bool, value_selector: St
 }
 
 /// What a field shows: the text being typed, or the value.
-fn field_text(state: &ExportPanelState, field: ExportField, value: String) -> String {
+fn field_text(state: &Rc<RefCell<ExportPanelState>>, field: ExportField, value: String) -> String {
+    let state = state.borrow();
     match state.draft.as_ref() {
         Some(draft) if draft.field == field => format!("{}|", draft.text),
         _ => value,
     }
+}
+
+/// Whether a field is being typed into.
+fn is_editing(state: &Rc<RefCell<ExportPanelState>>, field: ExportField) -> bool {
+    state
+        .borrow()
+        .draft
+        .as_ref()
+        .is_some_and(|draft| draft.field == field)
 }
 
 /// A line of text under a control.
@@ -1538,12 +1497,6 @@ fn note(text: &str) -> Div {
 /// A plain vertical stack.
 fn column() -> Div {
     div().flex().flex_col()
-}
-
-/// The state a section is in once a choice has been made: nothing open, and
-/// nothing being typed.
-fn closed_state() -> Option<ExportPanelState> {
-    Some(ExportPanelState::default())
 }
 
 #[cfg(test)]
@@ -1679,73 +1632,86 @@ mod tests {
         let (session, id) = session_with_exports();
         let model = model_of(&session, id);
 
-        let command = model.update_command(0, &ExportEdit::Format(ExportFormat::Pdf));
-        assert_eq!(command.id, "export.update");
-        assert_eq!(command.params["ids"], json!([id.0]));
-        assert_eq!(command.params["index"], json!(0));
+        let (command, params) = model.update_command(0, &ExportEdit::Format(ExportFormat::Pdf));
+        assert_eq!(command, "export.update");
+        assert_eq!(params["ids"], json!([id.0]));
+        assert_eq!(params["index"], json!(0));
         assert_eq!(
-            command.params["format"],
+            params["format"],
             json!("pdf"),
             "the engine spells a format as its file extension"
         );
 
-        let command = model.update_command(0, &ExportEdit::Size(ExportSize::Scale { value: 3.0 }));
+        let (_, params) =
+            model.update_command(0, &ExportEdit::Size(ExportSize::Scale { value: 3.0 }));
         assert_eq!(
-            command.params["size"],
+            params["size"],
             json!("3x"),
             "the engine spells a size as its label"
         );
 
-        let command = model.update_command(0, &ExportEdit::Suffix("-dark".to_owned()));
-        assert_eq!(command.params["suffix"], json!("-dark"));
+        let (_, params) = model.update_command(0, &ExportEdit::Suffix("-dark".to_owned()));
+        assert_eq!(params["suffix"], json!("-dark"));
 
-        let command = model.update_command(0, &ExportEdit::ContentsOnly(false));
+        let (_, params) = model.update_command(0, &ExportEdit::ContentsOnly(false));
         assert_eq!(
-            command.params["contentsOnly"],
+            params["contentsOnly"],
             json!(false),
             "the engine's own name for the option"
         );
 
-        let command = model.update_command(0, &ExportEdit::IncludeBoundingBox(true));
-        assert_eq!(command.params["includeBoundingBox"], json!(true));
+        let (_, params) = model.update_command(0, &ExportEdit::IncludeBoundingBox(true));
+        assert_eq!(params["includeBoundingBox"], json!(true));
 
-        let command = model.update_command(0, &ExportEdit::SvgOutlineText(false));
-        assert_eq!(command.params["svgOutlineText"], json!(false));
+        let (_, params) = model.update_command(0, &ExportEdit::SvgOutlineText(false));
+        assert_eq!(params["svgOutlineText"], json!(false));
 
-        let command = model.update_command(0, &ExportEdit::SvgIdAttribute(true));
-        assert_eq!(command.params["svgIdAttribute"], json!(true));
+        let (_, params) = model.update_command(0, &ExportEdit::SvgIdAttribute(true));
+        assert_eq!(params["svgIdAttribute"], json!(true));
 
-        let command = model.update_command(0, &ExportEdit::SvgSimplifyStroke(false));
-        assert_eq!(command.params["svgSimplifyStroke"], json!(false));
+        let (_, params) = model.update_command(0, &ExportEdit::SvgSimplifyStroke(false));
+        assert_eq!(params["svgSimplifyStroke"], json!(false));
 
-        let command = model.update_command(1, &ExportEdit::Print(PrintEdit::Bleed(12.0)));
+        let (_, params) = model.update_command(1, &ExportEdit::Print(PrintEdit::Bleed(12.0)));
+        assert_eq!(params["bleed"], json!(12.0), "the bleed is in points");
+
+        let (_, params) = model.update_command(1, &ExportEdit::Print(PrintEdit::CropMarks(true)));
+        assert_eq!(params["cropMarks"], json!(true));
+
+        let (_, params) = model.update_command(1, &ExportEdit::Print(PrintEdit::BleedMarks(true)));
+        assert_eq!(params["bleedMarks"], json!(true));
+
+        let (_, params) = model.update_command(1, &ExportEdit::Print(PrintEdit::Cmyk(true)));
+        assert_eq!(params["cmyk"], json!(true));
+
+        let (command, params) = model.remove_command(0);
+        assert_eq!(command, "export.remove");
+        assert_eq!(params["index"], json!(0));
+    }
+
+    #[test]
+    fn an_action_carries_the_same_command_the_model_builds() {
+        let (session, id) = session_with_exports();
+        let model = model_of(&session, id);
+        let action = ExportAction::Update {
+            ids: model.ids.clone(),
+            index: 0,
+            edit: ExportEdit::Format(ExportFormat::Pdf),
+        };
         assert_eq!(
-            command.params["bleed"],
-            json!(12.0),
-            "the bleed is in points"
+            action.command(),
+            model.update_command(0, &ExportEdit::Format(ExportFormat::Pdf)),
+            "the action and the model build the same command"
         );
-
-        let command = model.update_command(1, &ExportEdit::Print(PrintEdit::CropMarks(true)));
-        assert_eq!(command.params["cropMarks"], json!(true));
-
-        let command = model.update_command(1, &ExportEdit::Print(PrintEdit::BleedMarks(true)));
-        assert_eq!(command.params["bleedMarks"], json!(true));
-
-        let command = model.update_command(1, &ExportEdit::Print(PrintEdit::Cmyk(true)));
-        assert_eq!(command.params["cmyk"], json!(true));
-
-        let command = model.remove_command(0);
-        assert_eq!(command.id, "export.remove");
-        assert_eq!(command.params["index"], json!(0));
     }
 
     #[test]
     fn the_engine_accepts_the_commands_the_panel_builds() {
         let (mut session, id) = session_with_exports();
         let model = model_of(&session, id);
-        let command = model.update_command(0, &ExportEdit::Format(ExportFormat::Webp));
+        let (command, params) = model.update_command(0, &ExportEdit::Format(ExportFormat::Webp));
         session
-            .execute(command.id, &command.params)
+            .execute(&command, &params)
             .expect("the engine accepts the panel's command");
         let doc = session.doc().expect("a document");
         let node = doc.node(id).expect("the layer");
@@ -1755,17 +1721,18 @@ mod tests {
             "the engine's document holds the format the panel wrote"
         );
 
-        let command = model.update_command(0, &ExportEdit::Size(ExportSize::Scale { value: 3.0 }));
+        let (command, params) =
+            model.update_command(0, &ExportEdit::Size(ExportSize::Scale { value: 3.0 }));
         session
-            .execute(command.id, &command.params)
+            .execute(&command, &params)
             .expect("the engine accepts the panel's command");
         let doc = session.doc().expect("a document");
         let node = doc.node(id).expect("the layer");
         assert_eq!(node.exports[0].size, ExportSize::Scale { value: 3.0 });
 
-        let command = model.update_command(0, &ExportEdit::ContentsOnly(false));
+        let (command, params) = model.update_command(0, &ExportEdit::ContentsOnly(false));
         session
-            .execute(command.id, &command.params)
+            .execute(&command, &params)
             .expect("the engine accepts the panel's command");
         let doc = session.doc().expect("a document");
         let node = doc.node(id).expect("the layer");
@@ -1776,11 +1743,11 @@ mod tests {
     fn adding_a_setting_uses_the_engines_own_command() {
         let (mut session, id) = session_with_rectangle();
         let model = model_of(&session, id);
-        let command = model.add_command();
-        assert_eq!(command.id, "export.add");
-        assert_eq!(command.params["ids"], json!([id.0]));
+        let (command, params) = model.add_command();
+        assert_eq!(command, "export.add");
+        assert_eq!(params["ids"], json!([id.0]));
         session
-            .execute(command.id, &command.params)
+            .execute(&command, &params)
             .expect("the engine accepts the panel's command");
         let doc = session.doc().expect("a document");
         let node = doc.node(id).expect("the layer");
@@ -1810,18 +1777,18 @@ mod tests {
         let doc = session.doc().expect("a document");
         let model = selected_exports(doc, &[id, other]);
         assert!(model.mixed, "the two layers disagree about their settings");
-        let command = model.add_command();
+        let (command, params) = model.add_command();
         assert_eq!(
-            command.id, "node.set",
+            command, "node.set",
             "a mixed selection is replaced by one default setting"
         );
         assert_eq!(
-            command.params["props"]["exports"],
+            params["props"]["exports"],
             json!([{ "size": { "by": "scale", "value": 1.0 }, "suffix": "", "format": "png" }]),
             "the engine's default setting, in the engine's own spelling"
         );
         session
-            .execute(command.id, &command.params)
+            .execute(&command, &params)
             .expect("the engine accepts the panel's command");
         let doc = session.doc().expect("a document");
         let node = doc.node(id).expect("the layer");
@@ -1943,11 +1910,11 @@ mod tests {
             select_all: true,
         });
         let action = state.handle_key("enter").expect("the key is the section's");
-        let command = action.command.expect("a command");
-        assert_eq!(command.id, "export.update");
-        assert_eq!(command.params["ids"], json!([7]));
-        assert_eq!(command.params["index"], json!(0));
-        assert_eq!(command.params["size"], json!("2x"));
+        let (command, params) = action.command();
+        assert_eq!(command, "export.update");
+        assert_eq!(params["ids"], json!([7]));
+        assert_eq!(params["index"], json!(0));
+        assert_eq!(params["size"], json!("2x"));
         assert!(state.draft.is_none(), "the field closed");
 
         let mut state = ExportPanelState::new();
@@ -1957,9 +1924,8 @@ mod tests {
             ids: vec![NodeId(7)],
             select_all: true,
         });
-        let action = state.handle_key("enter").expect("the key is the section's");
         assert!(
-            action.command.is_none(),
+            state.handle_key("enter").is_none(),
             "a size the engine would refuse is not written"
         );
     }
@@ -1974,9 +1940,9 @@ mod tests {
             select_all: true,
         });
         let action = state.handle_key("enter").expect("the key is the section's");
-        let command = action.command.expect("a command");
-        assert_eq!(command.params["index"], json!(1));
-        assert_eq!(command.params["suffix"], json!("-dark"));
+        let (_, params) = action.command();
+        assert_eq!(params["index"], json!(1));
+        assert_eq!(params["suffix"], json!("-dark"));
     }
 
     #[test]
@@ -1988,7 +1954,7 @@ mod tests {
             ids: vec![NodeId(3)],
             select_all: true,
         });
-        state.handle_key("x").expect("the key is the section's");
+        state.handle_key("x");
         let draft = state.draft.as_ref().expect("the field is still open");
         assert_eq!(draft.text, "x");
     }
@@ -2006,7 +1972,7 @@ mod tests {
     /// what the section asked for, and does what it is asked.
     struct Host {
         model: ExportModel,
-        state: ExportPanelState,
+        state: Rc<RefCell<ExportPanelState>>,
         asked: Rc<RefCell<Vec<ExportAction>>>,
     }
 
@@ -2014,9 +1980,16 @@ mod tests {
         fn new(model: ExportModel) -> Self {
             Self {
                 model,
-                state: ExportPanelState::new(),
+                state: Rc::new(RefCell::new(ExportPanelState::new())),
                 asked: Rc::new(RefCell::new(Vec::new())),
             }
+        }
+    }
+
+    impl ExportHost for Host {
+        fn run_export_action(&mut self, action: ExportAction, cx: &mut Context<Self>) {
+            self.asked.borrow_mut().push(action);
+            cx.notify();
         }
     }
 
@@ -2027,15 +2000,8 @@ mod tests {
             cx: &mut Context<Self>,
         ) -> impl IntoElement {
             let model = self.model.clone();
-            let state = self.state.clone();
-            let asked = self.asked.clone();
-            section(&model, &state, cx, move |this: &mut Host, cx, action| {
-                asked.borrow_mut().push(action.clone());
-                if let Some(state) = action.state {
-                    this.state = state;
-                }
-                cx.notify();
-            })
+            let state = Rc::clone(&self.state);
+            section(&model, &state, cx)
         }
     }
 
@@ -2171,9 +2137,9 @@ mod tests {
 
         let asked = root.read_with(cx, |host, _| host.asked.borrow().clone());
         assert_eq!(asked.len(), 1, "the section asked for one change");
-        let command = asked[0].command.as_ref().expect("a command");
-        assert_eq!(command.id, "export.add");
-        assert_eq!(command.params["ids"], json!([id.0]));
+        let (command, params) = asked[0].command();
+        assert_eq!(command, "export.add");
+        assert_eq!(params["ids"], json!([id.0]));
     }
 
     #[test]
