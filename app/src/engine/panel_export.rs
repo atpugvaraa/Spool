@@ -248,7 +248,7 @@ pub fn selected_exports(doc: &Document, selection: &[NodeId]) -> ExportModel {
         .filter_map(|id| doc.node(*id))
         .map(|node| node.exports.as_slice())
         .collect();
-    let count = lists.iter().map(|list| list.len()).max().unwrap_or(0);
+    let count = lists.iter().map(|list| list.len()).max().unwrap_or(0).max(1);
     let rows = (0..count).map(|index| row_at(&lists, index)).collect();
     let mixed = lists.len() > 1 && lists.iter().any(|list| *list != lists[0]);
     ExportModel {
@@ -491,7 +491,7 @@ fn update_params(ids: &[NodeId], index: usize, edit: &ExportEdit) -> Value {
         ExportEdit::Size(size) => params["size"] = json!(size.label()),
         ExportEdit::Suffix(suffix) => params["suffix"] = json!(suffix),
         ExportEdit::Format(format) => params["format"] = json!(format.ext()),
-        ExportEdit::ContentsOnly(on) => params["contentsOnly"] = json!(on),
+        ExportEdit::ContentsOnly(on) => params["contents_only"] = json!(on),
         ExportEdit::IncludeBoundingBox(on) => params["includeBoundingBox"] = json!(on),
         ExportEdit::SvgOutlineText(on) => params["svgOutlineText"] = json!(on),
         ExportEdit::SvgIdAttribute(on) => params["svgIdAttribute"] = json!(on),
@@ -1091,7 +1091,7 @@ fn options_menu<T: ExportHost>(
     ));
     if row.format.value() == Some(&ExportFormat::Svg) {
         list = list.child(checkbox_row(
-            "Outline text",
+            "Outline the text",
             row.svg_outline_text,
             ExportEdit::SvgOutlineText,
             ids.clone(),

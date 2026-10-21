@@ -2321,6 +2321,16 @@ impl Inspector {
                         cx,
                     ));
                 }
+                // The Effects section is here for the MULTI-selection, and that
+                // is the whole point of the per-property fold: this is where
+                // "Mixed" is reachable. A single selection can never disagree
+                // with itself.
+                sections = sections.child(self.inspector_section(
+                    "Effects",
+                    SectionSlot::EFFECTS,
+                    self.effects_section(cx),
+                    cx,
+                ));
                 sections.into_any_element()
             }
         }
