@@ -4262,4 +4262,5 @@ impl EntityInputHandler for EngineCanvas {
 }
 
 #[cfg(test)]
+pub mod guides;
 mod tests;
