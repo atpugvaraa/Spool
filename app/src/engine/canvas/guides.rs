@@ -469,7 +469,7 @@ impl GuidePainter<'_> {
             corner_radii: Corners::all(px(radius)),
             background: fill.into(),
             border_widths: Default::default(),
-            border_color: white().alpha(0.0).into(),
+            border_color: white().alpha(0.0),
             border_style: Default::default(),
         });
     }
@@ -481,7 +481,7 @@ impl GuidePainter<'_> {
         let run = TextRun {
             len: text.len(),
             font: self.window.text_style().font(),
-            color: ink.into(),
+            color: ink,
             background_color: None,
             underline: None,
             strikethrough: None,
@@ -733,7 +733,7 @@ impl GuidesLayer {
                         state.hitbox = Some(hitbox);
                         bounds
                     },
-                    move |bounds, _bounds, window, app| {
+                    move |bounds, _prepainted, window, app| {
                         paint(&paint_session, &paint_state, window, app, bounds);
                     },
                 )
@@ -1037,10 +1037,7 @@ fn cursor(
             let [a, b] = segment(&g, &r.view, state.viewport, bounds);
             Some(across_cursor(a, b))
         }
-        None => match state.drag {
-            Some(drag) => Some(guide_cursor(drag.vertical())),
-            None => None,
-        },
+        None => state.drag.map(|drag| guide_cursor(drag.vertical())),
     }
 }
 
@@ -1053,7 +1050,7 @@ mod tests {
     use super::*;
 
     use figcraft_doc::NodeKind;
-    use gpui::{Context, Entity, Modifiers, Render, TestAppContext, VisualTestContext};
+    use gpui::{Context, Modifiers, Render, TestAppContext, VisualTestContext};
     use serde_json::json;
 
     /// A session with one page and nothing on it, and the rulers on.
@@ -1127,7 +1124,7 @@ mod tests {
         }
         let session = session.borrow();
         let doc = session.doc().expect("a document");
-        let placed = placed_guides(&doc, page);
+        let placed = placed_guides(doc, page);
         assert_eq!(placed.len(), 2, "both guides are placed: {placed:?}");
         assert_eq!(placed[0].owner, page, "the page's own guide comes first");
         assert_eq!(placed[0].index, 0);
@@ -1149,7 +1146,7 @@ mod tests {
         let doc = session.doc().expect("a document");
         // The pointer is over the frame, which sits at the page's origin.
         let placed =
-            drop_target(&doc, page, Point::new(100.0, 100.0), true, true).expect("a guide to land");
+            drop_target(doc, page, Point::new(100.0, 100.0), true, true).expect("a guide to land");
         assert_eq!(placed.owner, frame, "the frame under the pointer owns it");
         assert_eq!(
             placed.offset, 100.0,
@@ -1164,8 +1161,7 @@ mod tests {
         let session = session.borrow();
         let doc = session.doc().expect("a document");
         // The pointer is past the frame's right edge.
-        let placed =
-            drop_target(&doc, page, Point::new(900.0, 100.0), true, true).expect("a guide");
+        let placed = drop_target(doc, page, Point::new(900.0, 100.0), true, true).expect("a guide");
         assert_eq!(placed.owner, page, "the page owns the guide");
         assert_eq!(placed.offset, 900.0);
         assert!(placed.line.is_none(), "and it crosses the whole canvas");
