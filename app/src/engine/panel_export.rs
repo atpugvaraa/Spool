@@ -1966,6 +1966,31 @@ mod tests {
         assert!(!state.is_busy());
     }
 
+    #[test]
+    fn the_hosts_key_forwarding_reads_and_writes_the_state_in_turn() {
+        // The surface that hosts the panel owns the state as a cell, so the
+        // reading and the writing must not overlap: the borrow that asks
+        // whether a field is open has to be gone before the borrow that types
+        // into it. This is that pattern, run for real.
+        let state = Rc::new(RefCell::new(ExportPanelState::new()));
+        state.borrow_mut().draft = Some(ExportDraft {
+            field: ExportField::Suffix(0),
+            text: "-dark".to_owned(),
+            ids: vec![NodeId(5)],
+            select_all: true,
+        });
+
+        let typing = state.borrow().is_busy();
+        assert!(typing, "a field is open, so the key is the section's");
+        let action = state.borrow_mut().handle_key("enter");
+        let action = action.expect("the typed suffix is a change");
+        let (command, params) = action.command();
+        assert_eq!(command, "export.update");
+        assert_eq!(params["ids"], json!([5]));
+        assert_eq!(params["suffix"], json!("-dark"));
+        assert!(!state.borrow().is_busy(), "the field closed");
+    }
+
     // ── The panel, in a window ──────────────────────────────────────────────
 
     /// A host for the section in a window: it draws the section, remembers
