@@ -6,3 +6,8 @@
 /.freebuff
 .DS_Store
 app/digest.txt
+
+# Graphify's code knowledge graph. A build artefact: rebuild with
+#   GRAPHIFY_BACKEND=none graphify extract . --code-only
+# It is 64MB of JSON and belongs on disk, not in history.
+graphify-out/
