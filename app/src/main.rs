@@ -36,6 +36,14 @@ fn main() {
 
     application().run(|cx: &mut App| {
         lifecycle::install(cx);
+        // INDEX THE SYSTEM FONTS, so text can be shaped at all.
+        //
+        // The engine's font database is empty until it is scanned, and an empty
+        // database means no face to shape a text layer with -- the layer draws
+        // nothing, and the typography panel's family list is empty. The scan is
+        // ON DEMAND, so it happens the first time a font is actually needed
+        // rather than at startup.
+        figcraft_text::scan_system_fonts_on_demand();
         let bounds = Bounds::centered(None, size(px(1480.0), px(960.0)), cx);
         cx.open_window(
             WindowOptions {

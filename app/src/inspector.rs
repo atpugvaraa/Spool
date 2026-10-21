@@ -1940,12 +1940,9 @@ impl Inspector {
         let Some(engine) = self.engine.clone() else {
             return empty_note("This layer has no text").into_any_element();
         };
-        let model: TypographyModel = engine.read(cx).with_session(|session| {
-            let Ok(doc) = session.doc() else {
-                return TypographyModel::default();
-            };
-            TypographyModel::read(doc, &session.selection(), None)
-        });
+        // The model reads the EDITED RANGE: a selected range's styles are what
+        // the panel shows, not the whole layer's.
+        let model: TypographyModel = engine.read(cx).with_session(TypographyModel::from_session);
         if !model.has_text {
             return empty_note("This layer has no text").into_any_element();
         }
@@ -2440,6 +2437,7 @@ impl Inspector {
                         column()
                             .child(text_block(&text))
                             .child(self.typography_fields(selection, cx))
+                            .child(self.typography_section(cx))
                     }
                     None => section_body().child(empty_note("This layer has no text")),
                 };
@@ -2498,12 +2496,16 @@ impl Inspector {
                 // mixed selection of shapes and words still has words in it, and
                 // setting one colour applies to all of them at once.
                 if selected.iter().any(|object| object.text_content.is_some()) {
-                    sections = sections.child(self.inspector_section(
-                        "Typography",
-                        SectionSlot::TYPOGRAPHY,
-                        self.typography_fields(selected, cx),
-                        cx,
-                    ));
+                    sections = sections.child(
+                        self.inspector_section(
+                            "Typography",
+                            SectionSlot::TYPOGRAPHY,
+                            column()
+                                .child(self.typography_fields(selected, cx))
+                                .child(self.typography_section(cx)),
+                            cx,
+                        ),
+                    );
                 }
                 // The Effects section is here for the MULTI-selection, and that
                 // is the whole point of the per-property fold: this is where
@@ -3274,17 +3276,11 @@ impl Inspector {
     }
 
     fn typography_fields(&self, selected: &[model::DesignObject], cx: &mut Context<Self>) -> Div {
+        // Only the text colour. The SIZE row moved into the typography panel, in
+        // figcraft's position -- and it moved rather than being copied, because
+        // two number widgets for one property is two owners of one value.
         let color = Paint::read(selected, |object| object.text_color);
-        section_body()
-            .child(self.paint_block(StyleProperty::TextColor, color, theme::TEXT, cx))
-            .child(self.preset_row(
-                "Size",
-                Property::FontSize,
-                selected_value(selected, Property::FontSize),
-                selected.len(),
-                &["12", "16", "24", "32"],
-                cx,
-            ))
+        section_body().child(self.paint_block(StyleProperty::TextColor, color, theme::TEXT, cx))
     }
 
     // ── Numbers ─────────────────────────────────────────────────────────────
