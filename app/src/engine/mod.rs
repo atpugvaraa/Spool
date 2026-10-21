@@ -55,4 +55,7 @@ pub mod keymap;
 pub mod layers;
 pub mod menus;
 pub mod palette;
+pub mod panel_components;
+pub mod panel_effects;
+pub mod panel_export;
 pub mod source_edits;

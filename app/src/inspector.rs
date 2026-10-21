@@ -59,8 +59,19 @@ use gpui::{
 };
 use serde_json::Value as JsonValue;
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use crate::engine::canvas::EngineCanvas;
 use crate::engine::inspector_model as model;
+use crate::engine::panel_components::{
+    self as panel_components, ComponentAction, ComponentsHost, ComponentsModel,
+    ComponentsPanelState,
+};
+use crate::engine::panel_effects::EffectsPanel;
+use crate::engine::panel_export::{
+    self as panel_export, ExportAction, ExportModel, ExportPanelState,
+};
 use crate::theme;
 
 /// The word for a property the selected objects disagree about.
@@ -1425,6 +1436,19 @@ pub struct Inspector {
     /// before it builds the engine canvas, so the two are joined afterwards by
     /// [`Inspector::set_engine_canvas`].
     engine: Option<Entity<EngineCanvas>>,
+    /// The effects section's own state. It is an ENTITY, because a field being
+    /// typed into needs a focus handle and a keyboard.
+    effects: Option<Entity<EffectsPanel>>,
+    /// The components section's state: which of its menus is open.
+    ///
+    /// The section is a function, not an entity, so the state lives here and
+    /// the section is handed a handle to it.
+    components_state: Rc<RefCell<ComponentsPanelState>>,
+    /// The export section's state: which row is being edited.
+    ///
+    /// The HOST owns it. The section is handed a snapshot and asks for changes
+    /// through an action, so there is one state and not two.
+    export_state: ExportPanelState,
     tab: usize,
     sections: Sections,
     /// The property the arrow keys move, once a field has been touched.
@@ -1461,6 +1485,9 @@ impl Inspector {
     pub fn new() -> Self {
         Self {
             engine: None,
+            effects: None,
+            components_state: Rc::new(RefCell::new(ComponentsPanelState::default())),
+            export_state: ExportPanelState::default(),
             tab: 0,
             sections: Sections::new(),
             focus: None,
@@ -1486,6 +1513,10 @@ impl Inspector {
     pub fn set_engine_canvas(&mut self, engine: Entity<EngineCanvas>, cx: &mut Context<Self>) {
         let observation = cx.observe(&engine, |_, _, cx| cx.notify());
         self.observations.push(observation);
+        // The effects section is an ENTITY, because a field being typed into
+        // needs a focus handle and the keyboard. It is built here, once, from the
+        // same engine canvas this panel reads.
+        self.effects = Some(cx.new(|cx| EffectsPanel::new(engine.clone(), cx)));
         self.engine = Some(engine);
         cx.notify();
     }
@@ -1753,6 +1784,81 @@ impl Inspector {
         engine.update(cx, |canvas, cx| canvas.run_engine_command(id, params, cx))
     }
 
+    /// The effects section: the selected layer's effects, in the engine's
+    /// vocabulary.
+    ///
+    /// It is an entity, so the section's own state -- which row is open, which
+    /// field is being typed into -- lives with it and keeps its focus.
+    fn effects_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        match self.effects.clone() {
+            Some(panel) => panel.into_any_element(),
+            None => empty_note("No effects yet.").into_any_element(),
+        }
+    }
+
+    /// The export section: the selected layer's export settings.
+    fn export_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(engine) = self.engine.clone() else {
+            return empty_note("Add export setting").into_any_element();
+        };
+        let model: ExportModel = engine.read(cx).with_session(|session| {
+            let Ok(doc) = session.doc() else {
+                return ExportModel::default();
+            };
+            panel_export::selected_exports(doc, &session.selection())
+        });
+        // The section is handed a SNAPSHOT and asks for changes through an
+        // action, so there is one state and not two.
+        let state = self.export_state.clone();
+        panel_export::section(&model, &state, cx, |this, cx, action| {
+            this.run_export_action(action, cx);
+        })
+        .into_any_element()
+    }
+
+    /// The components section: what the selected layer is, in the components
+    /// vocabulary.
+    ///
+    /// The model is read from the engine's document, the same one the rest of
+    /// the panel reads, so the two cannot be about different layers.
+    fn components_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(engine) = self.engine.clone() else {
+            return div().into_any_element();
+        };
+        let model = engine.read(cx).with_session(|session| {
+            let Ok(doc) = session.doc() else {
+                return ComponentsModel::empty();
+            };
+            ComponentsModel::read(doc, &session.selection())
+        });
+        let state = self.components_state.clone();
+        panel_components::components_section(&model, &state, cx)
+    }
+
+    /// Run a component change through the engine.
+    ///
+    /// The engine's commands are the operation surface, so a change made from
+    /// the section is the same change the CLI or a shortcut would make, and it
+    /// lands in the same history.
+    fn run_component_action(&mut self, action: ComponentAction, cx: &mut Context<Self>) {
+        let (command, params) = action.command();
+        self.run(&command, params, cx);
+    }
+
+    /// Run an export change through the engine.
+    ///
+    /// Two things, and they are different: a COMMAND changes the document, and
+    /// a STATE change changes what the section remembers.
+    fn run_export_action(&mut self, action: ExportAction, cx: &mut Context<Self>) {
+        if let Some(command) = action.command {
+            self.run(command.id, command.params.clone(), cx);
+        }
+        if let Some(state) = action.state {
+            self.export_state = state;
+        }
+        cx.notify();
+    }
+
     /// Write one property of one layer's box.
     fn commit_box(
         &mut self,
@@ -1994,6 +2100,13 @@ impl Inspector {
     }
 }
 
+impl ComponentsHost for Inspector {
+    /// Run a component change through the engine.
+    fn run_component_action(&mut self, action: ComponentAction, cx: &mut Context<Self>) {
+        Inspector::run_component_action(self, action, cx);
+    }
+}
+
 impl Render for Inspector {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::diagnostics::count("inspector_build", 1);
@@ -2175,15 +2288,16 @@ impl Inspector {
                     .child(self.inspector_section(
                         "Effects",
                         SectionSlot::EFFECTS,
-                        empty_note("No effects yet."),
+                        self.effects_section(cx),
                         cx,
                     ))
                     .child(self.inspector_section(
                         "Export",
                         SectionSlot::EXPORT,
-                        empty_note("Add export setting"),
+                        self.export_section(cx),
                         cx,
                     ))
+                    .child(self.components_section(cx))
                     .into_any_element()
             }
             _ => {
