@@ -1590,6 +1590,9 @@ impl Default for CanvasState {
 /// An ordinary GPUI entity. Put it in a `div().flex_1()` and it fills the space it is given; hand
 /// [`EngineCanvas::session_handle`] to the panels so they read and act through the same session.
 pub struct EngineCanvas {
+    /// The Prototype tab is open, so the canvas draws the prototype's
+    /// connections.
+    prototype_mode: bool,
     /// The engine. Shared with the panels through [`EngineCanvas::session_handle`].
     session: Rc<RefCell<Session>>,
     /// The retained render, on its own thread.
@@ -1626,6 +1629,7 @@ impl EngineCanvas {
             session,
             renderer: CanvasRenderer::new(),
             focus: cx.focus_handle(),
+            prototype_mode: false,
             state: CanvasState::default(),
             palette: Palette::new(),
             hitbox: Rc::new(RefCell::new(None)),
@@ -1723,6 +1727,17 @@ impl EngineCanvas {
                 eprintln!("spool_engine_command_failed id={id} error={error}");
                 false
             }
+        }
+    }
+
+    /// Turn the prototype's connections on and off.
+    ///
+    /// The Prototype tab is a mode as well as a panel: while it is open the
+    /// canvas draws the noodles between the layers that act on one another.
+    pub fn set_prototype_mode(&mut self, active: bool, cx: &mut gpui::Context<Self>) {
+        if self.prototype_mode != active {
+            self.prototype_mode = active;
+            cx.notify();
         }
     }
 
@@ -2636,6 +2651,23 @@ impl EngineCanvas {
         let pal = self.palette;
 
         self.paint_pixel_grid(ov, s);
+
+        // The prototype's connections, when the Prototype tab is open.
+        //
+        // The viewport is read first: `ov.window` is borrowed mutably by the
+        // call, so the viewport has to be copied out before it.
+        if self.prototype_mode {
+            let viewport = ov.viewport;
+            crate::engine::panel_prototyping::paint_proto_connections(
+                ov.window,
+                view,
+                viewport,
+                doc,
+                s.page,
+                &s.selection,
+                &pal,
+            );
+        }
 
         // Layout grids and frame labels for top-level frames.
         for c in boards(doc, s.page) {

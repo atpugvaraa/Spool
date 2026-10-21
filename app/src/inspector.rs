@@ -75,8 +75,14 @@ use crate::engine::panel_effects::EffectsPanel;
 use crate::engine::panel_export::{
     self as panel_export, ExportAction, ExportHost, ExportModel, ExportPanelState,
 };
+use crate::engine::panel_prototyping::{
+    self as panel_prototyping, ProtoAction, ProtoHost, ProtoModel, ProtoPanelState,
+};
 use crate::engine::panel_styles::{
     self as panel_styles, StylesAction, StylesHost, StylesModel, StylesPanelState,
+};
+use crate::engine::panel_variables::{
+    self as panel_variables, VariablesAction, VariablesHost, VariablesModel, VariablesPanelState,
 };
 use crate::engine::panel_typography::{
     self as panel_typography, TypographyAction, TypographyHost, TypographyModel,
@@ -130,7 +136,7 @@ const NO_STROKE: &str = "No stroke to be wide";
 ///
 /// Fixed rather than growable, so a section's slot can be baked into the click
 /// closure that toggles it.
-pub const SECTION_COUNT: usize = 7;
+pub const SECTION_COUNT: usize = 8;
 
 /// A collapsible section, addressed by a slot.
 ///
@@ -150,6 +156,7 @@ impl SectionSlot {
     pub const EFFECTS: Self = Self(4);
     pub const EXPORT: Self = Self(5);
     pub const STYLES: Self = Self(6);
+    pub const VARIABLES: Self = Self(7);
 
     fn index(self) -> usize {
         self.0
@@ -1461,6 +1468,12 @@ pub struct Inspector {
     /// The styles section's state: which slot's browser is open, what is being
     /// typed into it, and which folders are folded away.
     styles_state: Rc<RefCell<StylesPanelState>>,
+    /// The Prototype tab's own state: which menu is open, what is being typed
+    /// into it, and which interaction's editor is open.
+    prototyping_state: Rc<RefCell<ProtoPanelState>>,
+    /// The variables section's state: which collection and group the table
+    /// shows, what is being typed into it, and which menu is open.
+    variables_state: Rc<RefCell<VariablesPanelState>>,
     /// The typography section's state: which menu is open and what is being
     /// typed into it.
     typography_state: Rc<RefCell<TypographyPanelState>>,
@@ -1506,6 +1519,8 @@ impl Inspector {
             components_state: Rc::new(RefCell::new(ComponentsPanelState::default())),
             export_state: Rc::new(RefCell::new(ExportPanelState::default())),
             styles_state: Rc::new(RefCell::new(StylesPanelState::default())),
+            variables_state: Rc::new(RefCell::new(VariablesPanelState::default())),
+            prototyping_state: Rc::new(RefCell::new(ProtoPanelState::new())),
             typography_state: Rc::new(RefCell::new(TypographyPanelState::default())),
             color_state: Rc::new(RefCell::new(ColorPickerState::default())),
             tab: 0,
@@ -1935,6 +1950,53 @@ impl Inspector {
         panel_styles::styles_section(&model, &state, cx).into_any_element()
     }
 
+    /// Open one of the Inspector's tabs.
+    ///
+    /// The Prototype tab is a MODE as well as a panel: the canvas draws the
+    /// prototype's connections while it is open, so the canvas is told.
+    pub fn open_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.tab = index;
+        if let Some(engine) = self.engine.clone() {
+            engine.update(cx, |canvas, cx| canvas.set_prototype_mode(index == 1, cx));
+        }
+        cx.notify();
+    }
+
+    /// The Prototype tab: the page's flows, the selected layers' interactions
+    /// and the prototype's settings.
+    fn prototype_body(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(engine) = self.engine.clone() else {
+            return empty_note("No prototype yet.").into_any_element();
+        };
+        let model: ProtoModel = engine.read(cx).with_session(|session| {
+            let Ok(doc) = session.doc() else {
+                return ProtoModel::default();
+            };
+            let Ok(page) = session.page() else {
+                return ProtoModel::default();
+            };
+            ProtoModel::read(doc, page, &session.selection())
+        });
+        let state = self.prototyping_state.clone();
+        panel_prototyping::proto_panel(&model, &state, cx).into_any_element()
+    }
+
+    /// The variables section: the document's variables, and the selected
+    /// layers' own bindings and modes.
+    fn variables_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(engine) = self.engine.clone() else {
+            return empty_note("No variables yet.").into_any_element();
+        };
+        let model: VariablesModel = engine.read(cx).with_session(|session| {
+            let Ok(doc) = session.doc() else {
+                return VariablesModel::default();
+            };
+            VariablesModel::read(doc, &session.selection())
+        });
+        let state = self.variables_state.clone();
+        panel_variables::variables_section(&model, &state, cx).into_any_element()
+    }
+
     /// The typography section: the selection's text layers and their type.
     fn typography_section(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(engine) = self.engine.clone() else {
@@ -2229,10 +2291,26 @@ impl Inspector {
     }
 }
 
+impl ProtoHost for Inspector {
+    /// Run a prototype change through the engine.
+    fn run_proto_action(&mut self, action: ProtoAction, cx: &mut Context<Self>) {
+        let (command, params) = action.command();
+        self.run(&command, params, cx);
+    }
+}
+
 impl StylesHost for Inspector {
     /// Run a styles change through the engine.
     fn run_styles_action(&mut self, action: StylesAction, cx: &mut Context<Self>) {
         Inspector::run_styles_action(self, action, cx);
+    }
+}
+
+impl VariablesHost for Inspector {
+    /// Run a variables change through the engine.
+    fn run_variables_action(&mut self, action: VariablesAction, cx: &mut Context<Self>) {
+        let (command, params) = action.command();
+        self.run(&command, params, cx);
     }
 }
 
@@ -2288,7 +2366,8 @@ impl Render for Inspector {
         self.reconcile(&selected);
 
         let body = match self.tab {
-            1 => prototype_body(),
+            1 => self.prototype_body(cx),
+            1 => self.prototype_body(cx),
             2 => ai_body(),
             _ => self.design_body(&selected, cx),
         };
@@ -2326,7 +2405,7 @@ impl Inspector {
             None,
             true,
             |index, this: &mut Inspector, cx: &mut Context<Inspector>| {
-                this.tab = index;
+                this.open_tab(index, cx);
                 cx.notify();
             },
             cx,
@@ -2424,6 +2503,13 @@ impl Inspector {
                         .text_color(rgb(theme::TEXT_MUTED))
                         .child("Select an object on the canvas or in Layers."),
                 )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(theme::ACCENT))
+                        .child("MARKER-VARIABLES-SECTION"),
+                )
+                .child(self.variables_section(cx))
                 .into_any_element(),
             [object] => {
                 let selection = std::slice::from_ref(object);
@@ -2473,6 +2559,12 @@ impl Inspector {
                         "Styles",
                         SectionSlot::STYLES,
                         self.styles_section(cx),
+                        cx,
+                    ))
+                    .child(self.inspector_section(
+                        "Variables",
+                        SectionSlot::VARIABLES,
+                        self.variables_section(cx),
                         cx,
                     ))
                     .child(self.components_section(cx))
@@ -3831,37 +3923,6 @@ fn segmented(
 // The other two tabs
 // ═══════════════════════════════════════════════════════════════════════════
 
-fn prototype_body() -> AnyElement {
-    column()
-        .gap_3()
-        .p(px(15.0))
-        .child(
-            div()
-                .text_sm()
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(rgb(theme::TEXT))
-                .child("Prototype connections"),
-        )
-        .child(
-            div()
-                .text_xs()
-                .text_color(rgb(theme::TEXT_SECONDARY))
-                .child("Link this frame to another screen to start a flow."),
-        )
-        .child(
-            div()
-                .px(px(10.0))
-                .py(px(9.0))
-                .rounded_md()
-                .bg(rgb(theme::WINDOW))
-                .border_1()
-                .border_color(rgb(theme::BORDER))
-                .text_xs()
-                .text_color(rgb(theme::TEXT_MUTED))
-                .child("＋  Add interaction"),
-        )
-        .into_any_element()
-}
 
 fn ai_body() -> AnyElement {
     column()
@@ -3965,6 +4026,7 @@ mod tests {
             SectionSlot::EFFECTS,
             SectionSlot::EXPORT,
             SectionSlot::STYLES,
+            SectionSlot::VARIABLES,
         ];
         assert_eq!(slots.len(), SECTION_COUNT, "every slot is accounted for");
         for (index, slot) in slots.iter().enumerate() {

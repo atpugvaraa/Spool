@@ -1358,6 +1358,7 @@ impl AppShell {
                     .p(px(12.0))
                     .child(
                         div()
+                            .id("prototype-workspace")
                             .flex()
                             .items_center()
                             .gap_2()
@@ -1367,6 +1368,16 @@ impl AppShell {
                             .bg(rgb(theme::WINDOW))
                             .border_1()
                             .border_color(rgb(theme::BORDER_SOFT))
+                            .cursor_pointer()
+                            // The Prototype workspace opens the Prototype tab,
+                            // which is a MODE as well as a panel: the canvas
+                            // draws the prototype's connections while it is
+                            // open.
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.inspector.update(cx, |inspector, cx| {
+                                    inspector.open_tab(1, cx);
+                                });
+                            }))
                             .child(
                                 div()
                                     .size(px(7.0))
