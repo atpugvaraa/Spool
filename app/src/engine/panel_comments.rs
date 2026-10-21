@@ -65,6 +65,7 @@ use std::cmp::Reverse;
 
 use figcraft_doc::{Comment, Document, NodeId};
 use figcraft_engine::cmd::comment::{self, Filter, Sort};
+use serde_json::{json, Value};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // The words
@@ -518,6 +519,132 @@ impl CommentsModel {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// The commands
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A change the Comments section can ask for.
+///
+/// One variant per thing the section can change, so a change the engine has
+/// no command for cannot be written down as though it had one.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CommentsAction {
+    /// Open a thread and bring it into view.
+    Open {
+        /// The thread.
+        id: u64,
+    },
+    /// Resolve a thread, or leave it unresolved.
+    Resolve {
+        /// The thread.
+        id: u64,
+        /// Whether the thread is resolved.
+        resolved: bool,
+    },
+    /// Reply to a thread.
+    Reply {
+        /// The thread.
+        id: u64,
+        /// The reply.
+        text: String,
+    },
+    /// Change a message of a thread.
+    Edit {
+        /// The thread.
+        id: u64,
+        /// The message's new text.
+        text: String,
+        /// Which message: the thread's first one, or a reply by index.
+        ///
+        /// `None` is the thread's first message — the engine's own spelling,
+        /// which omits `reply` rather than sending a zero.
+        reply: Option<usize>,
+    },
+    /// React to a message of a thread.
+    React {
+        /// The thread.
+        id: u64,
+        /// The emoji.
+        emoji: String,
+        /// Which message: the thread's first one, or a reply by index.
+        reply: Option<usize>,
+    },
+    /// Delete a thread, or one of its replies.
+    Delete {
+        /// The thread.
+        id: u64,
+        /// Which message: the thread's first one, or a reply by index.
+        ///
+        /// `None` deletes the whole thread.
+        reply: Option<usize>,
+    },
+    /// Mark a thread read, or unread.
+    MarkRead {
+        /// The thread.
+        id: u64,
+        /// Whether the thread is read.
+        read: bool,
+    },
+    /// Mark every thread read.
+    MarkAllRead,
+    /// Copy a thread's link.
+    Link {
+        /// The thread.
+        id: u64,
+    },
+}
+
+impl CommentsAction {
+    /// The engine's command id and parameters for this change.
+    ///
+    /// The engine's own ids and the engine's own parameter spellings, so a
+    /// change made from the panel is the same change the CLI, the keymap and
+    /// an agent would make.
+    pub fn command(&self) -> (String, Value) {
+        match self {
+            Self::Open { id } => (
+                "comment.open".to_owned(),
+                json!({ "id": *id, "view": "center" }),
+            ),
+            Self::Resolve { id, resolved } => (
+                "comment.resolve".to_owned(),
+                json!({ "id": *id, "resolved": *resolved }),
+            ),
+            Self::Reply { id, text } => (
+                "comment.reply".to_owned(),
+                json!({ "id": *id, "text": text }),
+            ),
+            Self::Edit { id, text, reply } => {
+                let mut params = json!({ "id": *id, "text": text });
+                if let Some(reply) = reply {
+                    params["reply"] = json!(reply);
+                }
+                ("comment.edit".to_owned(), params)
+            }
+            Self::React { id, emoji, reply } => {
+                let mut params = json!({ "id": *id, "emoji": emoji });
+                if let Some(reply) = reply {
+                    params["reply"] = json!(reply);
+                }
+                ("comment.react".to_owned(), params)
+            }
+            Self::Delete { id, reply } => {
+                let mut params = json!({ "id": *id });
+                if let Some(reply) = reply {
+                    params["reply"] = json!(reply);
+                }
+                ("comment.delete".to_owned(), params)
+            }
+            Self::MarkRead { id, read } => (
+                "comment.markRead".to_owned(),
+                json!({ "id": *id, "read": *read }),
+            ),
+            Self::MarkAllRead => ("comment.markRead".to_owned(), json!({})),
+            Self::Link { id } => ("comment.link".to_owned(), json!({ "id": *id })),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // The times
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -756,8 +883,163 @@ mod tests {
         );
     }
 
-    // ── The times ────────────────────────────────────────────────────────────
+    // ── The commands ─────────────────────────────────────────────────────────
 
+    #[test]
+    fn a_change_carries_the_engines_own_command_id_and_params() {
+        let (id, params) = CommentsAction::Open { id: 7 }.command();
+        assert_eq!(id, "comment.open");
+        assert_eq!(params["id"], json!(7));
+        assert_eq!(params["view"], json!("center"));
+
+        let (id, params) = CommentsAction::Resolve {
+            id: 7,
+            resolved: true,
+        }
+        .command();
+        assert_eq!(id, "comment.resolve");
+        assert_eq!(params["id"], json!(7));
+        assert_eq!(params["resolved"], json!(true));
+
+        let (id, params) = CommentsAction::Reply {
+            id: 7,
+            text: "Done".to_owned(),
+        }
+        .command();
+        assert_eq!(id, "comment.reply");
+        assert_eq!(params["id"], json!(7));
+        assert_eq!(params["text"], json!("Done"));
+
+        let (id, params) = CommentsAction::Link { id: 7 }.command();
+        assert_eq!(id, "comment.link");
+        assert_eq!(params["id"], json!(7));
+    }
+
+    #[test]
+    fn a_message_is_named_the_way_the_engine_names_it() {
+        // The engine's own spelling: the thread's first message is the one
+        // with no `reply`, and a reply is named by its index.
+        let (id, params) = CommentsAction::Edit {
+            id: 7,
+            text: "Tighter".to_owned(),
+            reply: None,
+        }
+        .command();
+        assert_eq!(id, "comment.edit");
+        assert_eq!(params["id"], json!(7));
+        assert_eq!(params["text"], json!("Tighter"));
+        assert!(
+            params.get("reply").is_none(),
+            "the first message is named by leaving the index out: {params}"
+        );
+
+        let (id, params) = CommentsAction::Edit {
+            id: 7,
+            text: "Tighter".to_owned(),
+            reply: Some(1),
+        }
+        .command();
+        assert_eq!(id, "comment.edit");
+        assert_eq!(params["reply"], json!(1));
+
+        let (id, params) = CommentsAction::React {
+            id: 7,
+            emoji: "👍".to_owned(),
+            reply: None,
+        }
+        .command();
+        assert_eq!(id, "comment.react");
+        assert_eq!(params["emoji"], json!("👍"));
+        assert!(params.get("reply").is_none());
+
+        let (id, params) = CommentsAction::Delete { id: 7, reply: None }.command();
+        assert_eq!(id, "comment.delete");
+        assert_eq!(params["id"], json!(7));
+        assert!(
+            params.get("reply").is_none(),
+            "no index deletes the whole thread: {params}"
+        );
+
+        let (id, params) = CommentsAction::Delete {
+            id: 7,
+            reply: Some(2),
+        }
+        .command();
+        assert_eq!(id, "comment.delete");
+        assert_eq!(params["reply"], json!(2));
+    }
+
+    #[test]
+    fn the_read_state_commands_are_the_engines_own() {
+        let (id, params) = CommentsAction::MarkRead { id: 7, read: false }.command();
+        assert_eq!(id, "comment.markRead");
+        assert_eq!(params["id"], json!(7));
+        assert_eq!(params["read"], json!(false));
+
+        // Every thread: the engine's own "omit the id" spelling.
+        let (id, params) = CommentsAction::MarkAllRead.command();
+        assert_eq!(id, "comment.markRead");
+        assert_eq!(params, json!({}));
+    }
+
+    #[test]
+    fn the_engine_accepts_the_commands_the_panel_asks_for() {
+        use figcraft_engine::Session;
+
+        let mut session = Session::new();
+        let added = session
+            .execute(
+                "comment.add",
+                &json!({ "x": 10.0, "y": 20.0, "text": "Tighten this" }),
+            )
+            .expect("a comment");
+        let id = added["id"].as_u64().expect("the comment's id");
+
+        // Resolve it, the way the panel does.
+        let (command, params) = CommentsAction::Resolve { id, resolved: true }.command();
+        session
+            .execute(&command, &params)
+            .expect("the engine takes the panel's command");
+        assert!(
+            session
+                .doc()
+                .expect("the document")
+                .comment(id)
+                .expect("the thread")
+                .resolved
+        );
+
+        // And a reply.
+        let (command, params) = CommentsAction::Reply {
+            id,
+            text: "Done".to_owned(),
+        }
+        .command();
+        session
+            .execute(&command, &params)
+            .expect("the engine takes the panel's command");
+        let thread = session
+            .doc()
+            .expect("the document")
+            .comment(id)
+            .expect("the thread");
+        assert_eq!(thread.replies.len(), 1);
+        assert_eq!(thread.replies[0].text, "Done");
+
+        // And the read state.
+        let (command, params) = CommentsAction::MarkRead { id, read: true }.command();
+        session
+            .execute(&command, &params)
+            .expect("the engine takes the panel's command");
+        assert!(!session
+            .doc()
+            .expect("the document")
+            .comment(id)
+            .expect("the thread")
+            .is_unread("You"));
+    }
+
+    // ── The times ────────────────────────────────────────────────────────────
     #[test]
     fn the_ages_are_figcraft_s_own_words() {
         let now = 1_000_000_000;
