@@ -1619,6 +1619,8 @@ pub struct EngineCanvas {
     hitbox: Rc<RefCell<Option<Hitbox>>>,
     /// Where the canvas element is, from the last prepaint.
     viewport: Viewport,
+    /// What the ruler-guides layer remembers between frames.
+    guide_state: Rc<RefCell<guides::GuideState>>,
     /// When the entity was made, for the caret's blink.
     born: Instant,
 }
@@ -1652,6 +1654,7 @@ impl EngineCanvas {
             palette: Palette::new(),
             hitbox: Rc::new(RefCell::new(None)),
             viewport: Viewport::empty(),
+            guide_state: Rc::new(RefCell::new(guides::GuideState::default())),
             born: Instant::now(),
         }
     }
@@ -3990,6 +3993,23 @@ fn utf8_range_to_utf16(text: &str, range: Range<usize>) -> Range<usize> {
 
 impl Render for EngineCanvas {
     fn render(&mut self, _window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+        // THE RULERS ARE ON, because the ruler-guides layer is mounted.
+        //
+        // The engine's `view.rulers` flag is figcraft's VIEW MENU state: in
+        // figcraft the user turns the rulers on from View > Rulers. Spool has
+        // no View menu yet, so there is no way for the user to reach the flag
+        // and the layer would be mounted and invisible.
+        //
+        // So the layer is the switch, and the flag follows it. The moment a
+        // View menu exists this goes away and the flag becomes the user's
+        // choice again -- and the guides layer's own `view.rulers` guard comes
+        // back with it.
+        {
+            let mut session = self.session.borrow_mut();
+            if let Ok(mut ds) = session.ds_mut() {
+                ds.view.rulers = true;
+            }
+        }
         let hitbox_pre = self.hitbox.clone();
         let hitbox_paint = self.hitbox.clone();
         let entity_pre = cx.entity();
@@ -4063,6 +4083,16 @@ impl Render for EngineCanvas {
                 // parent's.
                 .absolute()
                 .size_full(),
+            )
+            // The ruler guides: the guide lines over the artboard, and the
+            // gestures that make, move and remove them.
+            .child(
+                guides::GuidesLayer::new(
+                    self.session.clone(),
+                    self.focus.clone(),
+                    self.guide_state.clone(),
+                )
+                .element(),
             )
     }
 }
@@ -4261,6 +4291,7 @@ impl EntityInputHandler for EngineCanvas {
     }
 }
 
-#[cfg(test)]
 pub mod guides;
+
+#[cfg(test)]
 mod tests;
