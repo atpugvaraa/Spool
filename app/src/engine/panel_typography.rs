@@ -2037,12 +2037,7 @@ fn basics_block<T: TypographyHost>(
         }
         // The decoration's colour: the engine records none of its own when the
         // line takes the text's colour, and the panel says so.
-        let colour = match &model.decoration_color {
-            TypographyValue::Set(Some(colour)) => format!("#{}", colour.to_hex()),
-            TypographyValue::Set(None) => NOT_SET.to_owned(),
-            TypographyValue::Unset => NOT_SET.to_owned(),
-            TypographyValue::Mixed => MIXED.to_owned(),
-        };
+        let colour = decoration_colour_label(&model.decoration_color);
         column = column.child(field_chrome("Colour", &colour, false));
         if matches!(model.decoration_color, TypographyValue::Set(None)) {
             column = column.child(disabled_note(INHERITED_COLOUR));
@@ -2986,6 +2981,19 @@ fn menu_header(text: &'static str) -> Div {
         .child(text.to_owned())
 }
 
+/// The word the decoration's colour is shown as.
+///
+/// A decoration with no colour of its own takes the text's, and the engine
+/// records no colour for it: the panel says "Not set" rather than showing a
+/// colour the user never chose.
+pub fn decoration_colour_label(value: &TypographyValue<Option<Color>>) -> String {
+    match value {
+        TypographyValue::Set(Some(colour)) => format!("#{}", colour.to_hex()),
+        TypographyValue::Set(None) | TypographyValue::Unset => NOT_SET.to_owned(),
+        TypographyValue::Mixed => MIXED.to_owned(),
+    }
+}
+
 /// The unit a spacing value uses.
 fn unit_of(value: Option<&LineHeight>) -> Option<SpacingUnit> {
     match value {
@@ -3811,6 +3819,31 @@ mod tests {
             TypographyValue::Set(TextAutoResize::WidthAndHeight)
         );
         assert_eq!(model.paragraph_spacing, TypographyValue::Set(0.0));
+    }
+
+    #[test]
+    fn a_decoration_with_no_colour_of_its_own_is_not_set() {
+        // The engine records no colour for a decoration: the line takes the
+        // text's colour, and the panel says "Not set" rather than showing a
+        // colour the user never chose.
+        let (doc, id) = document_with_text("Headline");
+        let mut session = session_with(doc, id);
+        session
+            .execute(
+                "node.set",
+                &serde_json::json!({
+                    "ids": [id.0],
+                    "props": { "textDecoration": "underline" },
+                }),
+            )
+            .expect("the engine accepts the property");
+        let model = TypographyModel::from_session(&session);
+        assert_eq!(model.decoration_color, TypographyValue::Set(None));
+        assert_eq!(
+            decoration_colour_label(&model.decoration_color),
+            NOT_SET,
+            "the decoration's colour is not set"
+        );
     }
 
     #[test]

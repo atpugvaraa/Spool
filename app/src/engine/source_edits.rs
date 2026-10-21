@@ -887,12 +887,32 @@ fn text_color(text: &figcraft_doc::TextData) -> Option<Color> {
 /// A colour as the author would write it.
 fn css_color(color: Color) -> String {
     let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u32;
-    format!(
+    let rgb = format!(
         "#{:02x}{:02x}{:02x}",
         channel(color.r),
         channel(color.g),
         channel(color.b)
-    )
+    );
+    // AN ALPHA THE SOURCE CAN CARRY.
+    //
+    // The engine's colour has an alpha and the engine's `fill` carries it, so
+    // the picker shows it and writes it back. Writing `#rrggbb` DROPPED it
+    // silently: a colour the user could see at 40% went to disk fully opaque.
+    //
+    // `rgba(r, g, b, a)` is CSS, and Spool's own reader already compiles it --
+    // `spool-source`'s `read_color` calls `Color::parse_css` -- so the write
+    // path was the only gap.
+    if color.a >= 0.999 {
+        rgb
+    } else {
+        format!(
+            "rgba({}, {}, {}, {})",
+            channel(color.r),
+            channel(color.g),
+            channel(color.b),
+            (color.a.clamp(0.0, 1.0) * 100.0).round() / 100.0
+        )
+    }
 }
 
 /// Corner radii as the author would write them.

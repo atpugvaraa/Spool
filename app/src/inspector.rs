@@ -130,7 +130,7 @@ const NO_STROKE: &str = "No stroke to be wide";
 ///
 /// Fixed rather than growable, so a section's slot can be baked into the click
 /// closure that toggles it.
-pub const SECTION_COUNT: usize = 8;
+pub const SECTION_COUNT: usize = 7;
 
 /// A collapsible section, addressed by a slot.
 ///
@@ -150,7 +150,6 @@ impl SectionSlot {
     pub const EFFECTS: Self = Self(4);
     pub const EXPORT: Self = Self(5);
     pub const STYLES: Self = Self(6);
-    pub const COLOUR: Self = Self(7);
 
     fn index(self) -> usize {
         self.0
@@ -1954,33 +1953,6 @@ impl Inspector {
         panel_typography::section(&model, &state, cx).into_any_element()
     }
 
-    /// The colour picker, editing the selection's fill.
-    ///
-    /// The picker is the engine's colour, read and written through the engine's
-    /// own prop names -- `fill`, `stroke` and `textFills` -- so a colour chosen
-    /// here is the colour the engine draws.
-    fn color_section(&self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(engine) = self.engine.clone() else {
-            return div().into_any_element();
-        };
-        let model = engine.read(cx).with_session(|session| {
-            session.doc().ok().map(|doc| {
-                ColorPickerModel::read(
-                    doc,
-                    &session.selection(),
-                    panel_colorpicker::ColorTarget::Fill,
-                    None,
-                    &[],
-                )
-            })
-        });
-        let Some(model) = model else {
-            return div().into_any_element();
-        };
-        let state = self.color_state.clone();
-        panel_colorpicker::panel(&model, state, cx)
-    }
-
     /// Run a styles change through the engine.
     fn run_styles_action(&mut self, action: StylesAction, cx: &mut Context<Self>) {
         let (command, params) = action.command();
@@ -2503,12 +2475,6 @@ impl Inspector {
                         "Styles",
                         SectionSlot::STYLES,
                         self.styles_section(cx),
-                        cx,
-                    ))
-                    .child(self.inspector_section(
-                        "Colour",
-                        SectionSlot::COLOUR,
-                        self.color_section(cx),
                         cx,
                     ))
                     .child(self.components_section(cx))
@@ -3539,8 +3505,9 @@ impl Inspector {
             .flex_col()
             .gap_1()
             .child(self.paint_row(property, paint, fallback, cx));
-        if self.palette == Some(property) {
-            block = block.child(self.palette_rows(property, cx));
+        // The engine's colour picker, under the row that opened it.
+        if let Some(picker) = self.color_picker(property, cx) {
+            block = block.child(picker);
         }
         block
     }
@@ -3614,11 +3581,16 @@ impl Inspector {
                     .hover(|style| style.bg(rgb(theme::SURFACE_HOVER)))
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.palette = if this.palette == Some(property) {
-                            None
-                        } else {
-                            Some(property)
+                        // The engine's colour picker, not the old static
+                        // palette: it edits the colour the engine draws, and
+                        // its drag is one undo step.
+                        let target = match property {
+                            StyleProperty::Fill => panel_colorpicker::ColorTarget::Fill,
+                            StyleProperty::Stroke => panel_colorpicker::ColorTarget::Stroke,
+                            StyleProperty::TextColor => panel_colorpicker::ColorTarget::TextColor,
                         };
+                        this.palette = None;
+                        this.color_state.borrow_mut().toggle(target);
                         cx.notify();
                     }))
                     .child(div().size(px(12.0)).rounded_sm().bg(rgb(color.to_rgb())))
@@ -3631,50 +3603,17 @@ impl Inspector {
             )
     }
 
-    fn palette_rows(&self, property: StyleProperty, cx: &mut Context<Self>) -> Div {
-        let mut palette = div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .p(px(7.0))
-            .rounded_md()
-            .bg(rgb(theme::WINDOW))
-            .border_1()
-            .border_color(rgb(theme::BORDER));
-        for chunk in PALETTE.chunks(3) {
-            let mut row = div().flex().gap_1();
-            for (name, value) in chunk {
-                let name = *name;
-                let color = model::Color::from_rgb(*value);
-                row = row.child(
-                    div()
-                        .id(SharedString::from(format!("style-color-{name}")))
-                        .flex()
-                        .flex_1()
-                        .items_center()
-                        .gap_1()
-                        .px(px(4.0))
-                        .py(px(5.0))
-                        .rounded_sm()
-                        .hover(|style| style.bg(rgb(theme::SURFACE_HOVER)))
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.commit_paint(property, Some(color), cx);
-                            this.palette = None;
-                            cx.notify();
-                        }))
-                        .child(div().size(px(10.0)).rounded_sm().bg(rgb(*value)))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(theme::TEXT_SECONDARY))
-                                .child(name),
-                        ),
-                );
-            }
-            palette = palette.child(row);
-        }
-        palette
+    /// The engine's colour picker for one paint, if it is open.
+    fn color_picker(&self, property: StyleProperty, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let Some(engine) = self.engine.clone() else {
+            return None;
+        };
+        let target = match property {
+            StyleProperty::Fill => panel_colorpicker::ColorTarget::Fill,
+            StyleProperty::Stroke => panel_colorpicker::ColorTarget::Stroke,
+            StyleProperty::TextColor => panel_colorpicker::ColorTarget::TextColor,
+        };
+        panel_colorpicker::picker(&engine, target, self.color_state.clone(), cx)
     }
 }
 
@@ -4030,7 +3969,6 @@ mod tests {
             SectionSlot::EFFECTS,
             SectionSlot::EXPORT,
             SectionSlot::STYLES,
-            SectionSlot::COLOUR,
         ];
         assert_eq!(slots.len(), SECTION_COUNT, "every slot is accounted for");
         for (index, slot) in slots.iter().enumerate() {
