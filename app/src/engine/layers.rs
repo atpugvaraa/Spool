@@ -670,11 +670,15 @@ pub fn row_hit_geometry(inner_x: f32, inner_w: f32, depth: usize, has_kids: bool
     if has_kids && (x0 - 1.0..=x0 + 13.0).contains(&inner_x) {
         return RowHit::Triangle;
     }
+    // The eye is drawn BEFORE the lock, and in a flex row the first child is on
+    // the left -- so the eye occupies the LEFT of the two toggles and the lock
+    // the right. These thresholds had them the other way round, so clicking the
+    // eye toggled the lock and clicking the lock toggled the eye.
     if inner_x >= inner_w - 20.0 {
-        return RowHit::Eye;
+        return RowHit::Lock;
     }
     if inner_x >= inner_w - 40.0 {
-        return RowHit::Lock;
+        return RowHit::Eye;
     }
     RowHit::Name
 }
@@ -3432,10 +3436,13 @@ mod tests {
 
     #[test]
     fn the_row_geometry_finds_the_control_under_the_pointer() {
-        // 240pt panel: the row's inner box is 224 wide, so the eye is the last 20 and the padlock
-        // the 20 before it.
-        assert_eq!(row_hit_geometry(210.0, 224.0, 0, false), RowHit::Eye);
-        assert_eq!(row_hit_geometry(190.0, 224.0, 0, false), RowHit::Lock);
+        // 240pt panel: the row's inner box is 224 wide. The eye is drawn first
+        // and the padlock second, and the first child of a flex row is on the
+        // LEFT -- so the eye is the 20 points BEFORE the padlock, not the last
+        // 20. This test asserted the opposite, which is why clicking the eye
+        // toggled the padlock.
+        assert_eq!(row_hit_geometry(190.0, 224.0, 0, false), RowHit::Eye);
+        assert_eq!(row_hit_geometry(210.0, 224.0, 0, false), RowHit::Lock);
         assert_eq!(row_hit_geometry(100.0, 224.0, 0, false), RowHit::Name);
         // The triangle only exists on a row with children, and it moves with the indent.
         assert_eq!(row_hit_geometry(8.0, 224.0, 0, true), RowHit::Triangle);
