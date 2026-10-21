@@ -4,8 +4,8 @@
 //!
 //! | Surface | Owns | Where |
 //! |---|---|---|
-//! | A text buffer | characters, caret keys, its own Escape | [`crate::inspector`] for a field or a name, `canvas` for an object's text |
-//! | A panel | its own navigation over its own rows | [`crate::layers`] |
+//! | A text buffer | characters, caret keys, its own Escape | [`crate::inspector`] for a field or a name, the engine's canvas for an object's text |
+//! | A panel | its own navigation over its own rows | [`crate::engine::layers`] |
 //! | This module | everything the whole editor answers to | [`crate::shell`] |
 //!
 //! So this file resolves keys into [`Command`]s and knows nothing about how one
@@ -18,7 +18,11 @@
 //!
 //! 1. **A text buffer is above the editor.** Typing `f` into a layer name must
 //!    not also switch to the frame tool, so [`Scope::TextEditing`] removes the
-//!    commands that would move or replace objects.
+//!    commands that would move or replace objects — and the commands the text
+//!    session itself owns: while a session is open, `⌘Z` undoes the text,
+//!    `⌘A` selects the text and `⌘D` does nothing, because the engine's own
+//!    keymap says the document's history, select-all and duplicate are canvas
+//!    chords and the canvas answers them while the session is open.
 //! 2. **Modifiers are context, not decoration.** `⌘D` duplicates in three
 //!    products and deselects in the fourth; the arrow keys nudge a selection and
 //!    pan the view with nothing selected. A keymap cannot express either, which
@@ -31,7 +35,7 @@
 
 use gpui::Modifiers;
 
-use crate::canvas::{Tool, Traversal};
+use crate::tools::{Tool, Traversal};
 
 /// The command modifier: `⌘` on macOS, `Ctrl` on Windows and Linux.
 ///
@@ -144,13 +148,21 @@ pub enum Scope {
     Editor,
     /// An object's text is being edited on the canvas.
     ///
-    /// History and duplicate stay reachable on purpose. A text session is one
-    /// semantic operation, so `⌘Z` has to reach the same `EditSession` history
-    /// the pointer uses to be one undo step rather than one per character; and
-    /// `⌘D` duplicates the object being edited rather than the text in it, so it
-    /// means the same thing it means everywhere else. Save stays reachable for
-    /// the same reason — it commits the open session and writes, rather than
-    /// silently doing nothing because a caret happened to be in a text box.
+    /// The text session is ABOVE the editor, and it owns history, duplicate
+    /// and select-all while it is open: `⌘Z` undoes the text, `⌘A` selects
+    /// the text, and `⌘D` is not a text verb at all. Those chords are the
+    /// canvas's while the session is open — see
+    /// [`crate::engine::canvas::EngineCanvas`] — and the editor-wide table
+    /// must not answer them as well, or one chord would have two owners.
+    ///
+    /// The engine's own keymap is the authority for that: `edit.undo`,
+    /// `edit.redo`, `select.all` and `edit.duplicate` are canvas chords, so
+    /// they are not live while text is being edited.
+    ///
+    /// Save stays reachable, because the engine's table says `file.save` is
+    /// live in both contexts: it commits the open session and writes, rather
+    /// than silently doing nothing because a caret happened to be in a text
+    /// box.
     ///
     /// Everything that would move or replace objects is unreachable: the caret
     /// keys and the delete keys belong to the buffer, and the tool letters are
@@ -164,13 +176,35 @@ pub enum Scope {
 /// case: most keys a user presses are either text, a panel's business, or
 /// nothing at all.
 pub fn resolve(key: &str, modifiers: Modifiers, scope: Scope) -> Option<Command> {
-    // History, duplicate and save answer in every scope, so they are asked
-    // first and they never fall through: a command-modifier key is either one
-    // of these or nothing, so the reader never has to know which block a `⌘`
-    // key stopped in. `⌥` is excluded from all of them — `⌥⌘D` is a shortcut in
-    // some other product, not this one, and quietly duplicating for it would be
-    // worse than doing nothing.
+    // THE COMMAND-MODIFIER CHORDS, and which scope answers them.
+    //
+    // They are asked first and they never fall through: a command-modifier key
+    // is either one of these or nothing, so the reader never has to know which
+    // block a `⌘` key stopped in. `⌥` is excluded from all of them — `⌥⌘D` is
+    // a shortcut in some other product, not this one, and quietly duplicating
+    // for it would be worse than doing nothing.
     if command(modifiers) && !modifiers.alt && !modifiers.function {
+        // A TEXT SESSION OWNS HISTORY, SELECT-ALL AND DUPLICATE while it is
+        // open, so the editor-wide table does not answer them there: `⌘Z`
+        // undoes the text, `⌘A` selects the text, and `⌘D` is not a text
+        // verb. The canvas answers those chords while the session is open
+        // (see `engine::canvas`), and two owners of one chord is the defect,
+        // not the fix.
+        //
+        // SAVE IS THE EXCEPTION, and the engine's own keymap says why:
+        // `file.save` is live in both contexts, so it answers here too.
+        if scope == Scope::TextEditing {
+            return match key {
+                "s" => Some(Command::Save),
+                _ => None,
+            };
+        }
+        // THE EDITOR SCOPE answers the command modifier's chords, and it
+        // answers them first: a command-modifier key is either one of these
+        // or nothing, so the reader never has to know which block a `⌘` key
+        // stopped in. `⌥` is excluded from all of them — `⌥⌘D` is a shortcut
+        // in some other product, not this one, and quietly duplicating for it
+        // would be worse than doing nothing.
         return match key {
             "z" => Some(if modifiers.shift {
                 Command::Redo
@@ -745,12 +779,20 @@ mod tests {
     }
 
     #[test]
-    fn history_still_reaches_the_document_from_inside_a_text_buffer() {
-        // A text session is one semantic operation, so `⌘Z` has to land in the
-        // same `EditSession` history the pointer uses — one undo step for the
-        // whole session, not one per character.
+    fn the_text_session_owns_history_duplicate_and_select_all() {
+        // The engine's keymap is the authority: `edit.undo`, `edit.redo`,
+        // `edit.duplicate` and `select.all` are CANVAS chords, so they are
+        // not live while text is being edited — the text session is above the
+        // canvas and owns them. The canvas answers them there, so the
+        // editor-wide table must not answer them as well: one chord, one
+        // owner.
+        //
+        // This is the opposite of what this table used to say, and the
+        // change is deliberate: the old rule let `⌘Z` reach the document's
+        // history from inside a text session, which made one chord mean two
+        // things and left the text itself with no undo at all.
         for modifiers in [cmd(), ctrl()] {
-            assert_eq!(resolve_text("z", modifiers), Some(Command::Undo));
+            assert_eq!(resolve_text("z", modifiers), None, "⌘Z is the text's");
             assert_eq!(
                 resolve_text(
                     "z",
@@ -759,10 +801,25 @@ mod tests {
                         ..modifiers
                     }
                 ),
-                Some(Command::Redo)
+                None,
+                "and so is ⌘⇧Z"
             );
-            assert_eq!(resolve_text("d", modifiers), Some(Command::Duplicate));
+            assert_eq!(resolve_text("y", modifiers), None, "⌘Y is the text's");
+            assert_eq!(resolve_text("d", modifiers), None, "⌘D is not a text verb");
+            assert_eq!(resolve_text("a", modifiers), None, "⌘A is the text's");
+            // Save is live in both contexts: the engine's own table says so.
             assert_eq!(resolve_text("s", modifiers), Some(Command::Save));
+        }
+    }
+
+    #[test]
+    fn the_traversal_chords_belong_to_the_text_session_too() {
+        // `⌘↑` and `⌘↓` are the caret's line ends and the text's ends while a
+        // session is open (the engine's own text rules), so the editor-wide
+        // table must not spend them on the selection's hierarchy.
+        for modifiers in [cmd(), ctrl()] {
+            assert_eq!(resolve_text("up", modifiers), None);
+            assert_eq!(resolve_text("down", modifiers), None);
         }
     }
 

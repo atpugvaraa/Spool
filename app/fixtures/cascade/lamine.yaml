@@ -1,0 +1,77 @@
+# Spool project metadata — version 2.
+#
+# This fixture exists to make one CSS bug VISIBLE in the running application
+# rather than only in a unit test: when a document links two stylesheets and
+# link order disagrees with selector specificity, the frame must render the
+# winner by specificity, not the winner by link order.
+#
+# The expected result, and why:
+#
+#   spool-frame-hero   #hero (base.css, specificity 1-0-0) vs .theme
+#                      (theme.css, 0-1-0). The id wins -> white.
+#   spool-frame-anchor #anchor (base.css, 1-0-0) vs .anchor (theme.css, 0-1-0).
+#                      The id wins -> white.
+#   spool-frame-swatch-*  .swatch in base.css vs .swatch in theme.css. Equal
+#                      specificity, so theme.css wins on link order -> orange.
+#
+# So the render is two white panels holding two orange swatches. If the panels
+# come out blue, a later stylesheet is overriding an earlier one regardless of
+# specificity, which is the defect.
+#
+# Everything in the stylesheets is Owner A and is deliberately absent here — a
+# property has exactly one owner. See docs/02-document-and-source-model.md.
+version: 2
+nodes:
+  - id: 1
+    key: spool-frame-hero
+    name: Hero
+    kind: frame
+    children:
+      - 2
+      - 3
+    binding:
+      file: index.html
+      selector: "[data-spool-id=\"spool-frame-hero\"]"
+
+  - id: 2
+    key: spool-frame-note
+    name: Note
+    kind: text
+    parent: 1
+    binding:
+      file: index.html
+      selector: "[data-spool-id=\"spool-frame-note\"]"
+
+  - id: 3
+    key: spool-frame-anchor
+    name: Anchor
+    kind: frame
+    parent: 1
+    children:
+      - 4
+      - 5
+    binding:
+      file: index.html
+      selector: "[data-spool-id=\"spool-frame-anchor\"]"
+
+  # Equal specificity in both sheets, so link order decides. theme.css is later
+  # and these come out orange.
+  - id: 4
+    key: spool-frame-swatch-a
+    name: Swatch A
+    kind: frame
+    parent: 3
+    binding:
+      file: index.html
+      selector: "[data-spool-id=\"spool-frame-swatch-a\"]"
+
+  - id: 5
+    key: spool-frame-swatch-b
+    name: Swatch B
+    kind: frame
+    parent: 3
+    binding:
+      file: index.html
+      selector: "[data-spool-id=\"spool-frame-swatch-b\"]"
+
+color_profile: srgb

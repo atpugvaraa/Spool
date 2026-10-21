@@ -37,6 +37,12 @@
 //! *not* part of it: an inline style belongs to the element reader, and
 //! inheritance belongs to the document tree rather than to a stylesheet.
 //!
+//! `!important` is reported rather than ordered — see
+//! [`Stylesheet::important_properties`]. It is reported *before* the cascade
+//! picks a winner, because the interesting case is a declaration that loses:
+//! once [`Stylesheet::resolve`] has chosen, a discarded `!important` cannot be
+//! seen at all, and the caller is left believing nothing was ambiguous.
+//!
 //! Shorthands are expanded into the longhands they compete with *before* the
 //! cascade runs, exactly as CSS does, which is why a later `background` beats
 //! an earlier `background-color`. Keeping both under one group also keeps the
@@ -50,8 +56,15 @@
 //! them in document order and asks each one in turn; nothing here reaches
 //! across from one stylesheet into another, because an offset into a different
 //! file is not a range.
+//!
+//! Asking each sheet in turn is not the same as letting the last sheet win.
+//! Link order decides only between declarations of *equal* specificity, so the
+//! ranking has to outlive [`Stylesheet::resolve`] for a caller merging several
+//! sheets — see [`Stylesheet::resolve_ranked`]. An earlier `#hero` and a later
+//! `.theme` are not tied, and a merge that keeps only the values has already
+//! lost the fact that made the first one win.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
 /// The properties this module understands.
@@ -123,6 +136,14 @@ pub struct Declaration {
     pub range: Range<usize>,
     /// Author order, used as the tie-breaker between equal specificity.
     pub order: usize,
+    /// Whether the author wrote `!important` on this declaration.
+    ///
+    /// Recorded from the authored text rather than re-read from `value` later,
+    /// because `value` is also where a substituted `var()` result can differ
+    /// from what was written. The cascade does not order it — see
+    /// [`Stylesheet::important_properties`] — so this is a fact reported to the
+    /// caller, not a rank used to pick a winner.
+    pub important: bool,
 }
 
 impl Declaration {
@@ -320,6 +341,7 @@ impl Stylesheet {
                 parsed.push(Declaration {
                     value: source[range.clone()].to_owned(),
                     property,
+                    important: carries_important(&source[range.clone()]),
                     range,
                     order,
                 });
@@ -343,20 +365,79 @@ impl Stylesheet {
     /// `row-gap` and `column-gap`. Each entry carries the resolved value
     /// (with `var()` substituted) and the authored byte range of the declaration
     /// that won.
+    ///
+    /// The rank that made the winner is not reported, because every caller of
+    /// this wants one element's answer and not a merge. A caller combining
+    /// several stylesheets wants the rank too, and loses the cascade if it asks
+    /// this — see [`Stylesheet::resolve_ranked`].
     pub fn resolve(&self, tag: &str, classes: &[String], id: Option<&str>) -> Resolved {
+        self.resolve_ranked(tag, classes, id)
+            .into_iter()
+            .map(|(property, ranked)| (property, ranked.into_resolved()))
+            .collect()
+    }
+
+    /// [`Stylesheet::resolve`], keeping each winner's specificity and author
+    /// order.
+    ///
+    /// Merging several stylesheets is not "take the last sheet that has a
+    /// value": the cascade ranks every matching declaration against every other
+    /// one, and only declarations of equal rank are decided by which sheet the
+    /// document links them from. So a merge done on [`Stylesheet::resolve`]
+    /// alone cannot rank what it is merging — the rank is gone — and silently
+    /// hands an element the value of whichever sheet happens to be linked last.
+    /// That is exactly the authored value, so nothing about the result looks
+    /// wrong.
+    pub fn resolve_ranked(&self, tag: &str, classes: &[String], id: Option<&str>) -> Ranked {
         self.cascaded(tag, classes, id)
             .into_iter()
-            .map(|(property, declaration)| {
+            .map(|(property, winner)| {
+                let declaration = winner.declaration;
                 (
                     property,
-                    ResolvedValue {
+                    RankedValue {
                         value: self.substitute_variables(&declaration.value),
                         range: declaration.range.clone(),
                         order: declaration.order,
+                        specificity: winner.specificity,
                     },
                 )
             })
             .collect()
+    }
+
+    /// Every computed longhand for which a *matching* declaration is written
+    /// `!important`.
+    ///
+    /// Asked before anything is resolved, because `!important` is a precedence
+    /// rule this cascade does not implement: it cannot say whether such a
+    /// declaration won, and reading it as though it had — or dropping it
+    /// because another rule outranked it — hands the element a value the author
+    /// may not have meant. Both readings are wrong, so the fact is reported
+    /// instead of resolved.
+    ///
+    /// A `!important` declaration on a rule that does not match this element is
+    /// not in here. It competes with nothing, so there is nothing ambiguous
+    /// about it, and a stylesheet is free to use the flag for selectors this
+    /// element does not carry.
+    pub fn important_properties(
+        &self,
+        tag: &str,
+        classes: &[String],
+        id: Option<&str>,
+    ) -> ImportantProperties {
+        let mut found = BTreeSet::new();
+        for rule in &self.rules {
+            if !rule.selector.matches(tag, classes, id) {
+                continue;
+            }
+            for declaration in &rule.declarations {
+                if declaration.important {
+                    found.extend(property_groups(&declaration.property));
+                }
+            }
+        }
+        ImportantProperties { properties: found }
     }
 
     /// The declaration that currently wins for one property on one element.
@@ -377,7 +458,7 @@ impl Stylesheet {
         let cascaded = self.cascaded(tag, classes, id);
         property_groups(property)
             .into_iter()
-            .find_map(|group| cascaded.get(&group).copied())
+            .find_map(|group| cascaded.get(&group).map(|winner| winner.declaration))
     }
 
     /// The authored byte range of the declaration that currently wins for
@@ -417,22 +498,24 @@ impl Stylesheet {
             .flat_map(|rule| rule.declarations.iter())
     }
 
-    /// Every declaration that wins for one computed longhand on one element.
+    /// Every declaration that wins for one computed longhand on one element,
+    /// with the rank that made it win.
     ///
     /// Single source of truth for the cascade: [`Stylesheet::resolve`] reads
-    /// values out of it, and [`Stylesheet::winner`] reads declarations out of
-    /// it, so the value a node is drawn with and the authored text an edit would
-    /// rewrite cannot disagree.
+    /// values out of it, [`Stylesheet::resolve_ranked`] reads ranks out of it,
+    /// and [`Stylesheet::winner`] reads declarations out of it, so the value a
+    /// node is drawn with and the authored text an edit would rewrite cannot
+    /// disagree.
     fn cascaded<'a>(
         &'a self,
         tag: &str,
         classes: &[String],
         id: Option<&str>,
-    ) -> BTreeMap<String, &'a Declaration> {
+    ) -> BTreeMap<String, Winner<'a>> {
         // The incumbent's own specificity is carried alongside it. Reusing the
         // candidate rule's specificity for the incumbent would make the
         // comparison depend on the order the rules happen to be visited in.
-        let mut winners: BTreeMap<String, (&'a Declaration, u32)> = BTreeMap::new();
+        let mut winners: BTreeMap<String, Winner<'a>> = BTreeMap::new();
         for rule in &self.rules {
             if !rule.selector.matches(tag, classes, id) {
                 continue;
@@ -441,24 +524,33 @@ impl Stylesheet {
             for declaration in &rule.declarations {
                 for group in property_groups(&declaration.property) {
                     match winners.get(&group) {
-                        Some((current, current_specificity)) => {
+                        Some(current) => {
                             if declaration.rank_for(specificity)
-                                > current.rank_for(*current_specificity)
+                                > current.declaration.rank_for(current.specificity)
                             {
-                                winners.insert(group, (declaration, specificity));
+                                winners.insert(
+                                    group,
+                                    Winner {
+                                        declaration,
+                                        specificity,
+                                    },
+                                );
                             }
                         }
                         None => {
-                            winners.insert(group, (declaration, specificity));
+                            winners.insert(
+                                group,
+                                Winner {
+                                    declaration,
+                                    specificity,
+                                },
+                            );
                         }
                     }
                 }
             }
         }
         winners
-            .into_iter()
-            .map(|(property, (declaration, _))| (property, declaration))
-            .collect()
     }
 
     /// Expand `var(--name)` against the `:root` custom properties.
@@ -509,6 +601,280 @@ impl Stylesheet {
         out.push_str(rest);
         changed.then_some(out)
     }
+}
+
+/// The declaration that currently wins one longhand, with the specificity of
+/// the rule it came from.
+///
+/// Split out from [`Declaration`] because the specificity belongs to the
+/// selector: keeping the pair adjacent is what stops a declaration from being
+/// ranked by a rule other than its own.
+struct Winner<'a> {
+    declaration: &'a Declaration,
+    specificity: u32,
+}
+
+/// A resolved declaration that carries the rank that made it win.
+///
+/// [`ResolvedValue`] is this without the rank. Callers reading a single
+/// stylesheet do not need it; a caller merging stylesheets cannot rank a merge
+/// without it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RankedValue {
+    /// The winning value, with `var()` references substituted.
+    ///
+    /// The same fact [`ResolvedValue::value`] reports, and subject to the same
+    /// caveat: it is not necessarily byte-identical to [`RankedValue::range`].
+    pub value: String,
+    /// Byte range of the authored value this one came from, in the stylesheet
+    /// it was read from.
+    pub range: Range<usize>,
+    /// Author order of the winning declaration, within its own stylesheet.
+    pub order: usize,
+    /// Specificity of the rule the winning declaration was authored under.
+    ///
+    /// Compared by a merging caller. Author order alone is not comparable across
+    /// stylesheets, so a merge that ranks on it treats link order as a rank of
+    /// its own and lets an unrelated selector beat a more specific one.
+    pub specificity: u32,
+}
+
+/// Every declaration that wins for one element, with its rank.
+///
+/// Keyed by computed longhand, and looked up by either spelling for the same
+/// reason [`Resolved`] is: `background` is found under `background-color` and
+/// `gap` under `row-gap`/`column-gap`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Ranked {
+    entries: BTreeMap<String, RankedValue>,
+}
+
+impl Ranked {
+    /// The winning declaration for one property, spelled either way.
+    pub fn get(&self, property: &str) -> Option<&RankedValue> {
+        property_groups(property)
+            .iter()
+            .find_map(|group| self.entries.get(group))
+    }
+
+    /// The canonical longhand names that resolved, in order.
+    pub fn properties(&self) -> impl Iterator<Item = &str> {
+        self.entries.keys().map(String::as_str)
+    }
+
+    /// Every resolved longhand and its declaration.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &RankedValue)> {
+        self.entries
+            .iter()
+            .map(|(property, ranked)| (property.as_str(), ranked))
+    }
+
+    /// How many longhands resolved.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether nothing matched this element.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+impl FromIterator<(String, RankedValue)> for Ranked {
+    fn from_iter<T: IntoIterator<Item = (String, RankedValue)>>(iter: T) -> Self {
+        Self {
+            entries: iter.into_iter().collect(),
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a Ranked {
+    type Item = (&'a str, &'a RankedValue);
+    type IntoIter = Box<dyn Iterator<Item = (&'a str, &'a RankedValue)> + 'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        Box::new(self.iter())
+    }
+}
+
+impl IntoIterator for Ranked {
+    type Item = (String, RankedValue);
+    type IntoIter = Box<dyn Iterator<Item = (String, RankedValue)> + 'static>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        Box::new(self.entries.into_iter())
+    }
+}
+
+impl RankedValue {
+    /// The same declaration without the rank, for a caller that has finished
+    /// merging.
+    ///
+    /// Dropping the rank here is only correct once one declaration has won:
+    /// there is then nothing left to rank against, so the fact that decided it
+    /// is spent. Converting earlier would discard it while it still decides
+    /// the answer.
+    fn into_resolved(self) -> ResolvedValue {
+        ResolvedValue {
+            value: self.value,
+            range: self.range,
+            order: self.order,
+        }
+    }
+}
+
+/// The winners of a cascade across several stylesheets.
+///
+/// One implementation of the cross-stylesheet ranking, used by everything that
+/// has to know which sheet decided a value: the reader, which compiles the
+/// project, and the editor's writer, which has to find the authored span that
+/// produced the value the editor is drawing.
+///
+/// A project has more than one stylesheet, and a declaration in one of them
+/// may or may not be the one that decides what an element looks like. Deciding
+/// that is a *ranking*, and a ranking that exists twice is two answers to one
+/// question: the reader resolves the value an element is drawn with, and the
+/// writer has to find the authored span that produced it. If the two
+/// disagreed, a save would rewrite a declaration that had already lost, and the
+/// file on disk would end up naming a different owner for the value than the
+/// editor had been drawing. Nothing about the result would look wrong.
+///
+/// # The order
+///
+/// Three criteria, in the order a browser applies them:
+///
+/// 1. **selector specificity** — an `#id` beats a `.class` beats a type,
+/// 2. **which stylesheet the document links the declaration from**, and
+/// 3. **author order inside that stylesheet**.
+///
+/// Link order is the *last* tie-break rather than an override. Ranking on link
+/// order alone lets a later `.theme` beat an earlier `#hero`, which is a value
+/// the author never asked for and which nothing about the result would reveal
+/// as wrong.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Cascade {
+    by_property: BTreeMap<String, CascadeWinner>,
+}
+
+/// One declaration that won a property, and the numbers that ranked it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CascadeWinner {
+    /// The specificity of the rule the winning declaration was authored under.
+    pub specificity: u32,
+    /// The index of the stylesheet the declaration came from.
+    ///
+    /// The stylesheet's place in the document's link order, which is the second
+    /// tie-break.
+    pub sheet: usize,
+    /// The author order of the winning declaration inside that stylesheet.
+    pub order: usize,
+    /// The value, with `var()` references substituted.
+    pub value: String,
+}
+
+impl Cascade {
+    /// Consider one declaration for one property.
+    ///
+    /// `sheet` is the stylesheet's index in the document's link order, and
+    /// `resolved` is what [`Stylesheet::resolve_ranked`] reported for it. The
+    /// declaration is kept if it outranks the incumbent.
+    ///
+    /// A tie cannot happen across sheets: `order` is unique within a sheet and
+    /// `sheet` separates them, so exactly one declaration wins each property.
+    pub fn consider(&mut self, property: &str, sheet: usize, resolved: &RankedValue) {
+        let candidate = CascadeWinner {
+            specificity: resolved.specificity,
+            sheet,
+            order: resolved.order,
+            value: resolved.value.clone(),
+        };
+        match self.by_property.get(property) {
+            Some(current) if current.rank() >= candidate.rank() => {}
+            _ => {
+                self.by_property.insert(property.to_owned(), candidate);
+            }
+        }
+    }
+
+    /// Which stylesheet owns `property`, by its index in the cascade.
+    ///
+    /// `None` when no sheet declared it.
+    pub fn sheet_of(&self, property: &str) -> Option<usize> {
+        self.by_property.get(property).map(|winner| winner.sheet)
+    }
+
+    /// The value that won `property`.
+    pub fn value_of(&self, property: &str) -> Option<&str> {
+        self.by_property
+            .get(property)
+            .map(|winner| winner.value.as_str())
+    }
+
+    /// Every property that was won, and the winner.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &CascadeWinner)> {
+        self.by_property
+            .iter()
+            .map(|(property, winner)| (property.as_str(), winner))
+    }
+
+    /// How many properties were won.
+    pub fn len(&self) -> usize {
+        self.by_property.len()
+    }
+
+    /// Whether nothing was won.
+    pub fn is_empty(&self) -> bool {
+        self.by_property.is_empty()
+    }
+}
+
+impl CascadeWinner {
+    /// The comparable rank, for deciding whether this beats the incumbent.
+    fn rank(&self) -> (u32, usize, usize) {
+        (self.specificity, self.sheet, self.order)
+    }
+}
+
+/// The computed longhands a matching `!important` declaration names.
+///
+/// A report, not a result: see [`Stylesheet::important_properties`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ImportantProperties {
+    properties: BTreeSet<String>,
+}
+
+impl ImportantProperties {
+    /// Whether a matching `!important` declaration competes for `property`,
+    /// spelled either way.
+    ///
+    /// Spelling-agnostic for the same reason the cascade is: a
+    /// `background: … !important` is an `!important` declaration of
+    /// `background-color` however the caller asks for it.
+    pub fn contains(&self, property: &str) -> bool {
+        property_groups(property)
+            .iter()
+            .any(|group| self.properties.contains(group))
+    }
+
+    /// The canonical longhand names, in order.
+    pub fn properties(&self) -> impl Iterator<Item = &str> {
+        self.properties.iter().map(String::as_str)
+    }
+
+    /// Whether no matching declaration was written `!important`.
+    pub fn is_empty(&self) -> bool {
+        self.properties.is_empty()
+    }
+}
+
+/// Whether the authored value text carries `!important`.
+///
+/// Read from the authored text as written, case-insensitively as CSS spells it
+/// `!IMPORTANT` too. `!important` is only ever a flag here — this cascade does
+/// not order it (see [`Stylesheet::important_properties`]), so nothing depends
+/// on where in the value it appears.
+fn carries_important(value: &str) -> bool {
+    value.to_ascii_lowercase().contains("!important")
 }
 
 /// A resolved declaration: what the element is styled with, and where in the
@@ -835,7 +1201,12 @@ mod tests {
 
     /// The authored bytes the cascade says won `property`, sliced back out of
     /// the stylesheet it was parsed from.
-    fn winning_text<'a>(source: &'a str, sheet: &Stylesheet, selector: (&str, &[&str], Option<&str>), property: &str) -> &'a str {
+    fn winning_text<'a>(
+        source: &'a str,
+        sheet: &Stylesheet,
+        selector: (&str, &[&str], Option<&str>),
+        property: &str,
+    ) -> &'a str {
         let (tag, classes, id) = selector;
         let range = sheet
             .declaration_value_range(tag, &owned(classes), id, property)
@@ -1017,7 +1388,10 @@ mod tests {
             .declaration_value_range("a", &owned(&["cta"]), None, "color")
             .expect("color wins");
         assert_eq!(&source[color.clone()], "#ffffff");
-        assert!(color.start > range.end, "the later declaration starts after it");
+        assert!(
+            color.start > range.end,
+            "the later declaration starts after it"
+        );
     }
 
     #[test]
@@ -1057,11 +1431,7 @@ mod tests {
                         "the span and the value must be the same authored bytes"
                     );
                 }
-                for classes in [
-                    owned(&["a\u{00E9}", "b"]),
-                    owned(&["a"]),
-                    Vec::new(),
-                ] {
+                for classes in [owned(&["a\u{00E9}", "b"]), owned(&["a"]), Vec::new()] {
                     let resolved = sheet.resolve("div", &classes, Some("\u{1F600}"));
                     for (_, entry) in resolved.iter() {
                         assert!(
@@ -1220,7 +1590,10 @@ mod tests {
         );
         // Equal specificity falls back to author order.
         let tie = "a { color: #ff0000; }\na { color: #0000ff; }\n";
-        assert_eq!(resolved_for(tie, "a", &[], None).value("color"), Some("#0000ff"));
+        assert_eq!(
+            resolved_for(tie, "a", &[], None).value("color"),
+            Some("#0000ff")
+        );
     }
 
     #[test]
@@ -1283,7 +1656,10 @@ mod tests {
     fn a_combinator_selector_is_out_of_scope_and_skipped() {
         // `.card .cta` needs a descendant combinator, which this cascade does
         // not implement. It must not be treated as if it were `.cta`.
-        for source in [".card .cta { color: #ff0000; }", ".card>.cta { color: #ff0000; }"] {
+        for source in [
+            ".card .cta { color: #ff0000; }",
+            ".card>.cta { color: #ff0000; }",
+        ] {
             assert!(
                 resolved_for(source, "a", &["cta"], None).is_empty(),
                 "{source} must not silently apply to the child"
@@ -1304,6 +1680,169 @@ mod tests {
                 "{source} is outside the supported subset and must not be guessed at"
             );
         }
+    }
+
+    #[test]
+    fn the_rank_that_decided_a_winner_survives_resolution() {
+        // A caller merging several stylesheets cannot rank the merge from the
+        // values alone, so `resolve_ranked` has to report why each winner won.
+        // Without the specificity, `#hero` and `.cta` are just two values and
+        // the sheet linked last wins by default.
+        let source = "#hero { color: #00ff00; }\n.cta { color: #ff0000; }\na { color: #0000ff; }\n";
+        let sheet = Stylesheet::parse(source);
+
+        let ranked = sheet.resolve_ranked("div", &owned(&["cta"]), Some("hero"));
+        let color = ranked
+            .get("color")
+            .unwrap_or_else(|| panic!("color resolves for every rule here"));
+        assert_eq!(color.value, "#00ff00", "one id outranks a class");
+        assert_eq!(
+            color.specificity, 10_000,
+            "and reports the specificity that decided it"
+        );
+        assert_eq!(color.order, 0, "author order is the sheet's own");
+        assert_eq!(&source[color.range.clone()], "#00ff00");
+
+        // Same element, different selectors: three different ranks, so a merge
+        // has something to compare.
+        for (classes, id, expected, specificity, order) in [
+            (&["cta"][..], Some("hero"), "#00ff00", 10_000u32, 0usize),
+            (&["cta"][..], None, "#ff0000", 100, 1),
+            (&[][..], None, "#0000ff", 1, 2),
+        ] {
+            let classes = owned(classes);
+            let at = source.find(expected).expect("authored");
+            assert_eq!(
+                sheet.resolve_ranked("a", &classes, id).get("color"),
+                Some(&RankedValue {
+                    value: expected.to_owned(),
+                    range: at..at + expected.len(),
+                    order,
+                    specificity,
+                }),
+                "classes {classes:?} id {id:?} resolves to {expected}"
+            );
+        }
+
+        // `resolve` is unchanged: same winner, same value, same span, no rank
+        // in the way.
+        let resolved = sheet.resolve("div", &owned(&["cta"]), Some("hero"));
+        assert_eq!(resolved.value("color"), Some("#00ff00"));
+        assert_eq!(
+            resolved.range("color"),
+            Some(15..22),
+            "and the span is still the winner's own"
+        );
+        assert_eq!(&source[resolved.range("color").expect("color")], "#00ff00");
+        assert_eq!(resolved.len(), 1);
+    }
+
+    #[test]
+    fn an_important_declaration_is_reported_even_though_it_lost_the_cascade() {
+        // `#hero` outranks `.theme`, so the cascade as implemented resolves
+        // blue and drops the red `!important` on the floor. That is the one
+        // case the flag has to survive for, so it is reported from the rules
+        // rather than read back off the winner — a reader that inspects only
+        // the winner never sees the declaration it cannot order.
+        let source = ".theme { color: #ff0000 !important; }\n#hero { color: #0000ff; }\n";
+        let sheet = Stylesheet::parse(source);
+        assert_eq!(
+            sheet
+                .resolve("div", &owned(&["theme"]), Some("hero"))
+                .value("color"),
+            Some("#0000ff"),
+            "the cascade as implemented prefers the id, flag or no flag"
+        );
+
+        let important = sheet.important_properties("div", &owned(&["theme"]), Some("hero"));
+        assert!(
+            important.contains("color"),
+            "a losing !important is still a matching one"
+        );
+
+        // The flag lives on the authored text, not on the winner, so it is
+        // reported the same way whichever rule ends up winning.
+        assert!(
+            sheet
+                .important_properties("div", &owned(&["theme"]), Some("hero"))
+                .contains("color")
+                && sheet
+                    .important_properties("div", &owned(&["theme"]), None)
+                    .contains("color"),
+            "and it is reported whether the flagged rule wins or loses"
+        );
+        assert!(
+            sheet
+                .important_properties("div", &owned(&["other"]), Some("hero"))
+                .is_empty(),
+            "a flag on a selector this element does not match competes with nothing"
+        );
+        assert!(
+            Stylesheet::parse(".theme { color: #ff0000; }")
+                .important_properties("div", &owned(&["theme"]), None)
+                .is_empty(),
+            "and a stylesheet without the flag reports nothing"
+        );
+    }
+
+    #[test]
+    fn an_important_shorthand_is_reported_under_the_longhand_it_competes_with() {
+        // `background` and `background-color` are one group, so the flag has to
+        // be findable under either spelling — otherwise an element styled with
+        // an important shorthand is silently resolved past it.
+        let sheet = Stylesheet::parse(".theme { background: #ff0000 !important; }");
+        let important = sheet.important_properties("div", &owned(&["theme"]), None);
+        assert!(important.contains("background"));
+        assert!(important.contains("background-color"));
+        assert_eq!(
+            important.properties().collect::<Vec<_>>(),
+            vec!["background-color"]
+        );
+
+        // Same for the one shorthand that expands into two longhands.
+        let gap = Stylesheet::parse(".theme { gap: 10px !important; }");
+        let gap = gap.important_properties("div", &owned(&["theme"]), None);
+        assert!(gap.contains("gap"), "the shorthand the author wrote");
+        assert!(gap.contains("row-gap"), "and the axis it competes under");
+        assert!(gap.contains("column-gap"));
+
+        // Case is not a way to hide it either.
+        let shouted = Stylesheet::parse(".theme { color: #ff0000 !IMPORTANT; }");
+        assert!(
+            shouted
+                .important_properties("div", &owned(&["theme"]), None)
+                .contains("color"),
+            "CSS spells the flag case-insensitively and so must this"
+        );
+    }
+
+    #[test]
+    fn a_declaration_reports_the_flag_its_author_wrote() {
+        let sheet =
+            Stylesheet::parse(".cta { color: #ff0000 !important; }\n#hero { color: #00ff00; }\n");
+        // Without the id, the flagged rule is the one that wins.
+        let flagged = sheet
+            .winner("div", &["cta".to_owned()], None, "color")
+            .expect("a declaration wins");
+        assert!(
+            flagged.important,
+            "the winner carries the flag it was authored with"
+        );
+        let unflagged = sheet
+            .winner("div", &[], Some("hero"), "color")
+            .expect("a declaration wins");
+        assert!(
+            !unflagged.important,
+            "and the flag is not smeared onto rules that were written without it"
+        );
+        // And with the id, the winner is the rule written without one.
+        assert!(
+            !sheet
+                .winner("div", &["cta".to_owned()], Some("hero"), "color")
+                .expect("a declaration wins")
+                .important,
+            "a rule that outranks the flagged one is not itself flagged"
+        );
     }
 
     #[test]
@@ -1386,7 +1925,9 @@ mod tests {
         let cyclic = ":root { --a: var(--b); --b: var(--a); }\n.x { color: var(--a); }";
         let resolved = Stylesheet::parse(cyclic).resolve("div", &owned(&["x"]), None);
         assert!(
-            resolved.value("color").is_some_and(|value| value.starts_with("var(")),
+            resolved
+                .value("color")
+                .is_some_and(|value| value.starts_with("var(")),
             "an unresolvable chain is left visibly wrong, not invented"
         );
 
@@ -1422,7 +1963,10 @@ mod tests {
     fn the_final_declaration_without_a_semicolon_is_still_read() {
         let source = ".cta { color: #ffffff }";
         let sheet = Stylesheet::parse(source);
-        assert_eq!(sheet.resolve("a", &owned(&["cta"]), None).value("color"), Some("#ffffff"));
+        assert_eq!(
+            sheet.resolve("a", &owned(&["cta"]), None).value("color"),
+            Some("#ffffff")
+        );
         assert_eq!(
             winning_text(source, &sheet, ("a", &["cta"], None), "color"),
             "#ffffff"

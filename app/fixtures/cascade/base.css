@@ -1,0 +1,28 @@
+/* Linked FIRST. High specificity, so it must win regardless of link order.
+
+   One selector per rule on purpose: a comma-separated selector GROUP is not
+   something this reader parses, and a group that silently matches nothing looks
+   exactly like a rule that lost. Written this way a mistake is loud. */
+#hero {
+  width: 560px;
+  height: 460px;
+  padding: 28px;
+  background: #ffffff;
+  color: #16161d;
+  font-family: system-ui, sans-serif;
+}
+
+#anchor {
+  padding: 20px;
+  background: #ffffff;
+  border-radius: 12px;
+}
+
+/* Equal specificity to the `.swatch` in theme.css, but linked earlier, so
+   theme.css should still win here. Link order is the tie-break, nothing more. */
+.swatch {
+  width: 200px;
+  height: 72px;
+  border-radius: 10px;
+  background: #00ff00;
+}

@@ -5,13 +5,14 @@
 //!
 //! Phases A-D built every stage of this pipeline and tested each one in
 //! isolation: [`ProjectBundle`] loads a project, [`reconcile`] binds persistent
-//! identities to authored elements, and [`RuntimeProjection`] derives runtime
-//! state. None of them had a production caller. The editor started from a
-//! hardcoded starter scene regardless of what was on disk, so "Spool can open
-//! a source-backed project" was true of the types and false of the program.
+//! identities to authored elements, and the engine's own compile turns the
+//! result into the document the editor draws. None of them had a production
+//! caller. The editor started from a hardcoded starter scene regardless of what
+//! was on disk, so "Spool can open a source-backed project" was true of the
+//! types and false of the program.
 //!
 //! This module is the one place that runs the stages in order and hands the
-//! result to the editor. `CanvasView` consumes the outcome; it does not parse
+//! result to the editor. The shell consumes the outcome; it does not parse
 //! anything, so adding a second loader would not be tempting later.
 //!
 //! # The path
@@ -20,8 +21,6 @@
 //! project directory
 //!   -> ProjectBundle::load      (metadata validated, every binding resolved)
 //!   -> source_binding::reconcile (identity confirmed against the authored parse)
-//!   -> RuntimeProjection         (runtime keys and prototype geometry derived)
-//!   -> canvas::Document          (the disposable scene the editor draws)
 //!   -> engine_project::compile   (the engine's own model, for the engine)
 //! ```
 //!
@@ -30,80 +29,54 @@
 //! Authoritative: the HTML/CSS/SVG on disk, and the `lamine.yaml` metadata.
 //! Neither is modified by opening a project.
 //!
-//! Derived and disposable: everything in [`LoadedProject::projection`] and
-//! [`LoadedProject::runtime`]. Drop them and re-open the project and you get
+//! Derived and disposable: the engine's document, and the list of nodes the
+//! engine has no kind for. Drop them and re-open the project and you get
 //! equivalent state. Opening a project never writes anything back.
 //!
-//! # Geometry is still provisional
+//! # The retired runtime is gone
 //!
-//! [`RuntimeProjection`] supplies [`PrototypeGeometry`], a deterministic
-//! placeholder column. No layout engine exists, so a project's real authored
-//! geometry is not read yet. The pipeline is proven; visual fidelity is not,
-//! and nothing here should be read as a claim that it is.
+//! This module used to derive a *second* model of the project — a runtime
+//! document, a visual model, and a projection between the persistent ids and
+//! the runtime's own handles — and hand all three to the editor alongside the
+//! engine's document. The editor drew the runtime document; the engine drew
+//! the engine's. Two models of one project, and the one the user could see was
+//! the one the engine could not save.
+//!
+//! There is now one model. The engine's document is what the editor draws,
+//! what the save path reads, and what a reopen reproduces. The list of nodes
+//! the engine cannot represent survives because it is still a fact about the
+//! project worth saying out loud — but it is answered by the engine's own
+//! kinds now, not by a second parser's.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::canvas::Document;
-use crate::document_runtime_bridge::RuntimeProjection;
 use crate::project_bundle::{BundleError, ProjectBundle};
 use crate::source_binding::{self, BindingError};
 use crate::source_document::PersistentDocument;
 
-/// A project that loaded, bound, and projected successfully.
+/// A project that loaded, bound, and compiled successfully.
 ///
-/// Holds the canonical document beside the derived runtime state so a caller
-/// can persist metadata edits without re-reading the project.
+/// Holds the canonical document beside the engine's document, so a caller can
+/// persist metadata edits without re-reading the project.
 #[derive(Clone, Debug)]
 pub struct LoadedProject {
     /// The directory the project was opened from.
     pub root: PathBuf,
     /// Canonical, source-backed state. This is the only durable truth.
     pub document: PersistentDocument,
-    /// Derived runtime mapping from `NodeId` to `ObjectId`. Disposable.
-    ///
-    /// Read by callers that want to go the other way, from a runtime object back
-    /// to the node it came from, and by the open-path tests.
-    #[allow(dead_code)]
-    pub projection: RuntimeProjection,
-    /// The disposable scene the editor draws and edits. Derived.
-    pub runtime: Document,
-    /// Derived text, style, and layout for each node. Disposable.
-    ///
-    /// The interpretation of the authored source, kept beside the runtime it
-    /// produced so a caller can ask "what did the source say?" instead of
-    /// inferring it from the runtime.
-    #[allow(dead_code)]
-    pub visuals: crate::visual::VisualModel,
-    /// Nodes that bound and drew, but whose paint came from the editor's
-    /// defaults because no authored CSS gave them any.
-    ///
-    /// The visible edge of CSS coverage. Reported rather than hidden, so a
-    /// project that opens with editor-default chrome is visible as such
-    /// instead of looking like the authored design.
-    pub unstyled: Vec<String>,
-    /// Nodes that bound successfully but have no canvas representation yet.
-    ///
-    /// A node is never dropped silently: if its kind is not one the runtime can
-    /// draw, it still exists in `document` and `projection`, and it is counted
-    /// here so the caller can say so.
-    pub unrendered: Vec<String>,
     /// The engine document compiled from the project. Derived and disposable.
     ///
-    /// This is the first thing in the pipeline that speaks the engine's own
-    /// model, and nothing reads it yet: it is produced on open so the claim
-    /// "a real project compiles into an engine document" is true of the running
-    /// program rather than only of a test.
-    ///
-    /// A compile failure is not fatal. A project the path above can open must
-    /// keep opening, so the failure becomes an empty document plus a readable
-    /// line in `engine.unresolved` — see [`crate::engine_project`].
-    // Dead code today, exactly as `projection` and `visuals` were when they
-    // were added: the compile is wired in so that the production open path
-    // produces an engine document, and the reader that will consume it is a
-    // later change. Nothing reads it, so say so rather than pretend otherwise.
-    #[allow(dead_code)]
+    /// This is the document the editor draws, the document the save path reads
+    /// and the document a reopen reproduces. There is no second model beside
+    /// it.
     pub engine: crate::engine_project::EngineProject,
+    /// Nodes that bound successfully but whose kind the engine does not have.
+    ///
+    /// The visible edge of what the editor can show. Reported rather than
+    /// hidden, so a project that opens with a layer the engine cannot draw is
+    /// visible as such instead of looking like the authored design.
+    pub unrendered: Vec<String>,
 }
 
 /// Why a project could not be opened.
@@ -148,10 +121,10 @@ impl From<BundleError> for ProjectOpenError {
     }
 }
 
-/// Open a source-backed project and derive the runtime document for it.
+/// Open a source-backed project and derive the engine document for it.
 ///
-/// This is the single production entry point. `CanvasView::load_project`
-/// calls it; nothing else loads projects.
+/// This is the single production entry point. The shell calls it; nothing else
+/// loads projects.
 pub fn open_project(root: impl AsRef<Path>) -> Result<LoadedProject, ProjectOpenError> {
     // 1. Metadata + authored bytes, with every binding already resolved to
     //    exactly one authored element.
@@ -172,67 +145,36 @@ pub fn open_project(root: impl AsRef<Path>) -> Result<LoadedProject, ProjectOpen
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    let reconciled = source_binding::reconcile(&document.structure, &sources)
-        .map_err(ProjectOpenError::Binding)?;
+    source_binding::reconcile(&document.structure, &sources).map_err(ProjectOpenError::Binding)?;
 
-    // 3. Interpret the authored source into text, style, and layout. This is
-    //    derived and disposable: nothing here is written back to the project.
-    let visuals = crate::visual::build(&reconciled, &document);
+    // 3. Compile the same project into the engine's document model. Additive
+    //    and non-fatal: a project the stages above accepted must not start
+    //    failing because the engine compile cannot represent something in it.
+    let engine = crate::engine_project::compile_or_report(&document, manifest_yaml.as_deref());
 
-    // 4. Derive runtime state. Disposable, and keyed from the reserved range so
-    //    it cannot collide with keys the canvas allocates later.
-    let projection = RuntimeProjection::from_document_with_visuals(&document, None, &visuals);
-    let runtime = Document::from_design_objects(projection.canvas_objects());
-
-    let unstyled: Vec<String> = visuals
-        .unstyled()
-        .iter()
-        .map(|id| id.as_str().to_owned())
-        .collect();
+    // 4. The nodes the engine has no kind for. Derived by asking the engine's
+    //    own compile, so the answer is the engine's and not a second parser's
+    //    idea of what a layer is.
+    let unrendered = crate::engine_project::unrenderable_nodes(&document, manifest_yaml.as_deref());
 
     // 5. A project that binds but draws nothing is reported, not shown blank.
-    //    "Unrendered" means the node survived into the projection and the
-    //    persistent document, but its kind has no canvas representation yet, so
-    //    it is absent from the runtime document. Derived by comparing the two,
-    //    rather than by asking the projection to classify again.
-    let drawn: std::collections::HashSet<&str> = runtime
-        .objects()
-        .iter()
-        .map(|object| object.spool_id.as_str())
-        .collect();
-    let unrendered: Vec<String> = projection
-        .in_hierarchy_order()
-        .iter()
-        .filter(|node| !drawn.contains(node.node_id.as_str()))
-        .map(|node| format!("{} ({})", node.name, node.node_id.as_str()))
-        .collect();
-    if runtime.objects().is_empty() {
+    //    "Unrendered" means the node survived into the document, but its kind
+    //    is not one the engine can represent, so there is nothing to draw.
+    if document.structure.nodes.len() == unrendered.len() {
         return Err(ProjectOpenError::NothingRenderable);
     }
-
-    // 6. Compile the same project into the engine's document model. Additive
-    //    and non-fatal: nothing below reads it yet, and a project the stages
-    //    above accepted must not start failing because the engine compile
-    //    cannot represent something in it.
-    let engine = crate::engine_project::compile_or_report(&document, manifest_yaml.as_deref());
 
     Ok(LoadedProject {
         root,
         document,
-        projection,
-        runtime,
-        visuals,
-        unstyled,
-        unrendered,
         engine,
+        unrendered,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::canvas::{CanvasView, ObjectId};
-    use crate::document_runtime_bridge::PROJECTED_OBJECT_ID_BASE;
     use crate::source_document::NodeId;
 
     fn fixture_root(fixture: &str) -> PathBuf {
@@ -243,6 +185,17 @@ mod tests {
 
     fn node(id: &str) -> NodeId {
         NodeId::new(id).expect("valid fixture id")
+    }
+
+    /// The names of the engine's own nodes, in document order.
+    fn engine_names(project: &LoadedProject) -> Vec<String> {
+        project
+            .engine
+            .document
+            .nodes()
+            .filter(|node| !matches!(node.kind, figcraft_doc::NodeKind::Page { .. }))
+            .map(|node| node.name.clone())
+            .collect()
     }
 
     /// Write a throwaway project into a temp directory.
@@ -307,72 +260,70 @@ mod tests {
     }
 
     #[test]
-    fn identity_survives_projection_and_maps_deterministically() {
+    fn identity_survives_the_compile_and_maps_deterministically() {
         let first = open_project(fixture_root("landing")).expect("landing opens");
         let second = open_project(fixture_root("landing")).expect("landing opens");
 
-        // Re-opening the same project yields the same runtime keys.
-        let ids = |p: &LoadedProject| -> Vec<ObjectId> {
-            p.projection.nodes.iter().map(|n| n.object_id).collect()
-        };
+        // Re-opening the same project yields the same engine nodes.
+        let ids =
+            |p: &LoadedProject| -> Vec<u64> { p.engine.document.ids().map(|id| id.0).collect() };
         assert_eq!(ids(&first), ids(&second));
 
-        // Each persistent node keeps a distinct runtime key, and the reverse
-        // lookup agrees.
-        let mut seen = std::collections::HashSet::new();
-        for node in &first.projection.nodes {
+        // Every persistent node is in the engine's document, under the name the
+        // metadata gave it.
+        for node in &first.document.structure.nodes {
             assert!(
-                seen.insert(node.object_id),
-                "two persistent nodes share runtime key {}",
-                node.object_id.0
-            );
-            assert_eq!(
-                first.projection.object_of(node.object_id),
-                Some(&node.node_id)
-            );
-            assert_eq!(
-                first.projection.identity_of(&node.node_id),
-                Some(node.object_id)
+                !first
+                    .engine
+                    .document
+                    .find_by_name(&node.name, None)
+                    .is_empty(),
+                "node {} is in the engine's document",
+                node.id.as_str()
             );
         }
-        // And that NodeId is the one authored in metadata and markup.
         assert_eq!(
-            first.projection.identity_of(&node("spool-text-headline")),
-            Some(ObjectId(PROJECTED_OBJECT_ID_BASE + 1))
+            crate::engine_project::content_node_count(&first.engine.document),
+            first.document.structure.nodes.len(),
+            "one engine node per persistent node"
+        );
+        // And the headline is the node the metadata named.
+        assert!(
+            !first
+                .engine
+                .document
+                .find_by_name("Headline", None)
+                .is_empty(),
+            "the engine holds the node the metadata named"
         );
     }
 
     #[test]
-    fn projected_keys_stay_clear_of_the_canvas_allocator() {
+    fn the_engines_own_ids_stay_clear_of_the_manifests() {
         let loaded = open_project(fixture_root("landing")).expect("landing opens");
 
-        // Objects the user draws afterwards get keys above every projected key.
-        let mut canvas = loaded.runtime.clone();
-        let drawn = canvas.create_object(
-            crate::canvas::ObjectType::Rectangle,
-            gpui::point(0.0, 0.0),
-            gpui::size(10.0, 10.0),
-            None,
+        // The engine allocates its own ids for nodes it creates, and they have
+        // to be above every id the manifest uses or a created node would be
+        // indistinguishable from an authored one.
+        let highest = loaded
+            .engine
+            .document
+            .ids()
+            .map(|id| id.0)
+            .max()
+            .unwrap_or_default();
+        assert!(
+            loaded.engine.document.next_id().0 > highest,
+            "a node the engine creates must not take an id the manifest uses"
         );
-        for projected in &loaded.projection.nodes {
-            assert_ne!(
-                projected.object_id, drawn.id,
-                "a drawn object collided with a projected key"
-            );
-            assert_eq!(
-                loaded.projection.object_of(drawn.id),
-                None,
-                "a drawn object must not resolve to a persistent node"
-            );
-        }
     }
 
     #[test]
-    fn hierarchy_survives_from_metadata_into_the_runtime_document() {
-        let loaded = open_project(fixture_root("nested")).expect("nested opens");
+    fn hierarchy_survives_from_metadata_into_the_engine_document() {
+        let nested = open_project(fixture_root("nested")).expect("nested opens");
 
         // Persistent hierarchy.
-        let root = &loaded.document.structure.nodes[0];
+        let root = &nested.document.structure.nodes[0];
         assert_eq!(root.id.as_str(), "spool-page-home");
         assert_eq!(root.parent, None);
         assert_eq!(
@@ -381,52 +332,50 @@ mod tests {
             "the authored child order is preserved"
         );
 
-        // Projected hierarchy, in the same order.
-        let projected: Vec<&str> = loaded
-            .projection
-            .in_hierarchy_order()
-            .iter()
-            .map(|n| n.node_id.as_str())
+        // The engine's document holds the same hierarchy, for a project it can
+        // compile. `nested` cannot be compiled — it declares an image — so the
+        // engine's answer is asked of `landing`.
+        let loaded = open_project(fixture_root("landing")).expect("landing opens");
+        let document = &loaded.engine.document;
+        let frame = document
+            .find_by_name("Landing Frame", None)
+            .first()
+            .copied()
+            .expect("the frame is in the engine's document");
+        let children: Vec<String> = document
+            .box_children(document.node(frame).expect("the frame is there"))
+            .map(|(id, _)| document.node(id).expect("a child is there").name.clone())
             .collect();
         assert_eq!(
-            projected,
-            vec!["spool-page-home", "spool-text-title", "spool-image-logo"],
-            "hierarchy order reaches the projection"
+            children,
+            vec!["Headline".to_string(), "Primary CTA".to_string()],
+            "hierarchy order reaches the engine's document"
         );
-
-        // The parent relationship survives into the projection itself.
-        let title = loaded
-            .projection
-            .nodes
-            .iter()
-            .find(|n| n.node_id == node("spool-text-title"))
-            .unwrap();
-        assert_eq!(title.parent, Some(node("spool-page-home")));
     }
 
     #[test]
-    fn the_runtime_document_holds_the_projected_objects() {
+    fn the_engine_document_holds_the_projects_nodes() {
         let loaded = open_project(fixture_root("landing")).expect("landing opens");
 
         // landing declares frame, text, frame: all three are drawable.
         assert!(loaded.unrendered.is_empty(), "landing is fully renderable");
-        assert_eq!(loaded.runtime.objects().len(), 3);
-
-        let objects = loaded.runtime.objects();
-        assert_eq!(objects[0].spool_id, node("spool-frame-root"));
-        assert_eq!(objects[0].name, "Landing Frame");
-        assert_eq!(objects[1].spool_id, node("spool-text-headline"));
-        assert_eq!(objects[2].spool_id, node("spool-cta-primary"));
-        // Order follows the hierarchy, so the parent is first.
-        assert_eq!(objects[0].id, ObjectId(PROJECTED_OBJECT_ID_BASE));
+        assert_eq!(
+            engine_names(&loaded),
+            vec![
+                "Landing Frame".to_string(),
+                "Headline".to_string(),
+                "Primary CTA".to_string()
+            ],
+            "one engine node per persistent node, in hierarchy order"
+        );
     }
 
     #[test]
-    fn a_node_the_runtime_cannot_draw_is_reported_not_dropped() {
+    fn a_node_the_engine_cannot_draw_is_reported_not_dropped() {
         let loaded = open_project(fixture_root("nested")).expect("nested opens");
 
-        // `nested` declares an image, which has no canvas representation yet.
-        // It must survive in the document and be named in `unrendered`.
+        // `nested` declares an image, which the engine has no kind for. It must
+        // survive in the document and be named in `unrendered`.
         assert!(
             loaded
                 .document
@@ -441,73 +390,32 @@ mod tests {
             vec!["Logo (spool-image-logo)".to_string()],
             "the node is reported rather than silently dropped"
         );
-        assert_eq!(
-            loaded.runtime.objects().len(),
-            2,
-            "only drawable nodes reach the runtime document"
+        // The engine refused the whole compile, and said so: a document missing
+        // some of its nodes would look like a project with fewer nodes.
+        assert!(
+            loaded.engine.unresolved[0].contains("did not compile"),
+            "the refusal is reported: {:?}",
+            loaded.engine.unresolved
         );
     }
 
     #[test]
-    fn canvas_view_actually_receives_the_projected_document() {
+    fn the_engine_document_is_what_the_editor_draws() {
         let loaded = open_project(fixture_root("landing")).expect("landing opens");
-        let expected: Vec<NodeId> = loaded
-            .runtime
-            .objects()
-            .iter()
-            .map(|o| o.spool_id.clone())
-            .collect();
 
-        let mut view = CanvasView::new();
-        // Before opening, the canvas is the starter scene, not the project.
-        assert_ne!(
-            view.document_objects().len(),
-            expected.len(),
-            "the blank canvas is not already showing the project"
-        );
-
-        view.load_project(loaded);
-
-        let now: Vec<NodeId> = view
-            .document_objects()
-            .iter()
-            .map(|o| o.spool_id.clone())
-            .collect();
-        assert_eq!(now, expected, "the live canvas holds the projected nodes");
-        assert_eq!(view.persistent_document().structure.nodes.len(), 3);
+        // The engine's document has a page to draw on, and the project's nodes
+        // on it. There is no second model beside it: the runtime document, the
+        // visual model and the projection between them are gone, and what the
+        // editor opens is this.
+        let document = &loaded.engine.document;
         assert!(
-            view.selection().ids().is_empty(),
-            "stale selection was cleared"
+            document.first_page().is_some(),
+            "the engine's document has a page"
         );
-
-        // Hit testing sees the projected objects, so they are really in the
-        // scene rather than merely listed. Children are painted over their
-        // parent, so a point inside the call-to-action resolves to the CTA and
-        // not to the frame behind it.
-        let cta = view
-            .document_objects()
-            .iter()
-            .find(|object| object.spool_id.as_str() == "spool-cta-primary")
-            .expect("the CTA is projected");
-        let inside = gpui::point(
-            cta.position.x + cta.size.width / 2.0,
-            cta.position.y + cta.size.height / 2.0,
-        );
-        assert_eq!(view.runtime_document().hit_test(inside), Some(cta.id));
-    }
-
-    #[test]
-    fn the_blank_document_path_still_works() {
-        // No project requested: the editor keeps its original behaviour.
-        let view = CanvasView::new();
         assert_eq!(
-            view.document_objects().len(),
-            4,
-            "the starter scene remains"
-        );
-        assert!(
-            view.persistent_document().structure.nodes.is_empty(),
-            "no project means no persistent metadata"
+            crate::engine_project::content_node_count(document),
+            3,
+            "and the project's three nodes"
         );
     }
 
@@ -535,7 +443,7 @@ mod tests {
 
     #[test]
     fn a_project_with_nothing_drawable_is_an_error_not_a_blank_canvas() {
-        // Every node binds, but no kind is one the runtime can draw yet. The
+        // Every node binds, but no kind is one the engine can draw yet. The
         // editor must say so rather than showing its starter scene, which
         // would look like the project simply had no content.
         let yaml = "version: 1\nnodes:\n  - id: \"spool-art\"\n    name: \"Art\"\n    kind: \"image\"\n    parent: null\n    file: \"index.html\"\n    selector: \"[data-spool-id=\\\"spool-art\\\"]\"\n    children: []\n";

@@ -351,18 +351,119 @@ impl RenameNode {
     }
 }
 
-// NOTE: this module deliberately has no history type of its own.
+/// The undo history of the persistent document.
+///
+/// One stack, one place. Every entry is a [`RenameNode`], which is the only
+/// mutation the persistent document has that the editor drives: the names in
+/// `lamine.yaml`.
+///
+/// The document's *runtime* history is the engine's, and is not here. The
+/// engine owns the document the user edits, so it owns the undo stack for it;
+/// this is the history of the metadata that sits beside it, and a second
+/// history over the same document would be two answers to "what does undo
+/// mean".
+#[derive(Clone, Debug, Default)]
+pub struct SemanticHistory {
+    undo: Vec<RenameNode>,
+    redo: Vec<RenameNode>,
+}
+
+impl SemanticHistory {
+    /// Commit a rename, and clear the redo branch.
+    ///
+    /// A rename that changes nothing is not recorded: it would open a history
+    /// entry for a document that did not move, and undoing it would be a step
+    /// the user cannot see.
+    ///
+    /// Returns whether anything was recorded.
+    pub fn record(&mut self, rename: RenameNode) -> bool {
+        if rename.before == rename.after {
+            return false;
+        }
+        self.undo.push(rename);
+        self.redo.clear();
+        true
+    }
+
+    /// Whether there is anything to undo.
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+
+    /// Whether there is anything to redo.
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+
+    /// Number of committed renames currently undoable.
+    pub fn undo_len(&self) -> usize {
+        self.undo.len()
+    }
+
+    /// Number of renames currently redoable.
+    pub fn redo_len(&self) -> usize {
+        self.redo.len()
+    }
+
+    /// Undo the most recent rename.
+    ///
+    /// The inverse is replayed, not the rename itself: replaying the rename
+    /// would be a no-op at best and a stale-edit error at worst. A replay that
+    /// fails puts the entry back, so a failed undo loses nothing.
+    pub fn undo(&mut self, document: &mut PersistentDocument) -> Result<bool, ModelError> {
+        let Some(rename) = self.undo.pop() else {
+            return Ok(false);
+        };
+        match rename.inverse().apply(document) {
+            Ok(()) => {
+                self.redo.push(rename);
+                Ok(true)
+            }
+            Err(error) => {
+                self.undo.push(rename);
+                Err(error)
+            }
+        }
+    }
+
+    /// Redo the most recently undone rename.
+    ///
+    /// The mirror of [`SemanticHistory::undo`], with the same promise about a
+    /// failed replay.
+    pub fn redo(&mut self, document: &mut PersistentDocument) -> Result<bool, ModelError> {
+        let Some(rename) = self.redo.pop() else {
+            return Ok(false);
+        };
+        match rename.apply(document) {
+            Ok(()) => {
+                self.undo.push(rename);
+                Ok(true)
+            }
+            Err(error) => {
+                self.redo.push(rename);
+                Err(error)
+            }
+        }
+    }
+}
+
+// NOTE: this module used to have no history type of its own.
 //
 // An earlier `SemanticHistory` lived here, holding `Vec<RenameNode>` stacks.
 // It was a second implementation of the same concept as
 // `crate::operations::SemanticHistory`, and having two types with that name
 // made it unclear which stack an undo belonged to. It had no production
-// caller. History now lives in exactly one place: `crate::operations`.
+// caller.
+//
+// `crate::operations` went with the retired hand-written runtime, and with it
+// the one history it owned. What is here now is the history of the *persistent
+// document* — the names in `lamine.yaml` — which is not the runtime's history
+// and never was: the editor's own document history belongs to the engine,
+// which owns the document the user edits. One history, one place.
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operations::{apply, OperationTarget, SemanticHistory, SemanticOperation};
 
     fn fixture() -> LamineStructure {
         let root = NodeId::new("spool-root-001").unwrap();
@@ -560,7 +661,7 @@ mod tests {
             sources: HashMap::from([("styles.css".into(), ".title { color: red; }\n".into())]),
         };
         // The one and only history implementation, replayed against metadata
-        // alone via the metadata-only target.
+        // alone.
         let mut history = SemanticHistory::default();
         let rename = |before: &str, after: &str| RenameNode {
             id: NodeId::new("spool-child-002").unwrap(),
@@ -569,31 +670,20 @@ mod tests {
         };
         let commit =
             |history: &mut SemanticHistory, document: &mut PersistentDocument, op: RenameNode| {
-                assert!(history.record(SemanticOperation::Rename(op.clone())));
-                apply(
-                    &SemanticOperation::Rename(op),
-                    &mut OperationTarget::Document(document),
-                    crate::canvas::ReplayDirection::Redo,
-                )
-                .expect("the rename applies")
+                assert!(history.record(op.clone()));
+                op.apply(document).expect("the rename applies");
             };
 
         commit(&mut history, &mut document, rename("Title", "Hero"));
         assert_eq!(document.structure.nodes[1].name, "Hero");
         assert_eq!(document.sources["styles.css"], ".title { color: red; }\n");
 
-        assert!(history
-            .undo(&mut OperationTarget::Document(&mut document))
-            .unwrap());
+        assert!(history.undo(&mut document).unwrap());
         assert_eq!(document.structure.nodes[1].name, "Title");
         assert!(history.can_redo());
-        assert!(history
-            .redo(&mut OperationTarget::Document(&mut document))
-            .unwrap());
+        assert!(history.redo(&mut document).unwrap());
         assert_eq!(document.structure.nodes[1].name, "Hero");
-        assert!(history
-            .undo(&mut OperationTarget::Document(&mut document))
-            .unwrap());
+        assert!(history.undo(&mut document).unwrap());
 
         commit(&mut history, &mut document, rename("Title", "Heading"));
         assert!(!history.can_redo(), "a new commit clears the redo branch");

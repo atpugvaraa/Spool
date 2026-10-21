@@ -1,0 +1,16 @@
+/* Linked LAST but LOW specificity. These must NOT override the `#hero` and
+   `#anchor` rules in base.css, even though they are closer in link order. */
+.theme {
+  background: #0000ff;
+  color: #ffffff;
+}
+
+.anchor {
+  background: #0000ff;
+  color: #ffffff;
+}
+
+/* Same specificity as the `.swatch` in base.css, linked later: this one wins. */
+.swatch {
+  background: #ff9500;
+}

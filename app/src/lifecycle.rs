@@ -90,6 +90,21 @@ pub fn menus() -> Vec<Menu> {
 /// finished and put it back.
 pub fn install(cx: &mut App) {
     cx.bind_keys(bindings());
+    // The engine's own keymap, installed as GPUI bindings.
+    //
+    // figcraft's table is the product's keymap: it is the same table the command
+    // palette and the menus are built from, so a shortcut and a menu item cannot
+    // disagree about what a key does. Each binding dispatches a RunCommand
+    // action carrying a figcraft command id, which the shell turns into
+    // `Session::execute`.
+    //
+    // Installed HERE rather than in main.rs, because this is the one place the
+    // application is set up and the one place a test can reach: main.rs does not
+    // run under a test, so bindings installed there would be invisible to the
+    // window-level tests, and the keyboard path would have no end-to-end proof.
+    cx.bind_keys(crate::engine::keymap::bindings(
+        figcraft_engine::keymap::Platform::current(),
+    ));
     cx.set_menus(menus());
     cx.on_action(|_: &Quit, cx| cx.quit());
     cx.on_action(|_: &CloseWindow, cx| {
