@@ -405,7 +405,7 @@ fn clip_to_box(
 ) -> Option<[GPoint<f32>; 2]> {
     let (dx, dy) = (b.x - a.x, b.y - a.y);
     let p = [-dx, dx, -dy, dy];
-    let q = [lo.x - a.x, b.x - hi.x, lo.y - a.y, b.y - hi.y];
+    let q = [a.x - lo.x, hi.x - a.x, a.y - lo.y, hi.y - a.y];
     let (mut u1, mut u2) = (0.0_f32, 1.0_f32);
     for i in 0..4 {
         if p[i].abs() < 1e-9 {
@@ -1236,7 +1236,9 @@ mod tests {
 
     impl Render for LayerView {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            div().size_full().child(
+            // A size of its own, so the layer's bounds are the ones the test
+            // says they are and the camera can be set to match.
+            div().w(px(WINDOW.0)).h(px(WINDOW.1)).child(
                 GuidesLayer::new(self.session.clone(), self.focus.clone(), self.state.clone())
                     .element(),
             )
@@ -1285,20 +1287,20 @@ mod tests {
         let (session, page) = session_with_a_page();
         let (_view, window) = open_layer(cx, session.clone());
         // A press in the left ruler, a drag onto the canvas, and a release.
-        // The pointer lands at page x 800, which is 600 to the right of the
-        // page's origin at the window's centre.
+        // The pointer lands at page x 200: the page's origin is at the
+        // window's centre, which is 600 to the right of the left ruler.
         window.simulate_mouse_down(
             point(px(10.0), px(450.0)),
             MouseButton::Left,
             Modifiers::none(),
         );
         window.simulate_mouse_move(
-            point(px(200.0), px(450.0)),
+            point(px(800.0), px(450.0)),
             MouseButton::Left,
             Modifiers::none(),
         );
         window.simulate_mouse_up(
-            point(px(200.0), px(450.0)),
+            point(px(800.0), px(450.0)),
             MouseButton::Left,
             Modifiers::none(),
         );
@@ -1308,7 +1310,7 @@ mod tests {
             guides[0].vertical,
             "out of the left ruler is a vertical one"
         );
-        assert_eq!(guides[0].offset, 800.0, "where the pointer was let go");
+        assert_eq!(guides[0].offset, 200.0, "where the pointer was let go");
     }
 
     #[gpui::test]
