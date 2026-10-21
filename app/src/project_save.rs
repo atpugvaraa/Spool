@@ -1320,6 +1320,14 @@ impl<'a> AuthoredFiles<'a> {
         else {
             return Ok(StyleTarget::Element { authored: None });
         };
+        // A shorthand the author wrote beside one of its own longhands is not
+        // the value this element has: the longhand wins for the side it names,
+        // and rewriting the shorthand would change the sides the longhand does
+        // not name while leaving the ones it does. The edit is written on the
+        // element instead, where it beats the longhand.
+        if self.a_longhand_wins(&tag, &classes, id.as_deref(), property) {
+            return Ok(StyleTarget::Element { authored: None });
+        }
         let authored = self
             .texts
             .get(name)
@@ -1332,6 +1340,44 @@ impl<'a> AuthoredFiles<'a> {
             range,
             authored,
         })
+    }
+
+    /// Whether one of a property's longhands wins for this element.
+    ///
+    /// The cascade groups a shorthand with the longhands it expands into, so
+    /// `gap` and `row-gap` already compete under one name and the cascade can
+    /// answer that question on its own. The padding's longhands are not in
+    /// that group — the cascade keeps `padding` as one property — so the
+    /// writer asks about them here.
+    fn a_longhand_wins(
+        &self,
+        tag: &str,
+        classes: &[String],
+        id: Option<&str>,
+        property: &str,
+    ) -> bool {
+        let longhands: &[&str] = match property {
+            "padding" => &[
+                "padding-top",
+                "padding-right",
+                "padding-bottom",
+                "padding-left",
+            ],
+            _ => return false,
+        };
+        let sheets: Vec<&Stylesheet> = match self
+            .sheet_names
+            .iter()
+            .map(|name| self.sheets.get(name))
+            .collect::<Option<Vec<_>>>()
+        {
+            Some(sheets) => sheets,
+            // A sheet this save could not read has already refused the edit.
+            None => return false,
+        };
+        longhands
+            .iter()
+            .any(|longhand| cascade::owning_sheet(&sheets, tag, classes, id, longhand).is_some())
     }
 
     /// Which stylesheet owns `property` on this element, by index into
@@ -1357,6 +1403,12 @@ impl<'a> AuthoredFiles<'a> {
         // `ownership_spellings` already lists the spellings a visual property
         // may be authored as; the first one that the cascade reports is the
         // group both of them are answering about.
+        //
+        // The group is asked for by each of its longhands in turn, because the
+        // cascade only ever reports longhands: a sheet that carries `gap` is
+        // reported as carrying `row-gap` and `column-gap`, so asking for `gap`
+        // alone would find no owner and the edit would land on the element even
+        // though the author wrote the value in a rule.
         let sheets: Vec<&Stylesheet> = self
             .sheet_names
             .iter()
@@ -1364,7 +1416,11 @@ impl<'a> AuthoredFiles<'a> {
             .collect::<Option<Vec<_>>>()?;
         ownership_spellings(property)
             .into_iter()
-            .find_map(|spelling| cascade::owning_sheet(&sheets, tag, classes, id, spelling))
+            .find_map(|spelling| {
+                spool_source::css::property_groups(spelling)
+                    .into_iter()
+                    .find_map(|group| cascade::owning_sheet(&sheets, tag, classes, id, &group))
+            })
     }
 
     /// Guard the two ways rewriting a declaration would not mean what it says.
@@ -1479,6 +1535,15 @@ pub fn is_out_of_flow(
 
 /// The stylesheet declaration that wins for `property` on an element, and the
 /// spelling of the property it was written as.
+///
+/// The declaration has to be the one the author wrote *under the name that was
+/// asked for*. The cascade groups a shorthand with its longhands — `gap` and
+/// `row-gap` compete under one name — so asking for `row-gap` can land on the
+/// `gap` declaration that set both axes. Rewriting that declaration with a
+/// single axis's value would change the other axis too, which is not what the
+/// edit said. So the authored spelling has to match: a declaration written as
+/// something else is not this property's declaration, and the edit lands on the
+/// element instead.
 fn winning_declaration(
     stylesheet: &Stylesheet,
     tag: &str,
@@ -1490,8 +1555,9 @@ fn winning_declaration(
         .into_iter()
         .find_map(|spelling| {
             stylesheet
-                .declaration_value_range(tag, classes, id, spelling)
-                .map(|range| (range, spelling.to_owned()))
+                .winner(tag, classes, id, spelling)
+                .filter(|declaration| declaration.property == spelling)
+                .map(|declaration| (declaration.range.clone(), spelling.to_owned()))
         })
 }
 

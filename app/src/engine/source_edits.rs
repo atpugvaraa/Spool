@@ -106,12 +106,42 @@
 //! | text `characters` | the element's own text |
 //! | `node.width` / `node.height` | `width` / `height` |
 //! | `node.transform` | `left` / `top`, or `transform: translate(…)` |
+//! | `node.layout` | `display`, `flex-direction`, `flex-wrap`, `justify-content`, `align-items`, `gap`, `padding-*` |
 //!
 //! The same set the retired runtime wrote, with one addition: a size or a
 //! position the *layout* owns is not compared at all, because the layout
 //! computes it and the source never said it. Writing a computed size into the
 //! source would pin a box the author never sized.
 //!
+//! # The auto layout
+//!
+//! A layout is Owner A, and the source expresses it as a flex container: the
+//! spellings [`spool_source::reader`] compiles are the ones written back, so
+//! that a save followed by a reopen compiles to the same layout.
+//!
+//! | Engine | Authored property |
+//! |---|---|
+//! | the layout's presence | `display: flex` |
+//! | `layout.mode` | `flex-direction: row` / `column` |
+//! | `layout.wrap` | `flex-wrap: wrap` / `nowrap` |
+//! | `layout.main_align` | `justify-content` |
+//! | `layout.cross_align` | `align-items` |
+//! | `layout.gap` and `layout.cross_gap` | `gap`, or `row-gap` and `column-gap` |
+//! | `layout.padding` | `padding` |
+//!
+//! The two gap axes are named by direction in CSS and by role in the engine,
+//! and the two only agree in one direction, so the comparison is made in CSS's
+//! terms: a horizontal layout separates its items with `column-gap` and its
+//! rows with `row-gap`, and a vertical one is the other way round.
+//!
+//! A property the source does not state is *added* rather than changed: a
+//! frame the editor gave an auto layout has no `display: flex` in the source
+//! at all, and without one there is no layout to change.
+//!
+//! The parts of a layout CSS cannot say — a grid, how the wrapped lines share
+//! the free space, the canvas stacking order — belong to `lamine.yaml`, and a
+//! change to one of them is reported rather than written.
+
 //! # What is not compared
 //!
 //! Three cases, each for its own reason:
@@ -132,7 +162,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use figcraft_doc::color::{Color, Paint};
-use figcraft_doc::{Document, Node, NodeId, Sizing};
+use figcraft_doc::{AutoLayout, CrossAlign, Document, LayoutMode, MainAlign, Node, NodeId, Sizing};
 use spool_source::manifest::{Manifest, ManifestError, NodeRecord};
 use spool_source::reader::{self, Read, ReadError};
 
@@ -630,6 +660,7 @@ impl Comparison<'_> {
         self.styles(&key, live_node, base_node);
         self.text(&key, live_node, base_node);
         self.geometry(&key, record, live_node, base_node);
+        self.layout(&key, record, live_node, base_node);
     }
 
     /// A change that could not be written, named after the node it is about.
@@ -833,6 +864,216 @@ impl Comparison<'_> {
         })
     }
 
+    /// Whether the source authored `property` for a node that is **not** a flex
+    /// container.
+    ///
+    /// The reader's diagnostics read differently for the two cases, and the
+    /// difference matters here. For a flex container an unresolved property is
+    /// one the source did *not* author — the engine's own value stands. For a
+    /// node that is not one, an unresolved layout property is one the source
+    /// *did* author: it had no layout to apply to, so it was reported rather
+    /// than dropped. The same list therefore answers two opposite questions,
+    /// and which one it answers depends on the node.
+    fn source_authored_without_a_layout(&self, id: NodeId, property: &str) -> bool {
+        self.read.is_some_and(|read| {
+            read.unresolved_for(id)
+                .any(|unresolved| unresolved.property == property)
+        })
+    }
+
+    /// The auto layout that changed.
+    ///
+    /// A layout is Owner A, and the source expresses it as a flex container.
+    /// The spellings written here are the ones
+    /// [`spool_source::reader`](spool_source::reader) compiles, so a save
+    /// followed by a reopen compiles back to the same layout.
+    ///
+    /// A property the source does not state is *added* rather than changed: a
+    /// frame the editor gave an auto layout has no `display: flex` in the
+    /// source at all, and without one there is no layout to change.
+    fn layout(
+        &mut self,
+        key: &SourceNodeId,
+        record: &NodeRecord,
+        live_node: &Node,
+        base_node: &Node,
+    ) {
+        let live = live_node.layout.as_ref();
+        let base = base_node.layout.as_ref();
+        // A grid is not a flex container. The CSS has no spelling for one, and
+        // the manifest owns it, so nothing is written: a `display: flex` beside
+        // a grid would be a second owner saying the opposite.
+        if live.is_some_and(|live| live.mode == LayoutMode::Grid)
+            || base.is_some_and(|base| base.mode == LayoutMode::Grid)
+        {
+            if live != base {
+                self.report(
+                    record,
+                    "layout",
+                    "a grid auto layout has no CSS spelling; it is authored in \
+                     lamine.yaml, which this editor does not rewrite",
+                );
+            }
+            return;
+        }
+        match (live, base) {
+            // Neither document has a layout: nothing to say.
+            (None, None) => {}
+            // The layout was removed. The source still declares a flex
+            // container, so the layout comes back on a reopen, and taking an
+            // authored declaration out is not something this writer does.
+            (None, Some(_)) => self.report(
+                record,
+                "layout",
+                "the auto layout was removed, but the source still declares a flex \
+                 container, and removing an authored declaration is not something this \
+                 editor does",
+            ),
+            // The layout is new to the source: it has to be added, and `display:
+            // flex` has to be added with it, because without one the source does
+            // not describe a layout at all.
+            (Some(live), None) => {
+                self.style(key, "display", "flex");
+                // What the source will hold once it is a flex container: the
+                // manifest's half of the layout, or the engine's own default.
+                let base = record.layout.clone().unwrap_or_default();
+                self.layout_properties(record, key, live, &base, true);
+            }
+            (Some(live), Some(base)) => self.layout_properties(record, key, live, base, false),
+        }
+    }
+
+    /// The layout's own properties, one at a time.
+    ///
+    /// `source_has_no_layout` says the source does not declare a flex
+    /// container for this node. Then a layout property the source authored
+    /// anyway was inert — it had no layout to apply to — and it becomes live
+    /// the moment `display: flex` is written. It is written again here, or the
+    /// source would end up saying something the editor never asked for.
+    fn layout_properties(
+        &mut self,
+        record: &NodeRecord,
+        key: &SourceNodeId,
+        live: &AutoLayout,
+        base: &AutoLayout,
+        source_has_no_layout: bool,
+    ) {
+        let id = NodeId(record.id);
+        // Asked before anything is written, because the question is about the
+        // source and the writes are about the document.
+        let direction_authored =
+            source_has_no_layout && self.source_authored_without_a_layout(id, "flex-direction");
+        let wrap_authored =
+            source_has_no_layout && self.source_authored_without_a_layout(id, "flex-wrap");
+        let main_align_authored =
+            source_has_no_layout && self.source_authored_without_a_layout(id, "justify-content");
+        let cross_align_authored =
+            source_has_no_layout && self.source_authored_without_a_layout(id, "align-items");
+        let gap_authored = source_has_no_layout
+            && (self.source_authored_without_a_layout(id, "gap")
+                || self.source_authored_without_a_layout(id, "row-gap")
+                || self.source_authored_without_a_layout(id, "column-gap"));
+        let padding_authored = source_has_no_layout
+            && (self.source_authored_without_a_layout(id, "padding")
+                || self.source_authored_without_a_layout(id, "padding-top")
+                || self.source_authored_without_a_layout(id, "padding-right")
+                || self.source_authored_without_a_layout(id, "padding-bottom")
+                || self.source_authored_without_a_layout(id, "padding-left"));
+
+        // The direction the items flow in.
+        if live.mode != base.mode || direction_authored {
+            match live.mode {
+                LayoutMode::Horizontal => self.style(key, "flex-direction", "row"),
+                LayoutMode::Vertical => self.style(key, "flex-direction", "column"),
+                // A grid never reaches here: it has no CSS spelling at all, and
+                // it is reported rather than written.
+                LayoutMode::Grid => {}
+            }
+        }
+
+        // Whether the lines wrap.
+        if live.wrap != base.wrap || wrap_authored {
+            self.style(key, "flex-wrap", if live.wrap { "wrap" } else { "nowrap" });
+        }
+
+        // The alignment along the main axis.
+        if live.main_align != base.main_align || main_align_authored {
+            self.style(key, "justify-content", main_align_keyword(live.main_align));
+        }
+
+        // The alignment across the main axis.
+        if live.cross_align != base.cross_align || cross_align_authored {
+            self.style(key, "align-items", cross_align_keyword(live.cross_align));
+        }
+
+        // The two gap axes. One value says both of them, so it is written when
+        // they agree; when they do not, each axis is written on its own.
+        let (live_column, live_row) = css_gaps(live);
+        let (base_column, base_row) = css_gaps(base);
+        if live_column == live_row {
+            if live_column != base_column || live_row != base_row || gap_authored {
+                self.style(key, "gap", &css_px(live_column));
+            }
+        } else {
+            if live_column != base_column || gap_authored {
+                self.style(key, "column-gap", &css_px(live_column));
+            }
+            if live_row != base_row || gap_authored {
+                self.style(key, "row-gap", &css_px(live_row));
+            }
+        }
+
+        // The padding. One property with four sides, so one declaration: the
+        // shorthand is what the reader compiles, and it is written in the
+        // shortest form that says the same four sides.
+        if live.padding != base.padding || padding_authored {
+            self.style(key, "padding", &padding_value(live.padding));
+        }
+
+        self.layout_without_a_css_spelling(record, live, base);
+    }
+
+    /// The parts of a layout that CSS cannot say.
+    ///
+    /// A grid, how the wrapped lines share the free space, the canvas stacking
+    /// order: these belong to `lamine.yaml`, and the writer does not rewrite
+    /// the metadata's layout. A change to one of them is reported rather than
+    /// written, because writing it would put a second owner on the property.
+    fn layout_without_a_css_spelling(
+        &mut self,
+        record: &NodeRecord,
+        live: &AutoLayout,
+        base: &AutoLayout,
+    ) {
+        let mut inexpressible: Vec<&str> = Vec::new();
+        if live.content_align != base.content_align {
+            inexpressible.push("how the wrapped lines share the free space");
+        }
+        if live.grid_columns != base.grid_columns || live.grid_rows != base.grid_rows {
+            inexpressible.push("the grid's column and row counts");
+        }
+        if live.column_tracks != base.column_tracks || live.row_tracks != base.row_tracks {
+            inexpressible.push("the grid's track sizes");
+        }
+        if live.strokes_included != base.strokes_included {
+            inexpressible.push("whether the frame's own strokes take up space");
+        }
+        if live.reverse_z != base.reverse_z {
+            inexpressible.push("the order the children are painted in");
+        }
+        if inexpressible.is_empty() {
+            return;
+        }
+        self.report(
+            record,
+            "layout",
+            &format!(
+                "{} is authored in lamine.yaml, which this editor does not rewrite",
+                inexpressible.join(", and ")
+            ),
+        );
+    }
+
     /// Whether the layout, rather than the source, decides this node's size.
     fn size_is_layout_owned(&self, node: &Node) -> bool {
         if node.child_layout.sizing_h != Sizing::Fixed
@@ -927,6 +1168,75 @@ fn radii_value(radii: [f64; 4]) -> String {
         lengths(radii[1]),
         lengths(radii[2]),
         lengths(radii[3])
+    )
+}
+
+/// The gap of each CSS axis, for a layout in the mode it has.
+///
+/// CSS names its axes by direction and the engine names them by role, and the
+/// two agree in one direction only: a horizontal layout separates its items
+/// with `column-gap` and its rows with `row-gap`, and a vertical one is the
+/// other way round. The reader compiles it the same way, so this is the one
+/// place the two have to agree.
+///
+/// The first value is the column gap, the second the row gap.
+fn css_gaps(layout: &AutoLayout) -> (f64, f64) {
+    match layout.mode {
+        LayoutMode::Horizontal => (layout.gap, layout.cross_gap),
+        _ => (layout.cross_gap, layout.gap),
+    }
+}
+
+/// `justify-content` for an alignment along the main axis.
+fn main_align_keyword(align: MainAlign) -> &'static str {
+    match align {
+        MainAlign::Min => "flex-start",
+        MainAlign::Center => "center",
+        MainAlign::Max => "flex-end",
+        MainAlign::SpaceBetween => "space-between",
+        MainAlign::SpaceAround => "space-around",
+        MainAlign::SpaceEvenly => "space-evenly",
+    }
+}
+
+/// `align-items` for an alignment across the main axis.
+fn cross_align_keyword(align: CrossAlign) -> &'static str {
+    match align {
+        CrossAlign::Min => "flex-start",
+        CrossAlign::Center => "center",
+        CrossAlign::Max => "flex-end",
+        CrossAlign::Baseline => "baseline",
+    }
+}
+
+/// A length as the author would write it.
+fn css_px(value: f64) -> String {
+    format!("{}px", project_save::css_length(value as f32))
+}
+
+/// The padding as the author would write it.
+///
+/// The shorthand carries one, two, three or four lengths, and each form means
+/// a different set of sides, so the shortest form that says the same four
+/// sides is the one written: `padding: 4px` for a uniform padding and
+/// `padding: 1px 2px 3px 4px` for a mixed one.
+fn padding_value(padding: [f64; 4]) -> String {
+    let [top, right, bottom, left] = padding;
+    if top == right && right == bottom && bottom == left {
+        return css_px(top);
+    }
+    if top == bottom && right == left {
+        return format!("{} {}", css_px(top), css_px(right));
+    }
+    if right == left {
+        return format!("{} {} {}", css_px(top), css_px(right), css_px(bottom));
+    }
+    format!(
+        "{} {} {} {}",
+        css_px(top),
+        css_px(right),
+        css_px(bottom),
+        css_px(left)
     )
 }
 
@@ -1254,6 +1564,379 @@ mod tests {
         assert_eq!(
             projected.structure, project.document.structure,
             "an untouched project projects onto itself"
+        );
+    }
+
+    // ── The auto layout ────────────────────────────────────────────────────
+    //
+    // The layout is Owner A: the source expresses it as a flex container, and
+    // the save has to write back the same spellings the reader compiles. These
+    // cases are the round trip, because a layout that is not written back is a
+    // layout that is gone on the next open.
+
+    /// The metadata of the layout fixture: a frame with one child.
+    const LAYOUT_METADATA: &str = r#"version: 2
+nodes:
+  - id: 1
+    key: spool-frame-hero
+    name: Hero
+    kind: frame
+    children:
+      - 2
+    binding:
+      file: index.html
+      selector: "[data-spool-id=\"spool-frame-hero\"]"
+  - id: 2
+    key: spool-frame-label
+    name: Label
+    kind: frame
+    parent: 1
+    binding:
+      file: index.html
+      selector: "[data-spool-id=\"spool-frame-label\"]"
+color_profile: srgb
+"#;
+
+    /// The markup of the layout fixture.
+    const LAYOUT_MARKUP: &str = r#"<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div id="hero" data-spool-id="spool-frame-hero">
+      <div id="label" data-spool-id="spool-frame-label"></div>
+    </div>
+  </body>
+</html>
+"#;
+
+    /// A stylesheet with no flex container in it.
+    const NO_LAYOUT_CSS: &str = "\
+#hero { width: 320px; height: 200px; }
+#label { position: absolute; left: 20px; top: 30px; width: 80px; height: 40px; }
+";
+
+    /// A stylesheet whose frame is a flex container.
+    const FLEX_CSS: &str = "\
+#hero { display: flex; flex-direction: row; gap: 10px; padding: 10px; width: 320px; height: 200px; }
+#label { position: absolute; left: 20px; top: 30px; width: 80px; height: 40px; }
+";
+
+    /// A throwaway project with the fixture's markup and a stylesheet of our own.
+    ///
+    /// Written rather than copied from a fixture, because the point of these
+    /// cases is one declaration in one file, and a committed fixture that
+    /// carried a layout would carry it into every case.
+    fn layout_project(name: &str, css: &str) -> PathBuf {
+        let to = std::env::temp_dir().join(format!(
+            "spool-layout-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&to);
+        std::fs::create_dir_all(&to).expect("create project");
+        std::fs::write(to.join("lamine.yaml"), LAYOUT_METADATA).expect("write metadata");
+        std::fs::write(to.join("index.html"), LAYOUT_MARKUP).expect("write html");
+        std::fs::write(to.join("styles.css"), css).expect("write css");
+        to
+    }
+
+    /// Compile the project, run one engine command, save, and compile again.
+    ///
+    /// The last compile is the point: it is what a reopen sees, so the layout
+    /// it holds has to be the layout the editor was showing.
+    fn save_and_recompile(
+        root: &Path,
+        command: &str,
+        params: serde_json::Value,
+    ) -> (Document, Document) {
+        let project = read_project(root).expect("the project reads");
+        let read = reader::read_with_diagnostics(&project.manifest, &project.sources)
+            .expect("the source compiles");
+        let mut session = figcraft_engine::Session::with_document(read.document);
+        session
+            .execute(command, &params)
+            .expect("the engine accepts the command");
+        let live = session.doc().expect("the engine's document").clone();
+        let outcome = save_engine_document(root, &live).expect("the save succeeds");
+        assert!(outcome.unsupported.is_empty(), "{:?}", outcome.unsupported);
+        assert!(outcome.notes.is_empty(), "{:?}", outcome.notes);
+
+        let project = read_project(root).expect("the project reads again");
+        let read = reader::read_with_diagnostics(&project.manifest, &project.sources)
+            .expect("the saved source compiles");
+        (live, read.document)
+    }
+
+    /// The layout of one node, in the document the editor was showing.
+    fn live_layout(document: &Document, id: NodeId) -> AutoLayout {
+        document
+            .node(id)
+            .and_then(|node| node.layout.clone())
+            .expect("the frame has an auto layout")
+    }
+
+    /// The layout of one node, in the document the source compiles to.
+    fn recompiled_layout(document: &Document, id: NodeId) -> AutoLayout {
+        document
+            .node(id)
+            .and_then(|node| node.layout.clone())
+            .expect("the recompiled frame has an auto layout")
+    }
+
+    #[test]
+    fn an_added_auto_layout_is_written_back_to_the_source() {
+        // The bug this whole file exists for: the panel adds an auto layout,
+        // the save says there is nothing to write, and the layout is gone on
+        // the next open.
+        let root = layout_project("add", NO_LAYOUT_CSS);
+        let (live, recompiled) =
+            save_and_recompile(&root, "layout.add", serde_json::json!({ "ids": [1] }));
+
+        let live_layout = live_layout(&live, NodeId(1));
+        let recompiled = recompiled_layout(&recompiled, NodeId(1));
+        assert_eq!(
+            recompiled, live_layout,
+            "the layout the source compiles to is the layout the editor was showing"
+        );
+
+        let html = std::fs::read_to_string(root.join("index.html")).expect("read html");
+        assert!(
+            html.contains("display: flex"),
+            "the source says the frame is a flex container now: {html}"
+        );
+    }
+
+    #[test]
+    fn a_changed_auto_layout_is_changed_in_place() {
+        // The same round trip for a project that already says `display: flex`.
+        // The change is made in the declaration the author wrote, not by adding
+        // a second one beside it.
+        let root = layout_project("change", FLEX_CSS);
+        let (live, recompiled) = save_and_recompile(
+            &root,
+            "node.set",
+            serde_json::json!({ "ids": [1], "props": { "layout": "vertical" } }),
+        );
+
+        let live_layout = live_layout(&live, NodeId(1));
+        let recompiled = recompiled_layout(&recompiled, NodeId(1));
+        assert_eq!(
+            recompiled, live_layout,
+            "the layout the source compiles to is the layout the editor was showing"
+        );
+
+        let css = std::fs::read_to_string(root.join("styles.css")).expect("read css");
+        assert!(
+            css.contains("flex-direction: column"),
+            "the declaration the author wrote was changed: {css}"
+        );
+        assert_eq!(
+            css.matches("display: flex").count(),
+            1,
+            "the flex container is not declared twice: {css}"
+        );
+        assert_eq!(
+            css.matches("flex-direction").count(),
+            1,
+            "the direction is not declared twice: {css}"
+        );
+    }
+
+    #[test]
+    fn a_changed_auto_layout_writes_the_gaps_and_the_padding() {
+        // The gap and the padding are the two numbers the panel shows, and both
+        // have to survive the round trip.
+        let root = layout_project("numbers", FLEX_CSS);
+        let (live, recompiled) = save_and_recompile(
+            &root,
+            "node.set",
+            serde_json::json!({
+                "ids": [1],
+                "props": { "gap": 24.0, "padding": [1.0, 2.0, 3.0, 4.0] }
+            }),
+        );
+
+        let live_layout = live_layout(&live, NodeId(1));
+        let recompiled = recompiled_layout(&recompiled, NodeId(1));
+        assert_eq!(
+            recompiled, live_layout,
+            "the layout the source compiles to is the layout the editor was showing"
+        );
+        assert_eq!(live_layout.gap, 24.0);
+        assert_eq!(live_layout.padding, [1.0, 2.0, 3.0, 4.0]);
+
+        let css = std::fs::read_to_string(root.join("styles.css")).expect("read css");
+        assert!(
+            css.contains("padding: 1px 2px 3px 4px"),
+            "the padding the author wrote was changed: {css}"
+        );
+        // The gap is two axes, and one shorthand cannot say two different
+        // gaps, so the axis that changed is written as the longhand it is.
+        let html = std::fs::read_to_string(root.join("index.html")).expect("read html");
+        assert!(
+            html.contains("column-gap: 24px"),
+            "the axis that changed was written: {html}"
+        );
+    }
+
+    #[test]
+    fn the_padding_spellings_round_trip_exactly() {
+        // Every form the shorthand can take, and the mixed one that needs all
+        // four sides spelled out.
+        for padding in [
+            [4.0, 4.0, 4.0, 4.0],
+            [4.0, 8.0, 4.0, 8.0],
+            [1.0, 2.0, 3.0, 4.0],
+        ] {
+            let root = layout_project("padding", FLEX_CSS);
+            let (live, recompiled) = save_and_recompile(
+                &root,
+                "node.set",
+                serde_json::json!({
+                    "ids": [1],
+                    "props": { "padding": padding }
+                }),
+            );
+            let live_layout = live_layout(&live, NodeId(1));
+            let recompiled = recompiled_layout(&recompiled, NodeId(1));
+            assert_eq!(
+                recompiled.padding, live_layout.padding,
+                "the padding {padding:?} round trips exactly"
+            );
+            assert_eq!(live_layout.padding, padding);
+        }
+    }
+
+    #[test]
+    fn a_second_save_after_a_layout_writes_nothing() {
+        // The save has to converge: the layout that was written back is the
+        // layout the source now says, so the next comparison finds nothing to
+        // change and the CSS does not grow on every save.
+        let root = layout_project("converge", NO_LAYOUT_CSS);
+        let (live, _) = save_and_recompile(&root, "layout.add", serde_json::json!({ "ids": [1] }));
+        let project = read_project(&root).expect("the project reads");
+        let read = reader::read_with_diagnostics(&project.manifest, &project.sources)
+            .expect("the saved source compiles");
+        let edits = edits(&live, &project);
+        assert!(
+            edits.edits.is_empty(),
+            "the layout is in the source now, so there is nothing to write: {:?}",
+            edits.edits
+        );
+        assert!(edits.unsupported.is_empty(), "{:?}", edits.unsupported);
+        // And the source the first save wrote compiles to the same layout.
+        let recompiled = read
+            .document
+            .node(NodeId(1))
+            .and_then(|node| node.layout.clone())
+            .expect("the recompiled frame has an auto layout");
+        assert_eq!(recompiled, live_layout(&live, NodeId(1)));
+    }
+
+    #[test]
+    fn a_grid_layout_is_reported_rather_than_written() {
+        // A grid has no CSS spelling. The manifest owns it, and the writer
+        // does not rewrite the manifest's layout, so the change is reported
+        // rather than turned into a flex container that says the opposite.
+        let root = layout_project("grid", NO_LAYOUT_CSS);
+        let (project, mut document) = project_and_document(&root);
+        let hero = engine_id(&project, "spool-frame-hero");
+        let mut layout = AutoLayout::default();
+        layout.mode = LayoutMode::Grid;
+        document.node_mut(hero).expect("the hero is there").layout = Some(layout);
+
+        let edits = edits(&document, &project);
+        assert!(
+            edits.edits.is_empty(),
+            "a grid is not written into CSS: {:?}",
+            edits.edits
+        );
+        assert_eq!(edits.unsupported.len(), 1, "{:?}", edits.unsupported);
+        assert!(
+            edits.unsupported[0].reason.contains("grid"),
+            "{}",
+            edits.unsupported[0].reason
+        );
+    }
+
+    #[test]
+    fn a_removed_layout_is_reported_rather_than_lost_silently() {
+        // The other direction. The source still declares a flex container, so
+        // the layout comes back on a reopen — and the writer cannot take an
+        // authored declaration out, so it says so.
+        let root = layout_project("removed", FLEX_CSS);
+        let (project, mut document) = project_and_document(&root);
+        let hero = engine_id(&project, "spool-frame-hero");
+        document.node_mut(hero).expect("the hero is there").layout = None;
+
+        let edits = edits(&document, &project);
+        assert!(
+            edits.edits.is_empty(),
+            "a layout cannot be taken out of the source: {:?}",
+            edits.edits
+        );
+        assert_eq!(edits.unsupported.len(), 1, "{:?}", edits.unsupported);
+        assert!(
+            edits.unsupported[0]
+                .reason
+                .contains("auto layout was removed"),
+            "{}",
+            edits.unsupported[0].reason
+        );
+    }
+
+    #[test]
+    fn a_project_with_no_layout_produces_no_layout_edit() {
+        // The common case: nothing about the layout changed, so the source is
+        // not churned.
+        let root = layout_project("none", NO_LAYOUT_CSS);
+        let (project, document) = project_and_document(&root);
+        let edits = edits(&document, &project);
+        assert!(
+            edits.edits.is_empty(),
+            "a project nobody edited produces no edits: {:?}",
+            edits.edits
+        );
+        assert!(edits.unsupported.is_empty(), "{:?}", edits.unsupported);
+    }
+
+    #[test]
+    fn an_added_auto_layout_asks_for_the_properties_that_changed() {
+        // The edits themselves, so a failure says which property was wrong
+        // rather than only that the round trip broke.
+        let root = layout_project("edits", NO_LAYOUT_CSS);
+        let (project, mut document) = project_and_document(&root);
+        let hero = engine_id(&project, "spool-frame-hero");
+        let layout = AutoLayout {
+            mode: LayoutMode::Vertical,
+            wrap: true,
+            gap: 12.0,
+            cross_gap: 6.0,
+            padding: [1.0, 2.0, 3.0, 4.0],
+            main_align: MainAlign::SpaceBetween,
+            cross_align: CrossAlign::Center,
+            ..AutoLayout::default()
+        };
+        document.node_mut(hero).expect("the hero is there").layout = Some(layout);
+
+        let edits = edits(&document, &project);
+        let styles = styles_for(&edits, "spool-frame-hero");
+        assert_eq!(
+            styles,
+            vec![
+                ("display".to_owned(), "flex".to_owned()),
+                ("flex-direction".to_owned(), "column".to_owned()),
+                ("flex-wrap".to_owned(), "wrap".to_owned()),
+                ("justify-content".to_owned(), "space-between".to_owned()),
+                ("align-items".to_owned(), "center".to_owned()),
+                ("column-gap".to_owned(), "6px".to_owned()),
+                ("row-gap".to_owned(), "12px".to_owned()),
+                ("padding".to_owned(), "1px 2px 3px 4px".to_owned()),
+            ],
+            "one edit per property the layout owns"
         );
     }
 }

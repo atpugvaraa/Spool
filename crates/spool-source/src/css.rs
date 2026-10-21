@@ -175,7 +175,11 @@ impl Declaration {
 /// rewrites them one longhand at a time.
 ///
 /// Every other supported property is its own group.
-fn property_groups(property: &str) -> Vec<String> {
+///
+/// Public because a writer has to ask the same question the cascade asked: a
+/// declaration asked for by the name of its group is the declaration that owns
+/// it, whichever spelling the author wrote.
+pub fn property_groups(property: &str) -> Vec<String> {
     match property {
         "background" | "background-color" => vec!["background-color".to_owned()],
         "gap" => vec!["row-gap".to_owned(), "column-gap".to_owned()],
@@ -493,9 +497,7 @@ impl Stylesheet {
     /// Selectors are not exposed: what a stylesheet declares is only meaningful
     /// against an element, and [`Stylesheet::resolve`] is how it is asked.
     pub fn declarations(&self) -> impl Iterator<Item = &Declaration> {
-        self.rules
-            .iter()
-            .flat_map(|rule| rule.declarations.iter())
+        self.rules.iter().flat_map(|rule| rule.declarations.iter())
     }
 
     /// Every declaration that wins for one computed longhand on one element,
