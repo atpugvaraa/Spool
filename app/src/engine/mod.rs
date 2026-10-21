@@ -58,4 +58,7 @@ pub mod palette;
 pub mod panel_components;
 pub mod panel_effects;
 pub mod panel_export;
+pub mod panel_typography;
+pub mod panel_colorpicker;
+pub mod panel_styles;
 pub mod source_edits;
