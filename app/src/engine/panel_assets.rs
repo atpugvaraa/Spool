@@ -832,7 +832,7 @@ fn scale_row<T: AssetsHost>(model: &AssetsModel, cx: &mut Context<T>) -> AnyElem
     };
     let value_selector = format!("assets-scale-value-{shown}");
     let mut column = div().flex().flex_col().gap_1();
-    let mut row = div()
+    let row = div()
         .id(SharedString::from("assets-scale"))
         .debug_selector(|| "assets-scale".to_owned())
         .flex()
@@ -862,55 +862,52 @@ fn scale_row<T: AssetsHost>(model: &AssetsModel, cx: &mut Context<T>) -> AnyElem
     };
     let mut modes = div().flex().items_center().gap_1();
     let has_image = image.is_some();
-    match image {
-        Some(image) => {
-            for mode in MODES {
-                let current = model.mode.value() == Some(&mode);
-                let ids = model.ids.clone();
-                let name = image.clone();
-                let chip = div()
-                    .id(SharedString::from(format!(
-                        "assets-mode-{}",
-                        mode_name(mode)
-                    )))
-                    .debug_selector(move || format!("assets-mode-{}", mode_name(mode)))
-                    .px(px(8.0))
-                    .py(px(4.0))
-                    .rounded_md()
-                    .bg(rgb(if current {
-                        theme::ACCENT_WASH
-                    } else {
-                        theme::SURFACE
-                    }))
-                    .border_1()
-                    .border_color(rgb(if current {
-                        theme::ACCENT
-                    } else {
-                        theme::BORDER_SOFT
-                    }))
-                    .text_xs()
-                    .text_color(rgb(if current {
-                        theme::TEXT
-                    } else {
-                        theme::TEXT_SECONDARY
-                    }))
-                    .hover(|style| style.bg(rgb(theme::SURFACE_HOVER)))
-                    .cursor_pointer()
-                    .child(mode_label(mode))
-                    .on_click(cx.listener(move |host, _event, _window, cx| {
-                        host.run_assets_action(
-                            AssetsAction::SetMode {
-                                ids: ids.clone(),
-                                image: name.clone(),
-                                mode,
-                            },
-                            cx,
-                        );
-                    }));
-                modes = modes.child(chip);
-            }
+    if let Some(image) = image {
+        for mode in MODES {
+            let current = model.mode.value() == Some(&mode);
+            let ids = model.ids.clone();
+            let name = image.clone();
+            let chip = div()
+                .id(SharedString::from(format!(
+                    "assets-mode-{}",
+                    mode_name(mode)
+                )))
+                .debug_selector(move || format!("assets-mode-{}", mode_name(mode)))
+                .px(px(8.0))
+                .py(px(4.0))
+                .rounded_md()
+                .bg(rgb(if current {
+                    theme::ACCENT_WASH
+                } else {
+                    theme::SURFACE
+                }))
+                .border_1()
+                .border_color(rgb(if current {
+                    theme::ACCENT
+                } else {
+                    theme::BORDER_SOFT
+                }))
+                .text_xs()
+                .text_color(rgb(if current {
+                    theme::TEXT
+                } else {
+                    theme::TEXT_SECONDARY
+                }))
+                .hover(|style| style.bg(rgb(theme::SURFACE_HOVER)))
+                .cursor_pointer()
+                .child(mode_label(mode))
+                .on_click(cx.listener(move |host, _event, _window, cx| {
+                    host.run_assets_action(
+                        AssetsAction::SetMode {
+                            ids: ids.clone(),
+                            image: name.clone(),
+                            mode,
+                        },
+                        cx,
+                    );
+                }));
+            modes = modes.child(chip);
         }
-        None => {}
     }
     column = column.child(row);
     // The chips go under the row, not beside the value: the Inspector's
