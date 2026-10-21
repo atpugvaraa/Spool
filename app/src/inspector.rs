@@ -54,8 +54,8 @@
 //! lives in [`Inspector::availability`], not in each row.
 
 use gpui::{
-    div, prelude::*, px, rgb, AnyElement, Context, Div, Entity, FontWeight, IntoElement,
-    MouseButton, Render, SharedString, Stateful, Window,
+    div, prelude::*, px, rgb, AnyElement, App, Context, Div, Entity, FontWeight, IntoElement,
+    Modifiers, MouseButton, Render, SharedString, Stateful, Window,
 };
 use serde_json::Value as JsonValue;
 
@@ -1585,7 +1585,14 @@ impl Inspector {
         // The effects section is an ENTITY, because a field being typed into
         // needs a focus handle and the keyboard. It is built here, once, from the
         // same engine canvas this panel reads.
-        self.effects = Some(cx.new(|cx| EffectsPanel::new(engine.clone(), cx)));
+        let effects = cx.new(|cx| EffectsPanel::new(engine.clone(), cx));
+        // The effects section is its own entity, so a field opening in it is
+        // not a change this panel is told about — unless it observes it. The
+        // claim on the keyboard is read from this panel's own state, so the
+        // panel has to know when the effects section opens a field.
+        let observation = cx.observe(&effects, |_, _, cx| cx.notify());
+        self.observations.push(observation);
+        self.effects = Some(effects);
         self.engine = Some(engine);
         cx.notify();
     }
@@ -1602,10 +1609,26 @@ impl Inspector {
     /// to name it by, and a request in a form the engine cannot answer is not
     /// a rename of some other layer.
     pub fn open_rename(&mut self, id: model::EngineObjectId, cx: &mut Context<Self>) {
+        // Closing the others first is what makes the interaction states
+        // mutually exclusive: a rename, a typed number and a panel's field are
+        // different things to be doing, and the Escape ladder above them is
+        // simpler when at most one of them can be true.
+        self.cancel_in_flight(cx);
         let Some(name) = self.name_of(id, cx) else {
             return;
         };
         self.rename = Some(RenameSession::replacing(id, name));
+    }
+
+    /// Open a rename on the layer the engine has selected.
+    ///
+    /// The engine's selection is the only selection there is, so a rename
+    /// asked for from the keyboard names the layer the user is looking at.
+    pub fn open_rename_for_the_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.selection(cx).first().copied() else {
+            return;
+        };
+        self.open_rename(id, cx);
     }
 
     /// Which layer the engine is renaming, if any.
@@ -1635,6 +1658,56 @@ impl Inspector {
             || self.assets_state.borrow().is_busy()
             || self.devmode_state.borrow().is_busy()
             || self.a11y_state.borrow().is_busy()
+            // The Variables section's field and the Prototype tab's. They are
+            // text buffers like any other, and the ladder has to know.
+            || self.variables_state.borrow().is_busy()
+            || self.prototyping_state.borrow().is_busy()
+    }
+
+    /// Whether a text field is open somewhere in the Inspector.
+    ///
+    /// The question the keyboard asks. A character typed into an open field is
+    /// a character and not an editor shortcut, and the engine's keymap binds
+    /// letters that are tool shortcuts — so the shell's key gate asks this
+    /// before it lets a shortcut run, and the canvas asks it before it
+    /// answers a key as a gesture.
+    ///
+    /// Every panel that owns a field answers it, and it is one question so
+    /// that the gate and the canvas cannot disagree about what "a field is
+    /// open" means. A panel with a field of its own — the Effects section, the
+    /// Comments search — answers through the surface that holds it.
+    pub fn has_text_field(&self, window: &Window, cx: &App) -> bool {
+        self.edit.is_some()
+            || self.rename.is_some()
+            || self.export_state.borrow().is_busy()
+            || self.styles_state.borrow().is_busy()
+            || self.typography_state.borrow().is_busy()
+            || self.color_state.borrow().is_busy()
+            || self.assets_state.borrow().is_busy()
+            || self.devmode_state.borrow().is_busy()
+            || self.a11y_state.borrow().is_busy()
+            || self.variables_state.borrow().is_busy()
+            || self.prototyping_state.borrow().is_busy()
+            || self.comments_state.borrow().is_searching(window)
+            || self
+                .effects
+                .as_ref()
+                .is_some_and(|effects| effects.read(cx).is_editing())
+    }
+
+    /// Tell the canvas who owns the keyboard.
+    ///
+    /// The canvas answers keys as the engine's gestures, so it is the one
+    /// surface that has to be told when a text field wants the keyboard
+    /// instead. The render is where the answer is known: every panel that
+    /// owns a field notifies the Inspector when it opens one, and the
+    /// Inspector is what draws them.
+    fn claim_the_keyboard(&self, window: &Window, cx: &mut Context<Self>) {
+        let Some(engine) = self.engine.clone() else {
+            return;
+        };
+        let claimed = self.has_text_field(window, cx);
+        engine.update(cx, |canvas, cx| canvas.set_keyboard_claimed(claimed, cx));
     }
 
     /// Give up whatever the Inspector is part-way through.
@@ -1698,6 +1771,23 @@ impl Inspector {
             cx.notify();
             return true;
         }
+        // The Variables section's draft and the Prototype tab's. Guarded, so
+        // that giving up a field that was never open does not close a menu
+        // the user opened on purpose.
+        if self.variables_state.borrow().is_busy() {
+            let cancelled = self.variables_state.borrow_mut().cancel();
+            if cancelled {
+                cx.notify();
+                return true;
+            }
+        }
+        if self.prototyping_state.borrow().is_busy() {
+            let cancelled = self.prototyping_state.borrow_mut().cancel();
+            if cancelled {
+                cx.notify();
+                return true;
+            }
+        }
         false
     }
 
@@ -1712,10 +1802,21 @@ impl Inspector {
     /// belongs to the editor's ladder, which walks down from the topmost thing,
     /// and a text buffer that answered it first would make the rung it belongs
     /// to depend on which listener saw the key first.
-    pub fn handle_key(&mut self, key: &str, shift: bool, cx: &mut Context<Self>) -> bool {
+    pub fn handle_key(&mut self, key: &str, modifiers: Modifiers, cx: &mut Context<Self>) -> bool {
         if key == "escape" {
             return false;
         }
+        // A CHORD IS NOT A CHARACTER.
+        //
+        // `⌘Z` is undo and `⌘B` is bold: they are editor chords, and a field
+        // that took one as text would type a `z` into a colour code. So a
+        // keystroke with a command, control or alt key on it is not claimed
+        // here — it belongs to whatever answers chords, and the editor's own
+        // table is the one that does.
+        if modifiers.platform || modifiers.control || modifiers.alt {
+            return false;
+        }
+        let shift = modifiers.shift;
         // The Export section's own text fields: a size, a suffix or a bleed
         // being typed. The section owns the buffer; the Inspector routes the key
         // to it and runs the change it asks for.
@@ -1771,6 +1872,25 @@ impl Inspector {
             let action = self.color_state.borrow_mut().handle_key(key);
             if let Some(action) = action {
                 self.run_color_action(action, cx);
+            }
+            cx.notify();
+            return true;
+        }
+        // The Variables section's own field, and the Prototype tab's. They are
+        // text buffers like any other, and the key the user types has to reach
+        // them rather than the editor's shortcuts.
+        if self.variables_state.borrow().is_busy() {
+            let action = self.variables_state.borrow_mut().handle_key(key);
+            if let Some(action) = action {
+                self.run_variables_action(action, cx);
+            }
+            cx.notify();
+            return true;
+        }
+        if self.prototyping_state.borrow().is_busy() {
+            let action = self.prototyping_state.borrow_mut().handle_key(key);
+            if let Some(action) = action {
+                self.run_proto_action(action, cx);
             }
             cx.notify();
             return true;
@@ -1925,6 +2045,21 @@ impl Inspector {
                 .shown(state.padding_horizontal, Property::PaddingHorizontal.spec()),
             NumberWords::layout().shown(state.padding_vertical, Property::PaddingVertical.spec()),
         ]
+    }
+
+    /// The text in the colour picker's open field, if one is open.
+    ///
+    /// For the window-level tests: the buffer the user is typing into, read the
+    /// way the user reads it — the characters, in order. A field that shows
+    /// `d9770` because the last keystroke was eaten is a field that lost a
+    /// character, and no other reading of the state would show it.
+    #[cfg(test)]
+    pub fn test_color_draft(&self) -> Option<String> {
+        self.color_state
+            .borrow()
+            .draft
+            .as_ref()
+            .map(|draft| draft.text.clone())
     }
 
     /// The box of one layer, in the frame the layer is in.
@@ -2565,13 +2700,16 @@ impl ComponentsHost for Inspector {
 }
 
 impl Render for Inspector {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::diagnostics::count("inspector_build", 1);
         let start = crate::diagnostics::start();
         let selected = self.selected(cx);
         crate::diagnostics::record("inspector_projection", start);
         crate::diagnostics::count("inspector_objects_copied", selected.len() as u64);
         self.reconcile(&selected);
+        // The canvas answers keys as the engine's gestures, so it is the one
+        // surface that has to be told when a field wants the keyboard.
+        self.claim_the_keyboard(window, cx);
 
         let body = match self.tab {
             1 => self.prototype_body(cx),
@@ -3880,6 +4018,9 @@ impl Inspector {
                         "{}-color-trigger",
                         property.slug()
                     )))
+                    // A test looks the trigger up by name, the way it looks the
+                    // picker's fields up. A no-op in a release build.
+                    .debug_selector(|| format!("{}-color-trigger", property.slug()))
                     .flex()
                     .items_center()
                     .gap_1()
@@ -4181,6 +4322,16 @@ fn ai_body() -> AnyElement {
 // ═══════════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════
+
+/// The Inspector's text fields, in a real window.
+///
+/// A field is a keyboard thing, and a keyboard thing is only visible in a
+/// window: whether a keystroke reaches the field depends on which node holds
+/// the focus and on whether a key binding claimed the key before any
+/// `on_key_down` ran. A unit test holds the `Window` that would do that work
+/// and never lets it, so it cannot see the defect.
+#[cfg(test)]
+mod field_tests;
 
 #[cfg(test)]
 mod tests {

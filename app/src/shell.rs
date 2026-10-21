@@ -619,9 +619,10 @@ impl AppShell {
             self.handle_new_project_key(key, cx);
             return;
         }
-        if self.inspector.update(cx, |inspector, cx| {
-            inspector.handle_key(key, modifiers.shift, cx)
-        }) {
+        if self
+            .inspector
+            .update(cx, |inspector, cx| inspector.handle_key(key, modifiers, cx))
+        {
             return;
         }
         if key == "escape" {
@@ -684,6 +685,18 @@ impl AppShell {
     #[cfg(test)]
     pub fn engine_canvas(&self) -> &Entity<crate::engine::canvas::EngineCanvas> {
         &self.engine_canvas
+    }
+
+    /// The Inspector entity, for the window-level interaction tests.
+    #[cfg(test)]
+    pub fn inspector(&self) -> &Entity<inspector::Inspector> {
+        &self.inspector
+    }
+
+    /// The layers panel entity, for the window-level interaction tests.
+    #[cfg(test)]
+    pub fn engine_layers(&self) -> &Entity<crate::engine::layers::LayersPanel> {
+        &self.engine_layers
     }
 
     /// Whether the engine's tool in effect is `tool`, for the tests.
@@ -1638,7 +1651,7 @@ impl Render for AppShell {
             .on_action({
                 let engine_canvas = self.engine_canvas.clone();
                 let inspector = self.inspector.clone();
-                move |action: &crate::engine::keymap::RunCommand, _window, cx| {
+                move |action: &crate::engine::keymap::RunCommand, window, cx| {
                     let id = action.id.clone();
                     let params = action.params.clone();
                     // A TEXT SESSION IS ABOVE THE CANVAS.
@@ -1664,6 +1677,26 @@ impl Render for AppShell {
                         cx.propagate();
                         return;
                     }
+                    // A TEXT FIELD IS ABOVE THE CANVAS TOO.
+                    //
+                    // The engine's own text session is not the only place a
+                    // character can be typed: every field in the Inspector is
+                    // a text field, and the letters the engine's keymap binds
+                    // as tool shortcuts -- `v`, `a`, `c`, `f`, `o`, `p`, `r`,
+                    // `t` -- are letters in a colour code and in a name.
+                    //
+                    // GPUI dispatches a key binding BEFORE any `on_key_down`
+                    // runs, and an action that is answered stops the key
+                    // there: so a shortcut that ran while a field was open
+                    // would switch the tool and the character would never
+                    // reach the field. Skipping the shortcut lets the key
+                    // travel on to the field that wants it.
+                    if inspector.read(cx).has_text_field(window, cx)
+                        && !crate::engine::keymap::live_while_editing_text(&id)
+                    {
+                        cx.propagate();
+                        return;
+                    }
                     // DEV MODE IS A MODE, AND THE ENGINE ONLY QUEUES A REQUEST
                     // FOR IT.
                     //
@@ -1675,6 +1708,20 @@ impl Render for AppShell {
                     if id == "view.devMode" {
                         inspector.update(cx, |inspector, cx| {
                             inspector.toggle_dev_mode(cx);
+                        });
+                        return;
+                    }
+                    // RENAME IS THE INSPECTOR'S, AND THE ENGINE ONLY ASKS.
+                    //
+                    // `object.rename` without a name is the engine asking the
+                    // UI to rename a layer, which is what the Inspector's
+                    // rename session is for. So the shell answers the request
+                    // the way it answers Dev Mode's: by opening the rename,
+                    // and the name the user types reaches the document through
+                    // the engine's own `object.rename` when they commit it.
+                    if id == "object.rename" && params.get("name").is_none() {
+                        inspector.update(cx, |inspector, cx| {
+                            inspector.open_rename_for_the_selection(cx);
                         });
                         return;
                     }

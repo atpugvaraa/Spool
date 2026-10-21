@@ -67,7 +67,7 @@ use std::rc::Rc;
 
 use figcraft_doc::{Comment, Document, NodeId};
 use figcraft_engine::cmd::comment::{self, Filter, Sort};
-use gpui::{div, prelude::*, px, rgb, AnyElement, Context, Div, FocusHandle, SharedString};
+use gpui::{div, prelude::*, px, rgb, AnyElement, Context, Div, FocusHandle, SharedString, Window};
 use serde_json::{json, Value};
 
 use crate::theme;
@@ -722,6 +722,21 @@ impl CommentsPanelState {
     /// The state a section starts in.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Whether the search field is in use.
+    ///
+    /// The search is a text field like any other: while it has the keyboard,
+    /// a character typed into it is a character and not an editor shortcut, so
+    /// the shortcut has to be skipped. A search with text in it counts as in
+    /// use even if the field has lost the focus, because the text is still
+    /// there to be edited.
+    pub fn is_searching(&self, window: &Window) -> bool {
+        !self.query.is_empty()
+            || self
+                .focus
+                .as_ref()
+                .is_some_and(|focus| focus.is_focused(window))
     }
 }
 

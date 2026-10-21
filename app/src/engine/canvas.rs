@@ -1603,6 +1603,16 @@ pub struct EngineCanvas {
     /// The retained render, on its own thread.
     renderer: CanvasRenderer,
     focus: FocusHandle,
+    /// Whether another surface owns the keyboard.
+    ///
+    /// A text field in the Inspector is a text field: a character typed into
+    /// it is a character, not a canvas gesture. The canvas is the only
+    /// surface that takes the keyboard for itself, so it is the only one that
+    /// has to be told when a field wants it instead.
+    ///
+    /// The Inspector decides, because it is the surface that knows which of
+    /// its fields are open.
+    keyboard_claimed: bool,
     state: CanvasState,
     palette: Palette,
     /// The hitbox the last prepaint inserted: the cursor style needs it by reference.
@@ -1634,6 +1644,7 @@ impl EngineCanvas {
             session,
             renderer: CanvasRenderer::new(),
             focus: cx.focus_handle(),
+            keyboard_claimed: false,
             prototype_mode: false,
             dev_mode: false,
             dev_filter: crate::engine::panel_devmode::CategoryFilter::All,
@@ -2000,6 +2011,28 @@ impl EngineCanvas {
         self.focus.focus(window, cx);
     }
 
+    /// Say whether another surface owns the keyboard.
+    ///
+    /// The canvas takes the focus for itself on every click and answers keys
+    /// as the engine's gestures, so it is the one surface that has to be told
+    /// when a text field wants the keyboard instead: `z` typed into a colour
+    /// code is not the zoom tool, a space typed into one is not a pan, and a
+    /// click on the canvas does not take the field's focus away.
+    ///
+    /// The Inspector decides, because it is the surface that knows which of
+    /// its fields are open.
+    pub fn set_keyboard_claimed(&mut self, claimed: bool, cx: &mut gpui::Context<Self>) {
+        if self.keyboard_claimed != claimed {
+            self.keyboard_claimed = claimed;
+            cx.notify();
+        }
+    }
+
+    /// Whether another surface owns the keyboard.
+    pub fn keyboard_claimed(&self) -> bool {
+        self.keyboard_claimed
+    }
+
     // --- rendering ----------------------------------------------------------
 
     /// The render options for the current view state, mirroring figcraft's `JobKey`.
@@ -2293,6 +2326,20 @@ impl EngineCanvas {
         _window: &mut Window,
         cx: &mut gpui::Context<Self>,
     ) {
+        // A TEXT FIELD OWNS THE KEYBOARD, so the canvas does not answer keys.
+        //
+        // The canvas is the engine's own key handling, and the engine's keys
+        // are gestures: `z` is the zoom tool, a space is a pan, Enter places
+        // a shape. Typed into a field, those are characters. So while a field
+        // is open the canvas steps aside and lets the key travel up to the
+        // surface that has the field.
+        //
+        // The key still travels: `cx.propagate()` is what carries it to the
+        // shell, which routes it to the field's own handler.
+        if self.keyboard_claimed {
+            cx.propagate();
+            return;
+        }
         if !event.is_held {
             match event.keystroke.key.as_str() {
                 "space" => {
@@ -2349,7 +2396,20 @@ impl EngineCanvas {
         window: &mut Window,
         cx: &mut gpui::Context<Self>,
     ) {
-        self.focus.focus(window, cx);
+        // A FIELD OWNS THE KEYBOARD, SO THE CANVAS DOES NOT TAKE IT.
+        //
+        // The canvas takes the focus on every click, which is right while the
+        // canvas is the surface the user is on. It is wrong while a text
+        // field is open: the field owns the keyboard, and the next click on
+        // the canvas does not take it away.
+        //
+        // The default is prevented as well as the focus skipped: GPUI focuses
+        // a focusable element on the mouse-down, and the canvas is one.
+        if self.keyboard_claimed {
+            window.prevent_default();
+        } else {
+            self.focus.focus(window, cx);
+        }
         let at = f32_point(event.position);
         let m = Mods::of(&event.modifiers);
         match event.button {
