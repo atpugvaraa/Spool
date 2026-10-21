@@ -9,6 +9,18 @@ use std::time::Instant;
 #[cfg(debug_assertions)]
 pub use debug::{count, enabled, record, report, reset, start};
 
+/// Turn the diagnostics on for the calling thread, in a test.
+///
+/// The environment variable is the way the app turns them on; a test has no
+/// environment to speak of, and a test that cannot see the numbers the module
+/// keeps cannot use them. A release build has no diagnostics to turn on, so
+/// this does nothing there.
+#[cfg(test)]
+pub fn enable_for_tests() {
+    #[cfg(debug_assertions)]
+    debug::enable_for_tests();
+}
+
 #[cfg(not(debug_assertions))]
 #[inline]
 pub fn enabled() -> bool {
@@ -28,6 +40,14 @@ pub fn record(_kind: &'static str, _start: Option<Instant>) {}
 #[cfg(not(debug_assertions))]
 #[inline]
 pub fn count(_kind: &'static str, _amount: u64) {}
+
+#[cfg(not(debug_assertions))]
+#[inline]
+pub fn reset() {}
+
+#[cfg(not(debug_assertions))]
+#[inline]
+pub fn report(_label: &str) {}
 
 /// Tests only the geometry bounding box against the viewport, including touching
 /// edges. Offset is in world units; viewport is in screen units. Stroke, shadows,
@@ -127,6 +147,12 @@ mod debug {
 
     #[cfg(test)]
     thread_local! { static TEST_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+    /// Turn the diagnostics on for this thread, in a test.
+    #[cfg(test)]
+    pub fn enable_for_tests() {
+        TEST_ENABLED.with(|enabled| enabled.set(true));
+    }
 
     pub fn enabled() -> bool {
         #[cfg(test)]

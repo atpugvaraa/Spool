@@ -1102,6 +1102,151 @@ fn the_renderer_publishes_a_frame_of_the_requested_size() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// When the canvas has to ask for another frame
+// ---------------------------------------------------------------------------
+
+/// A frame that arrived while the canvas was painting is not on the screen.
+///
+/// This is the rule that stops the canvas sitting on a stale picture: the
+/// render thread publishes while the canvas is painting, and the frame the
+/// canvas drew is then older than the document. Without asking for another
+/// frame, the picture stays stale until the next input event — which is what
+/// made an undone object take a click to come back.
+#[test]
+fn a_frame_that_arrived_while_painting_needs_another_frame() {
+    assert!(
+        super::needs_repaint(/* drawn */ 4, /* current */ 5, /* awaiting */ 5, false),
+        "a frame the canvas has not drawn must be drawn"
+    );
+}
+
+/// A request in flight means an answer is coming that is not on the screen.
+#[test]
+fn a_request_in_flight_needs_another_frame() {
+    assert!(
+        super::needs_repaint(/* drawn */ 5, /* current */ 5, /* awaiting */ 6, false),
+        "the answer to a request in flight must be drawn"
+    );
+}
+
+/// Nothing new and nothing pending: the canvas can go idle.
+#[test]
+fn nothing_new_needs_no_frame() {
+    assert!(
+        !super::needs_repaint(/* drawn */ 5, /* current */ 5, /* awaiting */ 5, false),
+        "a canvas with the newest frame on the screen must not ask for another"
+    );
+}
+
+/// A faulted renderer never publishes, so waiting for it is waiting for ever.
+#[test]
+fn a_faulted_renderer_needs_no_frame() {
+    assert!(
+        !super::needs_repaint(/* drawn */ 0, /* current */ 0, /* awaiting */ 9, true),
+        "a faulted renderer must not keep the canvas asking for frames"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The geometry, end to end
+// ---------------------------------------------------------------------------
+
+/// The engine's pixels, the blit and the overlay must agree about where an
+/// object is.
+///
+/// The frame's top-left is a page point, and so is everything the overlay
+/// draws. If the frame is blitted at a different point on screen than the
+/// overlay would put that same page point, the selection handles float away
+/// from the thing they belong to — and the object looks as if it were
+/// stretching.
+#[test]
+fn the_engines_pixels_land_under_the_overlay() {
+    // A page with one red rectangle on it, and a camera that puts the page's
+    // origin at the viewport's top-left.
+    let (session, page) = session_with_filled_rectangle();
+    let doc = Arc::new(session.doc().expect("the session has a document").clone());
+    let renderer = CanvasRenderer::new();
+    renderer
+        .render_canvas(
+            doc,
+            page,
+            (0.0, 0.0),
+            1.0,
+            (800.0, 600.0),
+            1.0,
+            Options::default(),
+        )
+        .expect("a valid viewport is accepted");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let frame = loop {
+        if let Some(frame) = renderer.frame() {
+            break frame;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the render thread published nothing"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+
+    // The rectangle is at (20, 20) and is 120 × 90, so its centre is at page
+    // (80, 65) and the pixels there are red.
+    let image = frame.image.as_ref().expect("the frame carries an image");
+    let bytes = image.as_bytes(0).expect("the image has bytes");
+    let width = frame.size.width as usize;
+    let at = |x: usize, y: usize| -> (u8, u8, u8, u8) {
+        let i = (y * width + x) * 4;
+        (bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3])
+    };
+    assert_eq!(
+        at(80, 65),
+        (0, 0, 255, 255),
+        "the engine must draw the rectangle where the document says"
+    );
+    assert_eq!(
+        at(5, 5),
+        (245, 245, 245, 255),
+        "and the page around it, in the engine's own page colour"
+    );
+
+    // Where the overlay puts the rectangle's centre, in window coordinates.
+    // The camera's centre is the viewport's centre, so the page's origin is at
+    // the viewport's top-left — the same origin the render was asked for.
+    let mut view = ViewState::default();
+    view.zoom = 1.0;
+    view.vw = 800.0;
+    view.vh = 600.0;
+    view.cx = 400.0;
+    view.cy = 300.0;
+    let viewport = Viewport {
+        // The canvas element does not start at the window's top-left.
+        origin: point(215.0, 90.0),
+        size: (800.0, 600.0),
+    };
+    assert_eq!(
+        view.origin(),
+        (0.0, 0.0),
+        "the page's origin is the viewport's"
+    );
+    let overlay = super::page_to_screen(&view, viewport, 80.0, 65.0);
+
+    // Where the blit puts the frame's pixel (80, 65): the blit's origin plus
+    // the pixel's offset, in the frame's own scale.
+    let blit = super::blit_bounds(&frame, view.origin(), view.zoom, viewport.origin);
+    let blitted = (
+        f32::from(blit.origin.x) + 80.0,
+        f32::from(blit.origin.y) + 65.0,
+    );
+
+    assert_eq!(
+        (blitted.0, blitted.1),
+        (overlay.x, overlay.y),
+        "the engine's pixels and the overlay must land on the same pixel"
+    );
+}
+
 /// A viewport the engine cannot put on a pixel grid is refused at the door, and no thread is asked.
 #[test]
 fn the_renderer_refuses_an_unusable_viewport() {
@@ -1337,6 +1482,8 @@ fn the_frame_is_blitted_where_the_overlay_draws_it() {
         ratio: 1.0,
         work: figcraft_render::Work::Full,
         damage: Default::default(),
+        generation: 1,
+        doc: 0,
     };
     let blit = super::blit_bounds(&frame, view.origin(), view.zoom, viewport.origin);
 

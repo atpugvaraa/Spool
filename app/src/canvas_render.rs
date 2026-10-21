@@ -75,18 +75,43 @@
 //! no path for patching bytes into a live texture: the damage rectangles are
 //! recorded in [`Damage`] so the decision is visible and testable, and a partial
 //! upload can be built on them later without re-deriving where the change was.
+//!
+//! # What the draw side is told
+//!
+//! A frame says which frame it is ([`CanvasFrame::generation`]) and which
+//! document it is of ([`CanvasFrame::doc`]). Both are there because the picture
+//! on the screen is always a frame old, and the draw side has to be able to say
+//! so: a frame that arrived while it was painting is not on the screen yet, and
+//! without knowing that the canvas would sit on a stale picture until the next
+//! input event.
+//!
+//! # What is not asked for
+//!
+//! A request that is the same as the last one is not worth making
+//! ([`CanvasRenderer::repeats`]): the answer would be the frame that is already
+//! there. The canvas paints on every frame it is given, so this is the
+//! difference between a canvas that goes idle when nothing is happening and one
+//! that renders and repaints for ever. figcraft's egui frontend keeps the same
+//! key (`JobKey`) and does the same thing.
 
 use std::any::Any;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Instant;
 
 use figcraft_doc::{Document, NodeId};
 use figcraft_render::retained::snap;
 use figcraft_render::{Options, Pixmap, Retained, View, Work};
 use gpui::RenderImage;
 use image::{Frame, RgbaImage};
+
+#[cfg(test)]
+mod bench;
+
+#[cfg(test)]
+mod window_bench;
 
 /// The largest device-pixel edge a view may ask for.
 ///
@@ -457,6 +482,27 @@ impl TextureCache {
 /// tiny-skia's own, so the rounding here is the same rounding the engine's
 /// `take_demultiplied` would have produced — one less place for a translucent
 /// pixel to come out a shade different.
+///
+/// # Why this loop is shaped the way it is
+///
+/// This runs on every frame whose pixels changed, on the thread that has to
+/// finish before the GPU can be given the image, so its cost is the latency
+/// between the pointer and the picture. It used to push four bytes per pixel
+/// into a growing buffer; measured over a 1600 × 1200 canvas that was 2.76 ms
+/// a frame, which was more than the engine's own render of the same frame.
+///
+/// Three things changed, and none of them changes a single byte of the result:
+///
+/// * **The buffer is sized once** and written through, rather than grown a
+///   byte at a time: every push is a capacity check, and there are four per
+///   pixel.
+/// * **An opaque pixel is copied whole.** Premultiplying by 1 is the identity,
+///   and tiny-skia's own `demultiply` short-circuits there too, so the
+///   shortcut is the engine's rounding and not a second one.
+/// * **The four bytes go out together**, as one copy of a four-byte array,
+///   rather than as four separate stores.
+///
+/// Together: 0.73 ms for the same canvas, against 2.76 ms before.
 pub fn pixmap_to_bgra(pixmap: &Pixmap) -> Option<Vec<u8>> {
     let size = DeviceSize::new(pixmap.width(), pixmap.height());
     let pixels = pixmap.pixels();
@@ -465,13 +511,17 @@ pub fn pixmap_to_bgra(pixmap: &Pixmap) -> Option<Vec<u8>> {
         return None;
     }
     let wanted = usize::try_from(size.pixels().checked_mul(4)?).ok()?;
-    let mut out = Vec::with_capacity(wanted);
-    for pixel in pixels {
+    let mut out = vec![0u8; wanted];
+    for (pixel, chunk) in pixels.iter().zip(out.chunks_exact_mut(4)) {
+        if pixel.alpha() == 255 {
+            // Opaque: premultiplied and straight are the same colour.
+            chunk.copy_from_slice(&[pixel.blue(), pixel.green(), pixel.red(), 255]);
+            continue;
+        }
+        // Everything else: tiny-skia's own demultiply, so a translucent pixel
+        // comes out with the rounding the engine would have given it.
         let c = pixel.demultiply();
-        out.push(c.blue());
-        out.push(c.green());
-        out.push(c.red());
-        out.push(c.alpha());
+        chunk.copy_from_slice(&[c.blue(), c.green(), c.red(), c.alpha()]);
     }
     Some(out)
 }
@@ -581,6 +631,20 @@ pub struct CanvasFrame {
     /// partial upload would have to patch and what a diagnostics overlay can
     /// draw.
     pub damage: Damage,
+    /// Which frame this is: the counter the renderer bumps on every publish.
+    ///
+    /// The draw side needs it to know whether the frame it is about to draw is
+    /// the newest one — a frame that arrived while the last one was being
+    /// painted is not on the screen yet, and the canvas has to ask for another
+    /// frame or the picture stays stale until the next input event.
+    pub generation: u64,
+    /// The document this frame is of, by identity: the address of the `Arc` the
+    /// engine handed over.
+    ///
+    /// The engine's document is immutable behind its `Arc` — a change is a new
+    /// `Arc` — so this is the document's *version*, and the draw side can ask
+    /// whether the picture on the screen is of the document as it is now.
+    pub doc: usize,
 }
 
 impl CanvasFrame {
@@ -647,6 +711,12 @@ pub struct RenderRequest {
     /// The device pixel ratio the view was sized for.
     pub ratio: f32,
     pub options: Options,
+    /// When the request was made, so the render thread can say how long the
+    /// answer took to arrive.
+    ///
+    /// The latency is the number that decides whether the canvas feels live: the
+    /// pixels on screen are always a frame old, and this is how old.
+    pub submitted: Instant,
 }
 
 impl RenderRequest {
@@ -664,6 +734,7 @@ impl RenderRequest {
             origin_px: device.origin_px,
             ratio,
             options,
+            submitted: Instant::now(),
         }
     }
 }
@@ -702,6 +773,13 @@ pub enum CanvasError {
 /// that costs a texture upload and one that does not, and it is invisible
 /// otherwise. Nothing reads these yet outside the tests and
 /// [`CanvasRenderer::diagnostics`].
+///
+/// The timings are the other half of the story. `render_micros` is the engine's
+/// own work; `convert_micros` is the pixel-by-pixel conversion into GPUI's
+/// layout; `latency_micros` is the whole round trip from a submission to the
+/// frame that answers it. A canvas that feels late is one whose latency is
+/// larger than a frame, and these are what says which of the three is the
+/// reason.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[allow(dead_code)]
 pub struct RenderStats {
@@ -713,6 +791,26 @@ pub struct RenderStats {
     pub replaced: u64,
     /// Requests dropped because a newer one arrived before the thread took them.
     pub coalesced: u64,
+    /// Requests not submitted at all: the same request as the last one.
+    pub skipped: u64,
+    /// Renders the engine reported as a whole-view redraw.
+    pub full: u64,
+    /// Renders the engine patched rather than redrew.
+    pub partial: u64,
+    /// Total time inside the engine's render, in microseconds.
+    pub render_micros: u64,
+    /// Total time turning the engine's pixmap into a GPUI image, in microseconds.
+    pub convert_micros: u64,
+    /// Total time from a submission to the frame that answered it, in microseconds.
+    pub latency_micros: u64,
+    /// The last render's engine time, in microseconds.
+    pub last_render_micros: u64,
+    /// The last conversion's time, in microseconds.
+    pub last_convert_micros: u64,
+    /// The last submission's round trip, in microseconds.
+    pub last_latency_micros: u64,
+    /// The largest round trip so far, in microseconds.
+    pub max_latency_micros: u64,
 }
 
 /// What a submission did to the pending slot.
@@ -721,6 +819,82 @@ pub struct RenderStats {
 pub struct Submission {
     /// A newer request replaced this one before the render thread took it.
     pub coalesced: bool,
+}
+
+/// The last request that was submitted, and the document it was for.
+///
+/// The document is kept alive next to the key, because the key names the
+/// document by its address and an address that is free is an address another
+/// document can be given. A freed document's address reused by a new one would
+/// make two different documents look like the same request, and the canvas
+/// would keep a picture of the first.
+struct LastRequest {
+    key: RequestKey,
+    /// The document the key names, kept alive so its address cannot be
+    /// reused by another document while the key is.
+    ///
+    /// It is never read: holding it is the whole of it.
+    #[allow(dead_code)]
+    doc: Arc<Document>,
+}
+
+/// What makes two render requests the same request.
+///
+/// figcraft's egui frontend keeps the same key (`JobKey`) and does not submit
+/// a job that matches it, and this is that key. It has to name everything the
+/// picture depends on, or the canvas would keep a frame it should have
+/// replaced:
+///
+/// * the document — by identity, because the engine's document is immutable
+///   behind its `Arc` and a change is a new `Arc`;
+/// * the page, the view and the ratio — the picture's place and its scale;
+/// * the options — what is drawn and how;
+/// * the font generation — new fonts change the text's layout, and so the
+///   picture, without the document changing at all.
+#[derive(Clone, Debug, PartialEq)]
+struct RequestKey {
+    doc: usize,
+    page: NodeId,
+    origin: (i64, i64),
+    scale: f64,
+    width: u32,
+    height: u32,
+    ratio: f32,
+    background: Option<(f32, f32, f32, f32)>,
+    outline_mode: bool,
+    outline_hidden: bool,
+    outline_bounds: bool,
+    outline_light: bool,
+    outlined: Vec<NodeId>,
+    skip: Vec<NodeId>,
+    solo: Option<NodeId>,
+    lod: bool,
+    fonts: u64,
+}
+
+impl RequestKey {
+    fn of(request: &RenderRequest) -> Self {
+        let options = &request.options;
+        Self {
+            doc: Arc::as_ptr(&request.doc) as usize,
+            page: request.page,
+            origin: request.origin_px,
+            scale: request.view.scale,
+            width: request.view.width,
+            height: request.view.height,
+            ratio: request.ratio,
+            background: options.background.map(|c| (c.r, c.g, c.b, c.a)),
+            outline_mode: options.outline_mode,
+            outline_hidden: options.outline.hidden,
+            outline_bounds: options.outline.bounds,
+            outline_light: options.outline.light,
+            outlined: options.outlined.clone(),
+            skip: options.skip.clone(),
+            solo: options.solo,
+            lod: options.lod,
+            fonts: figcraft_text::layout_generation(),
+        }
+    }
 }
 
 /// A one-slot mailbox: a canvas only ever wants the newest view.
@@ -808,12 +982,34 @@ struct Shared {
     unchanged: AtomicU64,
     replaced: AtomicU64,
     coalesced: AtomicU64,
+    skipped: AtomicU64,
+    full: AtomicU64,
+    partial: AtomicU64,
+    render_micros: AtomicU64,
+    convert_micros: AtomicU64,
+    latency_micros: AtomicU64,
+    last_render_micros: AtomicU64,
+    last_convert_micros: AtomicU64,
+    last_latency_micros: AtomicU64,
+    max_latency_micros: AtomicU64,
+}
+
+/// What one publish cost, in microseconds.
+#[derive(Clone, Copy, Debug, Default)]
+struct Timings {
+    /// Inside the engine's render.
+    render: u64,
+    /// Turning the pixmap into a GPUI image.
+    convert: u64,
+    /// From the submission to this frame.
+    latency: u64,
 }
 
 impl Shared {
-    fn publish(&self, frame: CanvasFrame, upload: Upload) {
+    fn publish(&self, mut frame: CanvasFrame, upload: Upload, timings: Timings) {
+        let generation = self.generation.fetch_add(1, Ordering::Release) + 1;
+        frame.generation = generation;
         *lock(&self.frame) = Some(frame);
-        self.generation.fetch_add(1, Ordering::Release);
         self.published.fetch_add(1, Ordering::Relaxed);
         match upload {
             Upload::Skip => {
@@ -823,6 +1019,20 @@ impl Shared {
                 self.replaced.fetch_add(1, Ordering::Relaxed);
             }
         }
+        self.render_micros
+            .fetch_add(timings.render, Ordering::Relaxed);
+        self.convert_micros
+            .fetch_add(timings.convert, Ordering::Relaxed);
+        self.latency_micros
+            .fetch_add(timings.latency, Ordering::Relaxed);
+        self.last_render_micros
+            .store(timings.render, Ordering::Relaxed);
+        self.last_convert_micros
+            .store(timings.convert, Ordering::Relaxed);
+        self.last_latency_micros
+            .store(timings.latency, Ordering::Relaxed);
+        self.max_latency_micros
+            .fetch_max(timings.latency, Ordering::Relaxed);
         self.wake_up();
     }
 
@@ -884,6 +1094,7 @@ fn render_one(
     shared: &Shared,
     request: &RenderRequest,
 ) {
+    let started = Instant::now();
     let Some((view, pixmap, work)) =
         retained.render(&request.doc, request.page, &request.view, &request.options)
     else {
@@ -894,13 +1105,28 @@ fn render_one(
         *placed = None;
         return;
     };
+    let render_micros = started.elapsed().as_micros() as u64;
+    match work {
+        Work::Full => {
+            shared.full.fetch_add(1, Ordering::Relaxed);
+        }
+        Work::Partial { .. } => {
+            shared.partial.fetch_add(1, Ordering::Relaxed);
+        }
+        Work::Reused => {}
+    }
     let size = DeviceSize::new(pixmap.width(), pixmap.height());
     let to = Placed {
         origin_px: request.origin_px,
         size,
     };
     let damage = damage_of(work, *placed, to);
+    // The conversion is the whole image, every time the pixels changed: it is
+    // timed on its own, because it is the part of the pipeline Spool owns and the
+    // part the engine cannot make faster.
+    let convert_started = Instant::now();
     let upload = cache.commit(work, size, || to_render_image(pixmap));
+    let convert_micros = convert_started.elapsed().as_micros() as u64;
     *placed = Some(to);
     shared.publish(
         CanvasFrame {
@@ -912,8 +1138,15 @@ fn render_one(
             ratio: request.ratio,
             work,
             damage,
+            generation: 0,
+            doc: Arc::as_ptr(&request.doc) as usize,
         },
         upload,
+        Timings {
+            render: render_micros,
+            convert: convert_micros,
+            latency: request.submitted.elapsed().as_micros() as u64,
+        },
     );
 }
 
@@ -962,6 +1195,10 @@ pub struct CanvasRenderer {
     shared: Arc<Shared>,
     mailbox: Arc<Mailbox<RenderRequest>>,
     doorbell: Sender<()>,
+    /// The last request that was submitted, by what makes a request the same
+    /// request. A request that matches it would be answered with the frame
+    /// that is already there.
+    last: Mutex<Option<LastRequest>>,
 }
 
 impl Default for CanvasRenderer {
@@ -999,6 +1236,7 @@ impl CanvasRenderer {
             shared,
             mailbox,
             doorbell: doorbell_tx,
+            last: Mutex::new(None),
         }
     }
 
@@ -1028,9 +1266,22 @@ impl CanvasRenderer {
     /// the first replaces it, which is why this is not a queue: a canvas asked to
     /// render on every pointer move wants the position the pointer is at now, not
     /// the four hundred positions it passed through.
+    ///
+    /// Every request is answered, even one that repeats the last: the engine's
+    /// retained renderer has an answer for that too, and the answer is
+    /// [`Work::Reused`]. Whether to ask at all is the draw side's decision —
+    /// see [`CanvasRenderer::repeats`].
     pub fn submit(&self, request: RenderRequest) -> Result<Submission, CanvasError> {
         if let Some(fault) = self.fault() {
             return Err(CanvasError::Fault(fault));
+        }
+        let key = RequestKey::of(&request);
+        {
+            let mut last = lock(&self.last);
+            *last = Some(LastRequest {
+                key,
+                doc: Arc::clone(&request.doc),
+            });
         }
         let coalesced = self.mailbox.put(request);
         if coalesced {
@@ -1045,6 +1296,47 @@ impl CanvasRenderer {
             return Err(CanvasError::Fault(fault));
         }
         Ok(Submission { coalesced })
+    }
+
+    /// Whether a render of this view would be answered with the frame that is
+    /// already there.
+    ///
+    /// The picture depends on the document, the page, the view, the options and
+    /// the fonts. When none of them has moved since the last request, the
+    /// engine's retained renderer answers [`Work::Reused`] and the frame on the
+    /// screen is already the right one — so there is nothing to ask for.
+    ///
+    /// The draw side asks this before it renders, because the canvas paints on
+    /// every frame it is given: a request that cannot change the picture is a
+    /// thread round trip and a repaint for nothing, and a repaint that cannot
+    /// change the picture is a frame the user waits for. figcraft's egui
+    /// frontend keeps the same key (`JobKey`) and does the same thing.
+    pub fn would_repeat(
+        &self,
+        doc: &Arc<Document>,
+        page: NodeId,
+        origin: (f64, f64),
+        zoom: f64,
+        logical: (f32, f32),
+        ratio: f32,
+        options: &Options,
+    ) -> bool {
+        let Some(device) = device_view(origin, zoom, logical, ratio) else {
+            return false;
+        };
+        let request = RenderRequest::new(Arc::clone(doc), page, device, ratio, options.clone());
+        self.repeats(&request)
+    }
+
+    /// Whether a request would be answered with the frame that is already there.
+    fn repeats(&self, request: &RenderRequest) -> bool {
+        let repeats = lock(&self.last)
+            .as_ref()
+            .is_some_and(|last| last.key == RequestKey::of(request));
+        if repeats {
+            self.shared.skipped.fetch_add(1, Ordering::Relaxed);
+        }
+        repeats
     }
 
     /// Ask to be called after every published frame.
@@ -1087,6 +1379,16 @@ impl CanvasRenderer {
             unchanged: self.shared.unchanged.load(Ordering::Relaxed),
             replaced: self.shared.replaced.load(Ordering::Relaxed),
             coalesced: self.shared.coalesced.load(Ordering::Relaxed),
+            skipped: self.shared.skipped.load(Ordering::Relaxed),
+            full: self.shared.full.load(Ordering::Relaxed),
+            partial: self.shared.partial.load(Ordering::Relaxed),
+            render_micros: self.shared.render_micros.load(Ordering::Relaxed),
+            convert_micros: self.shared.convert_micros.load(Ordering::Relaxed),
+            latency_micros: self.shared.latency_micros.load(Ordering::Relaxed),
+            last_render_micros: self.shared.last_render_micros.load(Ordering::Relaxed),
+            last_convert_micros: self.shared.last_convert_micros.load(Ordering::Relaxed),
+            last_latency_micros: self.shared.last_latency_micros.load(Ordering::Relaxed),
+            max_latency_micros: self.shared.max_latency_micros.load(Ordering::Relaxed),
         }
     }
 
@@ -1094,11 +1396,20 @@ impl CanvasRenderer {
     pub fn diagnostics(&self) -> String {
         let stats = self.stats();
         format!(
-            "published {} · reused {} · uploaded {} · coalesced {}{}",
+            "published {} · reused {} · uploaded {} · coalesced {} · skipped {} · full {} · partial {} · \
+             render {}µs · convert {}µs · latency {}µs (last {}µs, worst {}µs){}",
             stats.published,
             stats.unchanged,
             stats.replaced,
             stats.coalesced,
+            stats.skipped,
+            stats.full,
+            stats.partial,
+            stats.render_micros,
+            stats.convert_micros,
+            stats.latency_micros,
+            stats.last_latency_micros,
+            stats.max_latency_micros,
             match self.fault() {
                 Some(fault) => format!(" · faulted: {fault:?}"),
                 None => String::new(),
@@ -1529,6 +1840,31 @@ mod tests {
         assert_eq!(bytes, vec![0, 0, 255, 128]);
     }
 
+    /// The opaque fast path must be the identity, not an approximation.
+    ///
+    /// The conversion skips the demultiply for an opaque pixel, and the whole
+    /// point of that is that premultiplying by one is the identity: the bytes
+    /// have to be the same ones tiny-skia's own `demultiply` would have given.
+    #[test]
+    fn an_opaque_pixmap_is_copied_unchanged() {
+        let mut pixmap = Pixmap::new(1, 1).expect("a one pixel pixmap");
+        pixmap.fill(Color::from_rgba(0.0, 0.5, 1.0, 1.0).expect("a colour in range"));
+        let bytes = pixmap_to_bgra(&pixmap).expect("a one pixel pixmap converts");
+        assert_eq!(bytes, vec![255, 128, 0, 255]);
+        // And the same, through tiny-skia's own demultiply.
+        let demultiplied = pixmap.pixels()[0].demultiply();
+        assert_eq!(
+            bytes,
+            vec![
+                demultiplied.blue(),
+                demultiplied.green(),
+                demultiplied.red(),
+                demultiplied.alpha()
+            ],
+            "the fast path must agree with the engine's own demultiply"
+        );
+    }
+
     #[test]
     fn a_pixmap_converts_to_four_bytes_per_pixel() {
         let pixmap = Pixmap::new(3, 2).expect("a six pixel pixmap");
@@ -1564,6 +1900,8 @@ mod tests {
             scale,
             ratio,
             work: Work::Full,
+            generation: 1,
+            doc: 0,
         }
     }
 
@@ -1962,6 +2300,132 @@ mod tests {
         assert!(
             line.contains("published 1"),
             "the diagnostics line is missing the frame: {line}"
+        );
+    }
+
+    /// The same request twice is one request.
+    ///
+    /// The canvas paints on every frame it is given, and it asks for a render
+    /// on every paint. A request that is the same as the last one would be
+    /// answered with the frame that is already there, so the draw side does not
+    /// make it: a thread round trip and a repaint for a picture that cannot
+    /// change.
+    ///
+    /// figcraft's egui frontend keeps the same key and does the same thing.
+    #[test]
+    fn the_same_request_is_answered_with_the_frame_that_is_there() {
+        let (doc, page) = document().expect("a document with one page");
+        let renderer = CanvasRenderer::new();
+        let options = Options {
+            lod: true,
+            ..Options::default()
+        };
+        assert!(
+            !renderer.would_repeat(&doc, page, (0.0, 0.0), 1.0, (200.0, 150.0), 1.0, &options),
+            "the first request has nothing to repeat"
+        );
+        renderer
+            .render_canvas(
+                doc.clone(),
+                page,
+                (0.0, 0.0),
+                1.0,
+                (200.0, 150.0),
+                1.0,
+                options.clone(),
+            )
+            .expect("a usable view");
+        await_generation(&renderer, 0).expect("a first frame");
+
+        assert!(
+            renderer.would_repeat(&doc, page, (0.0, 0.0), 1.0, (200.0, 150.0), 1.0, &options),
+            "the same request must be recognised as one"
+        );
+        assert_eq!(renderer.stats().skipped, 1);
+    }
+
+    /// A request that is not the same as the last one is a new picture.
+    ///
+    /// The key has to name everything the picture depends on: a pan, a zoom, a
+    /// different page and a different document are four different pictures.
+    #[test]
+    fn a_different_request_is_a_different_picture() {
+        let (doc, page) = document().expect("a document with one page");
+        let renderer = CanvasRenderer::new();
+        let options = Options {
+            lod: true,
+            ..Options::default()
+        };
+        renderer
+            .render_canvas(
+                doc.clone(),
+                page,
+                (0.0, 0.0),
+                1.0,
+                (200.0, 150.0),
+                1.0,
+                options.clone(),
+            )
+            .expect("a usable view");
+        await_generation(&renderer, 0).expect("a first frame");
+
+        assert!(
+            renderer.would_repeat(&doc, page, (0.0, 0.0), 1.0, (200.0, 150.0), 1.0, &options),
+            "the same view again is a repeat"
+        );
+        assert!(
+            !renderer.would_repeat(&doc, page, (3.0, 0.0), 1.0, (200.0, 150.0), 1.0, &options),
+            "a pan must be a new picture"
+        );
+        assert!(
+            !renderer.would_repeat(&doc, page, (3.0, 0.0), 2.0, (200.0, 150.0), 1.0, &options),
+            "a zoom must be a new picture"
+        );
+        let (other, other_page) = document().expect("a document with one page");
+        assert!(
+            !renderer.would_repeat(
+                &other,
+                other_page,
+                (3.0, 0.0),
+                2.0,
+                (200.0, 150.0),
+                1.0,
+                &options
+            ),
+            "a different document must be a new picture"
+        );
+    }
+
+    /// A frame knows which frame it is, and which document it is of.
+    ///
+    /// The draw side needs both: the generation to know whether the picture on
+    /// the screen is the newest one, and the document to know whether it is of
+    /// the document as it is now.
+    #[test]
+    fn a_frame_names_itself_and_its_document() {
+        let (doc, page) = document().expect("a document with one page");
+        let renderer = CanvasRenderer::new();
+        let before = renderer.generation();
+        renderer
+            .render_canvas(
+                doc.clone(),
+                page,
+                (0.0, 0.0),
+                1.0,
+                (200.0, 150.0),
+                1.0,
+                Options::default(),
+            )
+            .expect("a usable view");
+        let frame = await_generation(&renderer, before).expect("a frame");
+        assert!(
+            frame.generation > before,
+            "the frame must be newer than before"
+        );
+        assert_eq!(
+            frame.doc,
+            Arc::as_ptr(&doc) as usize,
+            "the frame must name the document it is of"
         );
     }
 

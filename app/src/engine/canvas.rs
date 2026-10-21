@@ -123,6 +123,11 @@ const MAX_LABEL_CHARS: usize = 24;
 const MAX_GRID_LINES: usize = 2048;
 /// The one colour the canvas adds to the theme: components, as `engine::layers` draws them.
 const COMPONENT_HEX: u32 = 0x6fd0b0;
+/// How many paints between two diagnostics reports.
+///
+/// Two seconds of a 60 Hz canvas: often enough to see what a session is doing
+/// and rare enough not to drown the output.
+const DIAGNOSTIC_EVERY_PAINTS: u64 = 120;
 
 // ---------------------------------------------------------------------------
 // Colour
@@ -1357,6 +1362,30 @@ fn truncate(text: &str, max: usize) -> String {
     out
 }
 
+/// Whether the canvas must ask for another frame.
+///
+/// The rule, in one place, because it is the difference between a canvas that
+/// keeps up and one that shows a stale picture until the user touches it:
+///
+/// * `drawn` is the generation of the frame the last paint drew, `current` the
+///   newest frame the render thread has published. A frame that arrived *while
+///   the canvas was painting* is newer than the one on the screen, so the
+///   canvas has to ask for another one. Without this the canvas sits on a
+///   stale frame until the next input event — an undone object that takes a
+///   click to come back.
+/// * `awaiting` is the generation of the answer the canvas is waiting for. A
+///   request in flight means an answer is coming that is not on the screen
+///   yet, and the canvas has to be awake to draw it.
+/// * A faulted renderer never publishes, so it is explicitly *not* pending:
+///   otherwise the canvas would ask for a redraw forever, waiting for a frame
+///   that cannot arrive.
+fn needs_repaint(drawn: u64, current: u64, awaiting: u64, faulted: bool) -> bool {
+    if faulted {
+        return false;
+    }
+    current > drawn || current < awaiting
+}
+
 /// Where the engine's frame goes on the window, in logical points.
 ///
 /// The engine renders one device pixel wider and taller than the view it was given, and the device
@@ -1517,10 +1546,20 @@ pub struct CanvasState {
     pub composition: Option<Composition>,
     /// The generation the canvas is waiting for; the render thread publishes one per frame.
     pub awaiting: u64,
+    /// The generation of the frame the last paint drew.
+    ///
+    /// A frame that arrives while the canvas is painting is not on the screen
+    /// yet, and the canvas has to ask for another one or the picture stays
+    /// stale until the next input event — which is what made an undone object
+    /// take a click to come back.
+    pub drawn: u64,
     /// The labels the last paint drew, fed back to the engine so a press on one hits its frame.
     pub labels: Vec<(NodeId, [Point; 4])>,
     /// The last error the engine reported, for a diagnostics line.
     pub fault: Option<String>,
+    /// How many times the canvas has painted, so the diagnostics can be
+    /// reported every so often rather than on every frame.
+    pub paints: u64,
 }
 
 impl Default for CanvasState {
@@ -1538,8 +1577,10 @@ impl Default for CanvasState {
             zoom_drag: None,
             composition: None,
             awaiting: 0,
+            drawn: 0,
             labels: Vec::new(),
             fault: None,
+            paints: 0,
         }
     }
 }
@@ -1807,6 +1848,30 @@ impl EngineCanvas {
         line
     }
 
+    /// Whether the picture on the canvas is of the document as it is now.
+    ///
+    /// The engine's document is immutable behind its `Arc` — a change is a new
+    /// `Arc` — so the frame's document and the session's document are the same
+    /// document when their addresses are the same. A frame that is not current
+    /// is a frame that was rendered before the last edit, and the canvas is
+    /// showing a picture of a document that is not the one on screen.
+    pub fn frame_is_current(&self) -> bool {
+        let Some(frame) = self.renderer.frame() else {
+            return false;
+        };
+        let session = self.session.borrow();
+        let Ok(ds) = session.ds() else { return false };
+        frame.doc == Arc::as_ptr(&ds.doc) as usize
+    }
+
+    /// Whether the canvas is waiting for a frame it has not drawn.
+    ///
+    /// A canvas that is waiting has asked for another frame; one that is not
+    /// has everything it needs and the app can go idle.
+    pub fn needs_repaint(&self) -> bool {
+        self.frame_pending()
+    }
+
     // --- what panels drive --------------------------------------------------
 
     /// Ask for the camera to be framed on the next paint that has a size.
@@ -1916,6 +1981,12 @@ impl EngineCanvas {
     ///
     /// The renderer coalesces to one pending request, so a pointer move that changes nothing costs
     /// at most one discarded submission.
+    ///
+    /// A request that would be answered with the frame that is already there is
+    /// not made at all: the canvas paints on every frame it is given, and a
+    /// request that cannot change the picture is a thread round trip and a
+    /// repaint for nothing — and, worse, a repaint the user waits for. figcraft's
+    /// egui frontend keeps the same key and does the same thing.
     fn request_render(&mut self, ratio: f32) {
         let request = {
             let session = self.session.borrow();
@@ -1929,6 +2000,17 @@ impl EngineCanvas {
             )
         };
         let (doc, page, origin, zoom, options) = request;
+        if self.renderer.would_repeat(
+            &doc,
+            page,
+            origin,
+            zoom,
+            self.viewport.size,
+            ratio,
+            &options,
+        ) {
+            return;
+        }
         match self.renderer.render_canvas(
             doc,
             page,
@@ -1962,18 +2044,26 @@ impl EngineCanvas {
         }
     }
 
-    /// Whether a frame is still on its way from the render thread.
+    /// Whether the canvas has to ask for another frame.
     ///
-    /// A faulted renderer never publishes, so it is explicitly *not* pending: otherwise the canvas
-    /// would ask for a redraw forever, waiting for a frame that cannot arrive.
+    /// See [`needs_repaint`], which is the rule and the reason.
     fn frame_pending(&self) -> bool {
-        self.renderer.fault().is_none() && self.renderer.generation() < self.state.awaiting
+        needs_repaint(
+            self.state.drawn,
+            self.renderer.generation(),
+            self.state.awaiting,
+            self.renderer.fault().is_some(),
+        )
     }
 
     // --- input --------------------------------------------------------------
 
     /// Send one pointer event to the engine. The only path into the gesture state machine.
     fn forward(&mut self, kind: PointerKind, at: GPoint<f32>, m: Mods, pressure: Option<f32>) {
+        // The engine's own gesture work, on the UI thread: the document preview
+        // it builds for a drag is the whole cost of a pointer move, and it is
+        // what the pointer waits behind.
+        let started = crate::diagnostics::start();
         let ev = {
             let session = self.session.borrow();
             let Ok(ds) = session.ds() else { return };
@@ -1994,6 +2084,7 @@ impl EngineCanvas {
         };
         self.state.last_pointer = Some(Point::new(ev.x, ev.y));
         let result = self.session.borrow_mut().pointer(&ev);
+        crate::diagnostics::record("canvas_pointer", started);
         if let Err(error) = result {
             self.state.fault = Some(error.to_string());
         }
@@ -2401,6 +2492,10 @@ impl EngineCanvas {
         ratio: f32,
         hitbox: Option<Hitbox>,
     ) {
+        // The canvas's own cost, on the UI thread: the snapshot, the overlays
+        // and the blit. This is the half of a frame that is not the engine's
+        // render, and it is what the pointer waits behind.
+        let paint_started = crate::diagnostics::start();
         self.viewport = Viewport::new(bounds);
 
         // Honour a deferred fit, now that there is a viewport to fit into. The
@@ -2421,6 +2516,11 @@ impl EngineCanvas {
 
         self.request_render(ratio);
         let frame = self.renderer.frame();
+        // Which frame this paint is about to draw. A frame that arrives while
+        // the canvas is painting is newer than this one, and the canvas asks
+        // for another one at the end of the paint rather than waiting for the
+        // next input event to bring the picture up to date.
+        self.state.drawn = frame.as_ref().map(|f| f.generation).unwrap_or(0);
         let snapshot = self.snapshot();
 
         let background = snapshot
@@ -2464,6 +2564,31 @@ impl EngineCanvas {
         if self.frame_pending() {
             ov.window.refresh();
         }
+        crate::diagnostics::record("canvas_paint", paint_started);
+        crate::diagnostics::count("canvas_paint", 1);
+        self.state.paints += 1;
+        // The first paint, so a run with the diagnostics on says something even
+        // if the app then sits still, and then every so often after that.
+        if self.state.paints == 1 || self.state.paints % DIAGNOSTIC_EVERY_PAINTS == 0 {
+            self.report_diagnostics();
+        }
+    }
+
+    /// What the canvas and the renderer have done, for a diagnostics run.
+    ///
+    /// The engine's own timings are on the UI thread, in the diagnostics
+    /// module; the renderer's are counters the render thread keeps, because
+    /// that thread has no thread-local store to keep them in. Both are printed
+    /// here, when the diagnostics are on.
+    fn report_diagnostics(&self) {
+        if !crate::diagnostics::enabled() {
+            return;
+        }
+        crate::diagnostics::report("canvas");
+        eprintln!(
+            "spool_diagnostics label=\"canvas\" kind=\"renderer\" {}",
+            self.renderer.diagnostics()
+        );
     }
 
     /// Everything the painter needs from the session, taken once and released.
