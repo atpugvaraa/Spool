@@ -64,6 +64,9 @@ use std::rc::Rc;
 
 use crate::engine::canvas::EngineCanvas;
 use crate::engine::inspector_model as model;
+use crate::engine::panel_assets::{
+    self as panel_assets, AssetsAction, AssetsHost, AssetsModel, AssetsPanelState,
+};
 use crate::engine::panel_colorpicker::{
     self as panel_colorpicker, ColorAction, ColorHost, ColorPickerState,
 };
@@ -81,12 +84,12 @@ use crate::engine::panel_prototyping::{
 use crate::engine::panel_styles::{
     self as panel_styles, StylesAction, StylesHost, StylesModel, StylesPanelState,
 };
-use crate::engine::panel_variables::{
-    self as panel_variables, VariablesAction, VariablesHost, VariablesModel, VariablesPanelState,
-};
 use crate::engine::panel_typography::{
     self as panel_typography, TypographyAction, TypographyHost, TypographyModel,
     TypographyPanelState,
+};
+use crate::engine::panel_variables::{
+    self as panel_variables, VariablesAction, VariablesHost, VariablesModel, VariablesPanelState,
 };
 use crate::theme;
 
@@ -136,7 +139,7 @@ const NO_STROKE: &str = "No stroke to be wide";
 ///
 /// Fixed rather than growable, so a section's slot can be baked into the click
 /// closure that toggles it.
-pub const SECTION_COUNT: usize = 8;
+pub const SECTION_COUNT: usize = 9;
 
 /// A collapsible section, addressed by a slot.
 ///
@@ -157,6 +160,7 @@ impl SectionSlot {
     pub const EXPORT: Self = Self(5);
     pub const STYLES: Self = Self(6);
     pub const VARIABLES: Self = Self(7);
+    pub const ASSETS: Self = Self(8);
 
     fn index(self) -> usize {
         self.0
@@ -1468,6 +1472,9 @@ pub struct Inspector {
     /// The styles section's state: which slot's browser is open, what is being
     /// typed into it, and which folders are folded away.
     styles_state: Rc<RefCell<StylesPanelState>>,
+    /// The assets section's state: which image is being edited and what is
+    /// being typed into it.
+    assets_state: Rc<RefCell<AssetsPanelState>>,
     /// The Prototype tab's own state: which menu is open, what is being typed
     /// into it, and which interaction's editor is open.
     prototyping_state: Rc<RefCell<ProtoPanelState>>,
@@ -1521,6 +1528,7 @@ impl Inspector {
             styles_state: Rc::new(RefCell::new(StylesPanelState::default())),
             variables_state: Rc::new(RefCell::new(VariablesPanelState::default())),
             prototyping_state: Rc::new(RefCell::new(ProtoPanelState::new())),
+            assets_state: Rc::new(RefCell::new(AssetsPanelState::default())),
             typography_state: Rc::new(RefCell::new(TypographyPanelState::default())),
             color_state: Rc::new(RefCell::new(ColorPickerState::default())),
             tab: 0,
@@ -1598,6 +1606,7 @@ impl Inspector {
             || self.styles_state.borrow().is_busy()
             || self.typography_state.borrow().is_busy()
             || self.color_state.borrow().is_busy()
+            || self.assets_state.borrow().is_busy()
     }
 
     /// Give up whatever the Inspector is part-way through.
@@ -1646,6 +1655,11 @@ impl Inspector {
             cx.notify();
             return true;
         }
+        let assets_cancelled = self.assets_state.borrow_mut().cancel();
+        if assets_cancelled {
+            cx.notify();
+            return true;
+        }
         false
     }
 
@@ -1687,6 +1701,14 @@ impl Inspector {
             let action = self.typography_state.borrow_mut().handle_key(key);
             if let Some(action) = action {
                 self.run_typography_action(action, cx);
+            }
+            cx.notify();
+            return true;
+        }
+        if self.assets_state.borrow().is_busy() {
+            let action = self.assets_state.borrow_mut().handle_key(key);
+            if let Some(action) = action {
+                self.run_assets_action(action, cx);
             }
             cx.notify();
             return true;
@@ -1948,6 +1970,22 @@ impl Inspector {
         });
         let state = self.styles_state.clone();
         panel_styles::styles_section(&model, &state, cx).into_any_element()
+    }
+
+    /// The assets section: the document's images, and the selection's own image
+    /// fill.
+    fn assets_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(engine) = self.engine.clone() else {
+            return empty_note("No images yet.").into_any_element();
+        };
+        let model: AssetsModel = engine.read(cx).with_session(|session| {
+            let Ok(doc) = session.doc() else {
+                return AssetsModel::default();
+            };
+            AssetsModel::read(doc, &session.selection())
+        });
+        let state = self.assets_state.clone();
+        panel_assets::assets_section(&model, &state, cx).into_any_element()
     }
 
     /// Open one of the Inspector's tabs.
@@ -2291,6 +2329,14 @@ impl Inspector {
     }
 }
 
+impl AssetsHost for Inspector {
+    /// Run an assets change through the engine.
+    fn run_assets_action(&mut self, action: AssetsAction, cx: &mut Context<Self>) {
+        let (command, params) = action.command();
+        self.run(&command, params, cx);
+    }
+}
+
 impl ProtoHost for Inspector {
     /// Run a prototype change through the engine.
     fn run_proto_action(&mut self, action: ProtoAction, cx: &mut Context<Self>) {
@@ -2559,6 +2605,12 @@ impl Inspector {
                         "Styles",
                         SectionSlot::STYLES,
                         self.styles_section(cx),
+                        cx,
+                    ))
+                    .child(self.inspector_section(
+                        "Assets",
+                        SectionSlot::ASSETS,
+                        self.assets_section(cx),
                         cx,
                     ))
                     .child(self.inspector_section(
@@ -3923,7 +3975,6 @@ fn segmented(
 // The other two tabs
 // ═══════════════════════════════════════════════════════════════════════════
 
-
 fn ai_body() -> AnyElement {
     column()
         .gap_3()
@@ -4027,6 +4078,7 @@ mod tests {
             SectionSlot::EXPORT,
             SectionSlot::STYLES,
             SectionSlot::VARIABLES,
+            SectionSlot::ASSETS,
         ];
         assert_eq!(slots.len(), SECTION_COUNT, "every slot is accounted for");
         for (index, slot) in slots.iter().enumerate() {
