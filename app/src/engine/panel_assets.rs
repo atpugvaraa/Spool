@@ -155,8 +155,8 @@ pub const SCALE_NEEDS_ONE_IMAGE: &str =
 /// rather than left for the user to find out by saving.
 pub const SOURCE_NOTE: &str =
     "Spool's source cannot carry an image yet: the CSS reader compiles background-color and \
-     nothing else, lamine.yaml has no image field, and the save path writes a fill back as a \
-     colour. An image applied or placed here stays in the editor's document.";
+     nothing else, and lamine.yaml has no image field. An image applied or placed here stays \
+     in the editor's document.";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // The three states
@@ -276,8 +276,12 @@ impl AssetEntry {
     /// The engine has no name for an image — it files them by content hash —
     /// so the hash is the only handle there is.
     pub fn short_hash(&self) -> &str {
-        let end = self.hash.len().min(8);
-        &self.hash[..end]
+        // Eight characters, on a character boundary: a hash is ASCII, but the
+        // engine's key is a string, and a string can be anything.
+        self.hash
+            .char_indices()
+            .nth(8)
+            .map_or(self.hash.as_str(), |(index, _)| &self.hash[..index])
     }
 
     /// The image's size, as the tile shows it: "1024 × 768".
@@ -856,9 +860,10 @@ fn scale_row<T: AssetsHost>(model: &AssetsModel, cx: &mut Context<T>) -> AnyElem
         AssetValue::Set(hash) => Some(hash.clone()),
         _ => None,
     };
+    let mut modes = div().flex().items_center().gap_1();
+    let has_image = image.is_some();
     match image {
         Some(image) => {
-            let mut modes = div().flex().items_center().gap_1().px(px(8.0));
             for mode in MODES {
                 let current = model.mode.value() == Some(&mode);
                 let ids = model.ids.clone();
@@ -904,13 +909,17 @@ fn scale_row<T: AssetsHost>(model: &AssetsModel, cx: &mut Context<T>) -> AnyElem
                     }));
                 modes = modes.child(chip);
             }
-            row = row.child(modes);
         }
-        None => {
-            column = column.child(caption(SCALE_NEEDS_ONE_IMAGE));
-        }
+        None => {}
     }
     column = column.child(row);
+    // The chips go under the row, not beside the value: the Inspector's
+    // column is 264 points wide, and four chips do not fit beside a word.
+    if has_image {
+        column = column.child(modes);
+    } else {
+        column = column.child(caption(SCALE_NEEDS_ONE_IMAGE));
+    }
     column.into_any_element()
 }
 
@@ -1045,7 +1054,7 @@ fn tile<T: AssetsHost>(model: &AssetsModel, image: &AssetEntry, cx: &mut Context
         .flex_col()
         .items_center()
         .gap_1()
-        .w(px(124.0))
+        .w(px(108.0))
         .cursor_pointer()
         .on_click(cx.listener(move |host, _event, _window, cx| {
             host.run_assets_action(
@@ -1064,8 +1073,8 @@ fn tile<T: AssetsHost>(model: &AssetsModel, image: &AssetEntry, cx: &mut Context
                 .items_center()
                 .justify_center()
                 .gap_1()
-                .w(px(116.0))
-                .h(px(64.0))
+                .w(px(100.0))
+                .h(px(60.0))
                 .rounded_md()
                 .bg(rgb(theme::SURFACE))
                 .border_1()
@@ -1092,11 +1101,16 @@ fn tile<T: AssetsHost>(model: &AssetsModel, image: &AssetEntry, cx: &mut Context
                 .child(short.clone()),
         );
     if image.used > 0 {
+        let used = if image.used == 1 {
+            "1 layer".to_owned()
+        } else {
+            format!("{} layers", image.used)
+        };
         column = column.child(
             div()
                 .text_xs()
                 .text_color(rgb(theme::TEXT_MUTED))
-                .child(format!("used by {} layers", image.used)),
+                .child(used),
         );
     }
     // The way to place the image as a layer of its own. It is a button

@@ -2549,12 +2549,6 @@ impl Inspector {
                         .text_color(rgb(theme::TEXT_MUTED))
                         .child("Select an object on the canvas or in Layers."),
                 )
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(rgb(theme::ACCENT))
-                        .child("MARKER-VARIABLES-SECTION"),
-                )
                 .child(self.variables_section(cx))
                 .into_any_element(),
             [object] => {
