@@ -7,7 +7,7 @@
 use std::time::Instant;
 
 #[cfg(debug_assertions)]
-pub use debug::{count, enabled, record, report, reset, start};
+pub use debug::{count, enabled, record, report, start};
 
 /// Turn the diagnostics on for the calling thread, in a test.
 ///
