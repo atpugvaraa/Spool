@@ -64,7 +64,12 @@ use std::rc::Rc;
 
 use crate::engine::canvas::EngineCanvas;
 use crate::engine::inspector_model as model;
+use crate::engine::panel_arrange::{
+    self as panel_arrange, ArrangeAction, ArrangeHost, ArrangeModel, ArrangePanelState,
+};
 use crate::engine::panel_a11y::{
+    // the Arrange section's own state and its command spelling
+
     self as panel_a11y, A11yAction, A11yHost, A11yModel, A11yPanelState,
 };
 use crate::engine::panel_assets::{
@@ -149,7 +154,7 @@ const NO_STROKE: &str = "No stroke to be wide";
 ///
 /// Fixed rather than growable, so a section's slot can be baked into the click
 /// closure that toggles it.
-pub const SECTION_COUNT: usize = 10;
+pub const SECTION_COUNT: usize = 11;
 
 /// A collapsible section, addressed by a slot.
 ///
@@ -172,6 +177,8 @@ impl SectionSlot {
     pub const VARIABLES: Self = Self(7);
     pub const ASSETS: Self = Self(8);
     pub const A11Y: Self = Self(9);
+    /// The Arrange section: alignment, order, distribution and booleans.
+    pub const ARRANGE: Self = Self(10);
 
     fn index(self) -> usize {
         self.0
@@ -1499,6 +1506,8 @@ pub struct Inspector {
     devmode_state: Rc<RefCell<DevPanelState>>,
     /// The Accessibility section's state: what is being typed into the name.
     a11y_state: Rc<RefCell<A11yPanelState>>,
+    /// The Arrange section's state: which of its menus is open.
+    arrange_state: Rc<RefCell<ArrangePanelState>>,
     /// The Prototype tab's own state: which menu is open, what is being typed
     /// into it, and which interaction's editor is open.
     prototyping_state: Rc<RefCell<ProtoPanelState>>,
@@ -1555,6 +1564,7 @@ impl Inspector {
             devmode_state: Rc::new(RefCell::new(DevPanelState::new())),
             comments_state: Rc::new(RefCell::new(CommentsPanelState::new())),
             a11y_state: Rc::new(RefCell::new(A11yPanelState::default())),
+            arrange_state: Rc::new(RefCell::new(ArrangePanelState::default())),
             assets_state: Rc::new(RefCell::new(AssetsPanelState::default())),
             typography_state: Rc::new(RefCell::new(TypographyPanelState::default())),
             color_state: Rc::new(RefCell::new(ColorPickerState::default())),
@@ -1659,6 +1669,7 @@ impl Inspector {
             || self.assets_state.borrow().is_busy()
             || self.devmode_state.borrow().is_busy()
             || self.a11y_state.borrow().is_busy()
+            || self.arrange_state.borrow().is_busy()
             // The Variables section's field and the Prototype tab's. They are
             // text buffers like any other, and the ladder has to know.
             || self.variables_state.borrow().is_busy()
@@ -1764,6 +1775,11 @@ impl Inspector {
         }
         let devmode_cancelled = self.devmode_state.borrow_mut().cancel();
         if devmode_cancelled {
+            cx.notify();
+            return true;
+        }
+        let arrange_cancelled = self.arrange_state.borrow_mut().cancel();
+        if arrange_cancelled {
             cx.notify();
             return true;
         }
@@ -2113,6 +2129,27 @@ impl Inspector {
     }
 
     /// The export section: the selected layer's export settings.
+    /// The Arrange section: alignment, order, distribution and booleans.
+    fn arrange_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(engine) = self.engine.clone() else {
+            return empty_note("Nothing selected").into_any_element();
+        };
+        let model: ArrangeModel = engine.read(cx).with_session(|session| {
+            let Ok(doc) = session.doc() else {
+                return ArrangeModel::default();
+            };
+            panel_arrange::selected_arrange(doc, &session.selection())
+        });
+        let state = self.arrange_state.clone();
+        panel_arrange::section(&model, &state, cx).into_any_element()
+    }
+
+    /// Run an arrange change through the engine.
+    fn run_arrange_action(&mut self, action: ArrangeAction, cx: &mut Context<Self>) {
+        let (command, params) = action.command();
+        self.run(&command, params, cx);
+    }
+
     fn export_section(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(engine) = self.engine.clone() else {
             return empty_note("Add export setting").into_any_element();
@@ -2686,6 +2723,13 @@ impl ColorHost for Inspector {
     }
 }
 
+impl ArrangeHost for Inspector {
+    /// Run an arrange change through the engine.
+    fn run_arrange_action(&mut self, action: ArrangeAction, cx: &mut Context<Self>) {
+        Inspector::run_arrange_action(self, action, cx);
+    }
+}
+
 impl ExportHost for Inspector {
     /// Run an export change through the engine.
     fn run_export_action(&mut self, action: ExportAction, cx: &mut Context<Self>) {
@@ -2871,6 +2915,12 @@ impl Inspector {
                 column()
                     .child(self.layer_header(object, cx))
                     .child(self.position_section(selection, cx))
+                    .child(self.inspector_section(
+                        "Arrange",
+                        SectionSlot::ARRANGE,
+                        self.arrange_section(cx),
+                        cx,
+                    ))
                     .child(self.layout_section(selection, cx))
                     .child(self.inspector_section(
                         "Appearance",
@@ -2928,6 +2978,12 @@ impl Inspector {
                 let mut sections = column()
                     .child(multi_header(selected.len()))
                     .child(self.position_section(selected, cx))
+                    .child(self.inspector_section(
+                        "Arrange",
+                        SectionSlot::ARRANGE,
+                        self.arrange_section(cx),
+                        cx,
+                    ))
                     // The layout section is here too: a selection of several
                     // frames has one layout each, and a disagreement about it
                     // is a disagreement the panel has to say out loud.
@@ -4431,6 +4487,7 @@ mod tests {
             SectionSlot::VARIABLES,
             SectionSlot::ASSETS,
             SectionSlot::A11Y,
+            SectionSlot::ARRANGE,
         ];
         assert_eq!(slots.len(), SECTION_COUNT, "every slot is accounted for");
         for (index, slot) in slots.iter().enumerate() {
