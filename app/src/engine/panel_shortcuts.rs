@@ -115,7 +115,8 @@ pub const TITLE: &str = "Keyboard shortcuts";
 /// is worse than no sheet: these say what the words on the rows mean, and
 /// which chords are Spool's own rather than the table's.
 pub const NOTES: &[&str] = &[
-    "Canvas: on the canvas, not while editing text.  Text: only while editing text.  Both: in both.",
+    "Canvas: the canvas's own chord — the canvas answers it while it holds the keyboard, and it is not live while editing text.  Text: only while editing text.  Both: in both.",
+    "\"Not wired\" means the chord is in the table and nothing in Spool answers it yet.",
     "Escape is Spool's ladder: it steps out one step at a time — panel, inspector, gesture, text, selection, tool.",
     "The save is Spool's own: it writes the document back to the HTML and CSS the project was authored in.",
     "Gestures are answered by the canvas while it holds the keyboard.",
@@ -159,13 +160,20 @@ impl Scope {
 /// Whether Spool answers a shortcut, and who.
 ///
 /// The answer comes from the live table and from the keymap Spool installs,
-/// never from a list written out here.
+/// never from a list written out here. The one that is derived rather than
+/// declared is [`Wired::Shell`]: a chord the keymap does not install, and
+/// that is not a text chord, is a chord the shell answers itself — which is
+/// Escape (the ladder) and the save (Spool's own), today.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Wired {
     /// The keymap installs it: a GPUI key binding dispatches the command.
     Keymap,
     /// The shell answers it: Escape is the shell's ladder, and the save is
     /// Spool's own.
+    ///
+    /// Derived from the keymap's own table: the keymap does not install this
+    /// chord, so the shell must. A test pins the exact set, so a third chord
+    /// joining the shell's is a failing test rather than a silent change.
     Shell,
     /// The canvas answers it: a gesture, not a command.
     Canvas,
@@ -364,33 +372,37 @@ fn scope_of(context: KeyContext) -> Scope {
     }
 }
 
-/// The chords the shell answers rather than the keymap.
-///
-/// Escape is the shell's ladder — it walks down from the topmost thing the
-/// user entered — and the save is Spool's own, because the engine's
-/// `file.save` writes a different file. The keymap installs neither, and a
-/// test says so: this list and the keymap's own table cannot drift apart
-/// without a test failing.
-const SHELL_OWNS: &[&str] = &["select.none", "file.save"];
-
 /// Who answers a binding.
 ///
 /// The keymap's own table is the authority for the chords it installs, and the
-/// shell is the authority for the two it answers itself.
+/// shell is the authority for the two it answers itself. Nothing here is
+/// written out by hand: a chord the keymap does not install, and that is not
+/// a text chord, is a chord the shell answers.
 fn wired_of(binding: &Binding, installed: &HashSet<String>) -> Wired {
-    if SHELL_OWNS.contains(&binding.id) {
-        return Wired::Shell;
-    }
     if binding.context == KeyContext::Text {
         // The text editing layer owns these, and Spool's does not implement
         // them yet: the keymap does not install them, and nothing else
         // answers them either.
         return Wired::NotYet;
     }
-    if installed.contains(binding.id) && crate::engine::menus::available(binding.id) {
-        return Wired::Keymap;
+    if installed.contains(binding.id) {
+        // The keymap installs it, so a GPUI key binding dispatches it. If
+        // Spool cannot run the command at all, then the chord is dead
+        // whatever the keymap says, and the sheet says that too.
+        return if crate::engine::menus::available(binding.id) {
+            Wired::Keymap
+        } else {
+            Wired::NotYet
+        };
     }
-    Wired::NotYet
+    // NOT INSTALLED, AND NOT A TEXT CHORD: the shell answers it.
+    //
+    // Escape is the shell's ladder rather than a binding, and the save is
+    // Spool's own. Both are chords the keymap deliberately does not install,
+    // and both are chords the shell does answer — so "not installed" is the
+    // fact that decides it, and the set that follows from that fact is
+    // checked by a test rather than written out here.
+    Wired::Shell
 }
 
 /// Rows a column of the fullest tab holds.
@@ -436,6 +448,11 @@ pub const COL_GAP: f32 = 24.0;
 /// fixed, because the sheet is anchored to the window rather than to a
 /// column.
 pub const PANEL_W: f32 = 1040.0;
+
+/// The width of the search field.
+///
+/// figcraft's own field asks for 180 points.
+pub const SEARCH_W: f32 = 180.0;
 
 /// The sheet's own state.
 ///
@@ -573,15 +590,45 @@ fn header<T: 'static>(
     }
     div()
         .flex()
-        .items_center()
-        .justify_between()
-        .gap_2()
-        .px(px(12.0))
-        .py(px(10.0))
+        .flex_col()
         .border_b_1()
         .border_color(rgb(theme::BORDER_SOFT))
-        .child(strip)
-        .child(search_field(state, focus, cx))
+        // The title, and the search beside it.
+        //
+        // figcraft's dialog names itself, and a sheet that does not say what
+        // it is leaves the user reading a list of chords with nothing to
+        // call it.
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .px(px(12.0))
+                .pt(px(10.0))
+                .pb(px(8.0))
+                .child(
+                    div()
+                        .id("shortcuts-title")
+                        .debug_selector(|| "shortcuts-title".to_owned())
+                        .text_sm()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(rgb(theme::TEXT))
+                        .child(TITLE),
+                )
+                .child(search_field(state, focus, cx)),
+        )
+        // The tab strip, under the title: twelve tabs and a search field do
+        // not share one line without one of them being squeezed.
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .px(px(12.0))
+                .pb(px(8.0))
+                .child(strip),
+        )
         .into_any_element()
 }
 
@@ -636,6 +683,10 @@ fn search_field<T: 'static>(
         .debug_selector(|| "shortcuts-search".to_owned())
         .flex()
         .items_center()
+        // A fixed width, so the field does not grow as the query does and
+        // push the title across the sheet. figcraft's own field is 180 wide.
+        .w(px(SEARCH_W))
+        .flex_shrink_0()
         .px(px(8.0))
         .py(px(6.0))
         .rounded_md()
@@ -649,6 +700,8 @@ fn search_field<T: 'static>(
             theme::TEXT_SECONDARY
         }))
         .cursor_text()
+        .overflow_hidden()
+        .truncate()
         .child(if empty {
             SEARCH_SHORTCUTS.to_owned()
         } else {
@@ -851,6 +904,16 @@ mod tests {
 
     const PLATFORMS: [Platform; 2] = [Platform::Mac, Platform::Other];
 
+    /// The chords the shell answers itself, as the sheet should report them.
+    ///
+    /// Escape is the shell's ladder and the save is Spool's own. The sheet
+    /// **derives** this set from the keymap's own table — a chord the keymap
+    /// does not install, and that is not a text chord, is the shell's — and
+    /// this is the expected result of that derivation, pinned so that a
+    /// change on either side fails a test rather than quietly changing what
+    /// the sheet teaches.
+    const SHELL_OWNS: &[&str] = &["file.save", "select.none"];
+
     fn row<'a>(model: &'a ShortcutsModel, id: &str) -> &'a Row {
         model
             .rows
@@ -951,9 +1014,11 @@ mod tests {
     /// The shell's two chords are exactly the ones the keymap does not
     /// install.
     ///
-    /// If a third chord joins the shell's, or one of these two leaves it, the
-    /// sheet would be teaching a chord that nothing answers — so this fails
-    /// rather than letting the two lists drift apart.
+    /// The sheet derives the set from the keymap's own table, so the two
+    /// cannot drift apart. The result is pinned here: if a third chord joins
+    /// the shell's, or one of these two leaves it, the sheet would be
+    /// teaching a chord that nothing answers — so this fails rather than
+    /// letting the two lists drift apart.
     #[test]
     fn the_shells_chords_are_exactly_the_ones_the_keymap_does_not_install() {
         for platform in PLATFORMS {
@@ -966,6 +1031,16 @@ mod tests {
                     binding.id
                 );
             }
+            // And the sheet says the same thing, from the same table.
+            let model = ShortcutsModel::read(platform);
+            let mut shell: Vec<&str> = model
+                .rows
+                .iter()
+                .filter(|row| row.wired == Wired::Shell)
+                .map(|row| row.id)
+                .collect();
+            shell.sort_unstable();
+            assert_eq!(shell, SHELL_OWNS, "{platform:?}");
         }
     }
 
@@ -1023,6 +1098,149 @@ mod tests {
         assert!(groups.len() > 1, "a search should cross the groups: {groups:?}");
         // And a search that matches nothing finds nothing.
         assert!(model.visible(None, "no such shortcut").is_empty());
+    }
+
+    /// A row says where the table says the chord is live.
+    ///
+    /// The scope is figcraft's own context, read from the table rather than
+    /// written out here: the canvas, only while editing text, or both.
+    #[test]
+    fn a_row_says_where_the_table_says_it_is_live() {
+        for platform in PLATFORMS {
+            let model = ShortcutsModel::read(platform);
+            for (index, binding) in KEYS.iter().enumerate() {
+                let expected = match binding.context {
+                    KeyContext::Canvas => Scope::Canvas,
+                    KeyContext::Text => Scope::Text,
+                    KeyContext::Both => Scope::Both,
+                };
+                assert_eq!(
+                    model.rows[index].scope,
+                    expected,
+                    "{}: {platform:?}",
+                    binding.id
+                );
+            }
+        }
+    }
+
+    /// The chords on a row are the table's own chords.
+    ///
+    /// Read back out of the same place the keymap reads them, and spelled
+    /// the way the keymap spells them: a row cannot show a chord the table
+    /// does not have, and it cannot hide one it does.
+    ///
+    /// By position, not by id: the table binds `view.assets` twice — once
+    /// under View and once under Components, with different chords — and the
+    /// sheet has a row for each, the way figcraft's own panel does.
+    #[test]
+    fn the_chords_on_a_row_are_the_table_s_own() {
+        for platform in PLATFORMS {
+            let model = ShortcutsModel::read(platform);
+            for (index, binding) in KEYS.iter().enumerate() {
+                // Every chord the table's specs stand for, in the table's
+                // order, with the alternatives that read the same collapsed.
+                let mut expected: Vec<String> = Vec::new();
+                for spec in binding.keys(platform) {
+                    for chord in keymap::gpui_keystrokes(spec) {
+                        let Some(spelling) = normalised(&chord, binding.id) else {
+                            continue;
+                        };
+                        if !expected.contains(&spelling) {
+                            expected.push(spelling);
+                        }
+                    }
+                }
+                let shown = &model.rows[index].keys;
+                let wanted = &expected[..expected.len().min(MAX_KEYS)];
+                assert_eq!(shown, wanted, "{}: {platform:?}", binding.id);
+            }
+        }
+    }
+
+    /// Every chord the sheet calls live is one the keymap installed.
+    ///
+    /// The sheet says a chord is live; the keymap is what makes it live. If
+    /// the two disagree then the sheet is teaching a chord that does
+    /// nothing — so this reads the keymap's own installed chords and
+    /// compares, rather than trusting the sheet's own word for it.
+    #[test]
+    fn every_chord_the_sheet_calls_live_is_one_the_keymap_installed() {
+        for platform in PLATFORMS {
+            let bindings = keymap::bindings(platform);
+            let installed: HashSet<String> =
+                bindings.iter().map(keymap::normalized).collect();
+            let model = ShortcutsModel::read(platform);
+            for row in &model.rows {
+                if row.wired != Wired::Keymap {
+                    continue;
+                }
+                for key in &row.keys {
+                    assert!(
+                        installed.contains(key),
+                        "{platform:?}: `{}` shows `{key}`, which the keymap does not install",
+                        row.id
+                    );
+                }
+            }
+        }
+    }
+
+    /// The gestures are in the sheet, under the group the table gives them.
+    ///
+    /// A gesture is not a command: the canvas answers it itself. They are
+    /// listed after the bindings, in the table's order, and a search finds
+    /// them by their own words.
+    #[test]
+    fn the_gestures_are_in_the_sheet_under_their_own_group() {
+        for platform in PLATFORMS {
+            let model = ShortcutsModel::read(platform);
+            assert!(
+                model
+                    .rows
+                    .iter()
+                    .take(KEYS.len())
+                    .all(|row| !row.id.is_empty()),
+                "the bindings come first"
+            );
+            let gestures: Vec<&Row> = model
+                .rows
+                .iter()
+                .filter(|row| row.id.is_empty())
+                .collect();
+            assert_eq!(gestures.len(), GESTURES.len());
+            for (index, (group, label, mac, other)) in GESTURES.iter().enumerate() {
+                let row = &model.rows[KEYS.len() + index];
+                assert_eq!(row.group, *group);
+                assert_eq!(row.label, *label);
+                assert_eq!(row.scope, Scope::Gesture);
+                assert_eq!(row.wired, Wired::Canvas);
+                let expected = if platform == Platform::Mac { mac } else { other };
+                assert_eq!(row.keys, vec![(*expected).to_string()]);
+            }
+            // And a search finds a gesture by its words.
+            assert!(model
+                .visible(None, "pan the canvas")
+                .iter()
+                .any(|row| row.id.is_empty()));
+        }
+    }
+
+    /// A row never shows the same chord twice.
+    ///
+    /// The alternatives that read the same show once — figcraft's own rule —
+    /// and a row shows at most figcraft's two.
+    #[test]
+    fn a_row_never_shows_the_same_chord_twice() {
+        for platform in PLATFORMS {
+            for row in ShortcutsModel::read(platform).rows {
+                let mut seen = HashSet::new();
+                for key in &row.keys {
+                    assert!(seen.insert(key.clone()), "{}: `{key}` twice", row.id);
+                }
+                assert!(row.keys.len() <= MAX_KEYS, "{}: {:?}", row.id, row.keys);
+            }
+        }
     }
 
     // ── In a real window ─────────────────────────────────────────────────────
@@ -1092,6 +1310,12 @@ mod tests {
         assert!(
             panel.size.height > px(0.0),
             "the sheet is on screen: {panel:?}"
+        );
+        // It says what it is.
+        let title = bounds(window, "shortcuts-title");
+        assert!(
+            title.size.height > px(0.0),
+            "the sheet names itself: {title:?}"
         );
         let tabs = bounds(window, "shortcuts-tabs");
         assert!(
@@ -1165,5 +1389,76 @@ mod tests {
             window.debug_bounds("shortcuts-body").is_none(),
             "and there are no rows to draw"
         );
+    }
+
+    /// Clicking a tab shows that group's rows.
+    ///
+    /// The tabs are the table's groups, and a tab that did not change what is
+    /// on screen would be a picture of a tab rather than a tab.
+    #[gpui::test]
+    fn clicking_a_tab_shows_that_groups_rows(cx: &mut TestAppContext) {
+        let (host, window) = open_sheet(cx, Platform::Mac);
+        draw(&host, window);
+
+        // The Essential tab is what figcraft opens on.
+        assert!(window.debug_bounds("shortcuts-row-app.actions").is_some());
+
+        let tools = bounds(window, "shortcuts-tab-Tools");
+        window.simulate_click(tools.center(), Modifiers::none());
+        window.run_until_parked();
+        draw(&host, window);
+
+        assert!(
+            window.debug_bounds("shortcuts-row-tool.move").is_some(),
+            "the Tools tab shows its own rows"
+        );
+        assert!(
+            window.debug_bounds("shortcuts-row-app.actions").is_none(),
+            "and not the tab that was showing"
+        );
+    }
+
+    /// The sheet says when its search field has the keyboard.
+    ///
+    /// While it does, a character typed into it is a character and not an
+    /// editor shortcut, so the shortcut has to be skipped — and only the
+    /// sheet can say that, because only the sheet knows where its own field
+    /// is. This is the hook the shell reads.
+    #[gpui::test]
+    fn the_sheet_says_when_the_search_field_has_the_keyboard(cx: &mut TestAppContext) {
+        let (host, window) = open_sheet(cx, Platform::Mac);
+        draw(&host, window);
+
+        assert!(!is_searching(&host, window), "the search starts unused");
+
+        let search = bounds(window, "shortcuts-search");
+        window.simulate_click(search.center(), Modifiers::none());
+        window.run_until_parked();
+        draw(&host, window);
+
+        assert!(
+            is_searching(&host, window),
+            "the field has the keyboard, so the shell has to skip the shortcuts"
+        );
+
+        // And a query in it counts as in use even once the field has lost the
+        // focus: the text is still there to be edited.
+        type_text(window, "copy");
+        let title = bounds(window, "shortcuts-title");
+        window.simulate_click(title.center(), Modifiers::none());
+        window.run_until_parked();
+        draw(&host, window);
+
+        assert!(
+            is_searching(&host, window),
+            "a query in the field is still a search in progress"
+        );
+    }
+
+    /// Whether the sheet's search field has the keyboard.
+    fn is_searching(host: &Entity<Host>, window: &mut VisualTestContext) -> bool {
+        window.update(|window, cx| {
+            host.read_with(cx, |host, _| host.state.borrow().is_searching(window))
+        })
     }
 }
