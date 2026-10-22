@@ -63,7 +63,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use figcraft_doc::{BoolOp, Document, NodeId};
-use figcraft_engine::{booleans, cmd::arrange as engine_arrange};
+use figcraft_engine::{booleans, cmd::arrange as engine_arrange, cmd::edit as engine_edit};
 use gpui::{
     div, px, rgb, svg, AnyElement, Context, Div, FontWeight, InteractiveElement, IntoElement,
     ParentElement, SharedString, Stateful, StatefulInteractiveElement, Styled, Svg,
@@ -107,6 +107,9 @@ const COMBINE_REASON: &str = "Select two or more shapes to combine";
 
 /// Why nothing can be combined.
 const COMBINE_ONE_REASON: &str = "Select a shape to combine";
+
+/// Why a section cannot be combined with anything.
+const COMBINE_SECTION_REASON: &str = "A section cannot go in a boolean group";
 
 /// What the save path does with a boolean operation today.
 const BOOLEAN_SAVE_NOTE: &str =
@@ -224,12 +227,9 @@ pub fn selected_arrange(doc: &Document, selection: &[NodeId]) -> ArrangeModel {
     } else {
         Availability::Disabled(ORDER_REASON)
     };
-    let boolean = if can_combine(doc, &ids) {
-        Availability::Supported
-    } else if count == 0 {
-        Availability::Disabled(COMBINE_ONE_REASON)
-    } else {
-        Availability::Disabled(COMBINE_REASON)
+    let boolean = match combine_blocker(doc, &ids) {
+        None => Availability::Supported,
+        Some(reason) => Availability::Disabled(reason),
     };
     ArrangeModel {
         ids,
@@ -244,25 +244,41 @@ pub fn selected_arrange(doc: &Document, selection: &[NodeId]) -> ArrangeModel {
     }
 }
 
-/// Whether the selection can be combined into a boolean.
+/// Why the selection cannot be combined into a boolean, if it cannot.
 ///
 /// The engine's rule, read the same way `booleans::apply` reads it: one
 /// boolean group changes its own operation, layers inside a boolean group
 /// change theirs, and anything else is wrapped in a new group — which takes
-/// at least two shapes to be a boolean at all.
-fn can_combine(doc: &Document, ids: &[NodeId]) -> bool {
+/// at least two shapes to be a boolean at all, and refuses a section, because
+/// a section cannot go in a group or a frame.
+fn combine_blocker(doc: &Document, ids: &[NodeId]) -> Option<&'static str> {
     if ids.is_empty() {
-        return false;
+        return Some(COMBINE_ONE_REASON);
     }
     if let [one] = ids {
         if booleans::is_group(doc, *one) {
-            return true;
+            return None;
         }
     }
     if ids.iter().all(|id| booleans::group_of(doc, *id).is_some()) {
-        return true;
+        return None;
     }
-    ids.len() >= 2
+    if engine_edit::roots(doc, ids)
+        .iter()
+        .any(|id| is_section(doc, *id))
+    {
+        return Some(COMBINE_SECTION_REASON);
+    }
+    if ids.len() < 2 {
+        return Some(COMBINE_REASON);
+    }
+    None
+}
+
+/// Whether a layer is a section.
+fn is_section(doc: &Document, id: NodeId) -> bool {
+    doc.node(id)
+        .is_some_and(|node| matches!(node.kind, figcraft_doc::NodeKind::Section { .. }))
 }
 
 /// The boolean operation the selection uses.
@@ -624,7 +640,7 @@ pub fn section<T: ArrangeHost>(
                     .text_color(rgb(theme::TEXT))
                     .child(NO_SELECTION),
             )
-            .child(note(NO_SELECTION_NOTE))
+            .child(note("no-selection", NO_SELECTION_NOTE))
             .into_any_element();
     }
 
@@ -650,7 +666,7 @@ fn alignment_row<T: ArrangeHost>(model: &ArrangeModel, cx: &mut Context<T>) -> i
         column = column.child(row);
     }
     if let Some(reason) = model.align.reason() {
-        column = column.child(note(reason));
+        column = column.child(note("align", reason));
     }
     column
 }
@@ -760,7 +776,7 @@ fn distribute_row<T: ArrangeHost>(
         column = column.child(distribute_menu(model, cx));
     }
     if let Some(reason) = model.distribute.reason() {
-        column = column.child(note(reason));
+        column = column.child(note("distribute", reason));
     }
     column
 }
@@ -806,9 +822,8 @@ fn spacing_entry<T: ArrangeHost>(
         .id(SharedString::from(selector.clone()))
         .debug_selector(move || selector.clone())
         .flex()
-        .items_center()
-        .justify_between()
-        .gap_2()
+        .flex_col()
+        .gap_1()
         .px(px(6.0))
         .py(px(4.0))
         .rounded_sm()
@@ -824,6 +839,10 @@ fn spacing_entry<T: ArrangeHost>(
             }));
     } else {
         entry = entry.cursor_default().opacity(0.5);
+    }
+    // A disabled entry says why it is disabled, in words, under itself.
+    if let Some(reason) = availability.reason() {
+        entry = entry.child(note(&format!("spacing-{}", spacing.command()), reason));
     }
     entry
 }
@@ -841,7 +860,7 @@ fn order_row<T: ArrangeHost>(model: &ArrangeModel, cx: &mut Context<T>) -> impl 
         column = column.child(row);
     }
     if let Some(reason) = model.order.reason() {
-        column = column.child(note(reason));
+        column = column.child(note("order", reason));
     }
     column
 }
@@ -949,12 +968,12 @@ fn boolean_row<T: ArrangeHost>(
         column = column.child(boolean_menu(model, cx));
     }
     if let Some(reason) = model.boolean.reason() {
-        column = column.child(note(reason));
+        column = column.child(note("boolean", reason));
     }
     // The save path cannot write a boolean operation back, so the panel says
     // so where the change is made rather than leaving the user to find out
     // by saving.
-    column = column.child(note(BOOLEAN_SAVE_NOTE));
+    column = column.child(note("boolean-save", BOOLEAN_SAVE_NOTE));
     column
 }
 
@@ -1080,18 +1099,26 @@ fn sublabel(text: &'static str) -> Div {
 }
 
 /// A line of text under the rows it belongs to.
-fn note(text: &str) -> Stateful<Div> {
+///
+/// The name is what makes the line findable: two lines that say the same
+/// thing are still two lines, and each keeps its own name.
+fn note(name: &str, text: &str) -> Stateful<Div> {
     div()
-        .id(SharedString::from(format!("arrange-note-{text}")))
-        .debug_selector(|| format!("arrange-note-{text}"))
+        .id(SharedString::from(format!("arrange-note-{name}")))
+        .debug_selector(|| format!("arrange-note-{name}"))
         .text_xs()
         .text_color(rgb(theme::TEXT_MUTED))
         .child(text.to_owned())
 }
 
 /// A value the panel shows but will not edit.
-fn read_only(label: &'static str, value: &str) -> Div {
+///
+/// The value carries its own name in the panel's debug selectors, so a test
+/// can say which value is on screen and not only that some value is.
+fn read_only(label: &'static str, value: &str) -> Stateful<Div> {
     div()
+        .id(SharedString::from(format!("arrange-read-only-{label}")))
+        .debug_selector(|| format!("arrange-read-only-{label}"))
         .flex()
         .items_center()
         .justify_between()
@@ -1110,6 +1137,8 @@ fn read_only(label: &'static str, value: &str) -> Div {
         )
         .child(
             div()
+                .id(SharedString::from(format!("arrange-value-{label}-{value}")))
+                .debug_selector(|| format!("arrange-value-{label}-{value}"))
                 .text_xs()
                 .text_color(rgb(theme::TEXT_SECONDARY))
                 .child(value.to_owned()),
@@ -1245,4 +1274,832 @@ fn icon(icon: ArrangeIcon, size_px: f32, color: u32) -> Svg {
         .h(px(size_px))
         .text_color(rgb(color))
         .flex_shrink_0()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use figcraft_doc::NodeKind;
+    use figcraft_engine::{Session, find_command, params::id_of};
+    use gpui::{point, size, Entity, Modifiers, Render, TestAppContext, VisualTestContext};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    // ── The documents the model reads ──────────────────────────────────────
+
+    /// A document with one rectangle on its page.
+    fn one_rectangle() -> (Document, NodeId) {
+        let mut doc = Document::new("test");
+        let page = doc.pages[0];
+        let id = doc
+            .create(page, NodeKind::Rectangle, "Hero", 0.0, 0.0, 100.0, 100.0)
+            .expect("a rectangle");
+        (doc, id)
+    }
+
+    /// A document with two rectangles on its page, one of them well to the right.
+    fn two_rectangles() -> (Document, NodeId, NodeId) {
+        let mut doc = Document::new("test");
+        let page = doc.pages[0];
+        let first = doc
+            .create(page, NodeKind::Rectangle, "First", 0.0, 0.0, 100.0, 100.0)
+            .expect("a rectangle");
+        let second = doc
+            .create(page, NodeKind::Rectangle, "Second", 200.0, 50.0, 100.0, 100.0)
+            .expect("a rectangle");
+        (doc, first, second)
+    }
+
+    /// A document with three rectangles on its page.
+    fn three_rectangles() -> (Document, Vec<NodeId>) {
+        let mut doc = Document::new("test");
+        let page = doc.pages[0];
+        let mut ids = Vec::new();
+        for (index, x) in [0.0, 50.0, 300.0].into_iter().enumerate() {
+            let id = doc
+                .create(
+                    page,
+                    NodeKind::Rectangle,
+                    &format!("Rectangle {index}"),
+                    x,
+                    0.0,
+                    10.0,
+                    10.0,
+                )
+                .expect("a rectangle");
+            ids.push(id);
+        }
+        (doc, ids)
+    }
+
+    /// A session over two overlapping rectangles, and the boolean group the
+    /// engine makes of them.
+    ///
+    /// The group is the engine's own: the panel never makes one itself.
+    fn boolean_group() -> (Session, NodeId, NodeId, NodeId) {
+        let mut doc = Document::new("test");
+        let page = doc.pages[0];
+        let first = doc
+            .create(page, NodeKind::Rectangle, "First", 0.0, 0.0, 100.0, 100.0)
+            .expect("a rectangle");
+        let second = doc
+            .create(page, NodeKind::Rectangle, "Second", 50.0, 50.0, 100.0, 100.0)
+            .expect("a rectangle");
+        let mut session = Session::with_document(doc);
+        let result = session
+            .execute("bool.subtract", &json!({ "ids": [first.0, second.0] }))
+            .expect("the engine makes the boolean group");
+        let group = id_of(&result["id"]).expect("the group's id");
+        (session, group, first, second)
+    }
+
+    // ── The model: what the buttons are for ────────────────────────────────
+
+    #[test]
+    fn nothing_selected_enables_nothing_and_says_why() {
+        let (doc, _id) = one_rectangle();
+        let model = selected_arrange(&doc, &[]);
+        assert!(model.ids.is_empty(), "nothing is selected");
+        assert_eq!(model.align, Availability::Disabled(ALIGN_REASON));
+        assert_eq!(model.distribute, Availability::Disabled(TIDY_REASON));
+        assert_eq!(
+            model.distribute_horizontal,
+            Availability::Disabled(DISTRIBUTE_REASON)
+        );
+        assert_eq!(
+            model.distribute_vertical,
+            Availability::Disabled(DISTRIBUTE_REASON)
+        );
+        assert_eq!(model.tidy, Availability::Disabled(TIDY_REASON));
+        assert_eq!(model.order, Availability::Disabled(ORDER_REASON));
+        assert_eq!(model.boolean, Availability::Disabled(COMBINE_ONE_REASON));
+        assert_eq!(model.boolean_value, BooleanValue::Unset);
+    }
+
+    #[test]
+    fn every_disabled_control_says_why_out_loud() {
+        let (doc, _id) = one_rectangle();
+        let model = selected_arrange(&doc, &[]);
+        for (name, availability) in [
+            ("align", model.align),
+            ("distribute", model.distribute),
+            ("distribute horizontal", model.distribute_horizontal),
+            ("distribute vertical", model.distribute_vertical),
+            ("tidy", model.tidy),
+            ("order", model.order),
+            ("boolean", model.boolean),
+        ] {
+            let reason = availability.reason().unwrap_or_else(|| {
+                panic!("{name} is disabled and says nothing about why")
+            });
+            assert!(!reason.trim().is_empty(), "{name} says nothing");
+        }
+    }
+
+    #[test]
+    fn a_layer_alone_on_the_page_cannot_be_aligned() {
+        // figcraft's own rule: a layer with no frame to align to has nothing
+        // to align to, so the alignment buttons are off and say so.
+        let (doc, id) = one_rectangle();
+        let model = selected_arrange(&doc, &[id]);
+        assert_eq!(
+            model.align,
+            Availability::Disabled(ALIGN_REASON),
+            "a layer on the page has nothing to align to"
+        );
+        assert_eq!(
+            model.align.reason(),
+            Some("A layer on its own aligns to its frame: select more layers, or one in a frame"),
+            "figcraft's own words"
+        );
+    }
+
+    #[test]
+    fn a_layer_in_a_frame_aligns_to_its_frame() {
+        let mut doc = Document::new("test");
+        let page = doc.pages[0];
+        let frame = doc
+            .create(page, NodeKind::Frame, "Frame", 0.0, 0.0, 400.0, 400.0)
+            .expect("a frame");
+        let inner = doc
+            .create(frame, NodeKind::Rectangle, "Inner", 10.0, 10.0, 50.0, 50.0)
+            .expect("a rectangle");
+        let model = selected_arrange(&doc, &[inner]);
+        assert_eq!(
+            model.align,
+            Availability::Supported,
+            "a layer in a frame has its frame to align to"
+        );
+    }
+
+    #[test]
+    fn two_layers_on_the_page_can_be_aligned() {
+        let (doc, first, second) = two_rectangles();
+        let model = selected_arrange(&doc, &[first, second]);
+        assert_eq!(model.align, Availability::Supported);
+    }
+
+    #[test]
+    fn the_order_buttons_need_one_layer() {
+        let (doc, id) = one_rectangle();
+        assert_eq!(
+            selected_arrange(&doc, &[]).order,
+            Availability::Disabled(ORDER_REASON)
+        );
+        assert_eq!(selected_arrange(&doc, &[id]).order, Availability::Supported);
+    }
+
+    #[test]
+    fn the_distribute_menu_opens_for_two_and_its_entries_need_three() {
+        let (doc, first, second) = two_rectangles();
+        let model = selected_arrange(&doc, &[first, second]);
+        assert_eq!(
+            model.distribute,
+            Availability::Supported,
+            "the menu holds a tidy-up, which two layers are enough for"
+        );
+        assert_eq!(
+            model.tidy,
+            Availability::Supported,
+            "two layers can be tidied"
+        );
+        assert_eq!(
+            model.distribute_horizontal,
+            Availability::Disabled(DISTRIBUTE_REASON),
+            "the engine spaces three layers and no fewer"
+        );
+        assert_eq!(
+            model.distribute_vertical,
+            Availability::Disabled(DISTRIBUTE_REASON)
+        );
+
+        let (doc, ids) = three_rectangles();
+        let model = selected_arrange(&doc, &ids);
+        assert_eq!(model.distribute, Availability::Supported);
+        assert_eq!(model.distribute_horizontal, Availability::Supported);
+        assert_eq!(model.distribute_vertical, Availability::Supported);
+        assert_eq!(model.tidy, Availability::Supported);
+    }
+
+    #[test]
+    fn two_shapes_can_be_combined_and_one_cannot() {
+        let (doc, first, second) = two_rectangles();
+        assert_eq!(
+            selected_arrange(&doc, &[first]).boolean,
+            Availability::Disabled(COMBINE_REASON),
+            "one shape cannot be combined with anything"
+        );
+        assert_eq!(
+            selected_arrange(&doc, &[first, second]).boolean,
+            Availability::Supported
+        );
+    }
+
+    #[test]
+    fn a_section_cannot_be_combined_with_anything() {
+        // The engine refuses to wrap a section in a group, so the panel must
+        // not offer to.
+        let mut doc = Document::new("test");
+        let page = doc.pages[0];
+        let section = doc
+            .create(
+                page,
+                NodeKind::Section {
+                    contents_hidden: false,
+                },
+                "Section",
+                0.0,
+                0.0,
+                200.0,
+                200.0,
+            )
+            .expect("a section");
+        let other = doc
+            .create(page, NodeKind::Rectangle, "Other", 0.0, 0.0, 10.0, 10.0)
+            .expect("a rectangle");
+        let model = selected_arrange(&doc, &[section, other]);
+        assert_eq!(
+            model.boolean,
+            Availability::Disabled(COMBINE_SECTION_REASON),
+            "the engine would refuse the group the panel is offering"
+        );
+    }
+
+    #[test]
+    fn a_boolean_group_shows_the_operation_it_uses() {
+        let (session, group, _first, _second) = boolean_group();
+        let doc = session.doc().expect("a document");
+        let model = selected_arrange(doc, &[group]);
+        assert_eq!(
+            model.boolean_value,
+            BooleanValue::Set(BoolOp::Subtract),
+            "the operation the group uses"
+        );
+        assert_eq!(
+            model.boolean,
+            Availability::Supported,
+            "a boolean group can change its own operation"
+        );
+    }
+
+    #[test]
+    fn operands_that_disagree_read_as_mixed() {
+        let (mut session, group, first, second) = boolean_group();
+        // The top operand gets an operation of its own, so the two disagree.
+        session
+            .execute("bool.union", &json!({ "ids": [second.0] }))
+            .expect("the operand's own operation");
+        let doc = session.doc().expect("a document");
+        let model = selected_arrange(doc, &[first, second]);
+        assert_eq!(
+            model.boolean_value,
+            BooleanValue::Mixed,
+            "the two operands do not agree on how they combine"
+        );
+        assert_eq!(
+            model.boolean,
+            Availability::Supported,
+            "operands can still change their own operation"
+        );
+        let _ = group;
+    }
+
+    #[test]
+    fn ordinary_layers_have_no_boolean_operation() {
+        let (doc, first, second) = two_rectangles();
+        let model = selected_arrange(&doc, &[first, second]);
+        assert_eq!(
+            model.boolean_value,
+            BooleanValue::Unset,
+            "two ordinary layers are not a boolean at all"
+        );
+        assert_eq!(model.boolean_value.word(), NOT_SET);
+    }
+
+    #[test]
+    fn the_mixed_operation_does_not_hide_the_rest_of_the_panel() {
+        // The fold is per property: the operation is mixed, and the
+        // alignment and the order are still what they were.
+        let (mut session, _group, first, second) = boolean_group();
+        session
+            .execute("bool.union", &json!({ "ids": [second.0] }))
+            .expect("the operand's own operation");
+        let doc = session.doc().expect("a document");
+        let model = selected_arrange(doc, &[first, second]);
+        assert_eq!(model.boolean_value, BooleanValue::Mixed);
+        assert_eq!(model.boolean_value.word(), MIXED);
+        assert_eq!(
+            model.order,
+            Availability::Supported,
+            "one property disagreeing does not disable the others"
+        );
+        assert_eq!(model.align, Availability::Supported);
+    }
+
+    // ── The commands ───────────────────────────────────────────────────────
+
+    #[test]
+    fn every_command_the_panel_names_is_the_engines_own() {
+        let mut ids = Vec::new();
+        for alignment in Align::ALL {
+            ids.push(alignment.command());
+        }
+        for order in Order::ALL {
+            ids.push(order.command());
+        }
+        for spacing in Spacing::ALL {
+            ids.push(spacing.command());
+        }
+        for operation in [
+            BoolOp::Union,
+            BoolOp::Subtract,
+            BoolOp::Intersect,
+            BoolOp::Exclude,
+        ] {
+            ids.push(boolean_command(operation));
+        }
+        ids.push("bool.flatten");
+        for id in ids {
+            assert!(
+                find_command(id).is_some(),
+                "the engine has no command called {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_engines_own_labels_are_the_labels_the_panel_shows() {
+        for alignment in Align::ALL {
+            let spec = find_command(alignment.command()).expect("the engine's command");
+            assert_eq!(
+                alignment.label(),
+                spec.label,
+                "{} is labelled differently by the engine",
+                alignment.command()
+            );
+        }
+        for order in Order::ALL {
+            let spec = find_command(order.command()).expect("the engine's command");
+            assert_eq!(order.label(), spec.label, "{}", order.command());
+        }
+        for spacing in Spacing::ALL {
+            let spec = find_command(spacing.command()).expect("the engine's command");
+            assert_eq!(spacing.label(), spec.label, "{}", spacing.command());
+        }
+    }
+
+    #[test]
+    fn the_boolean_operations_are_named_the_way_figcraft_names_them() {
+        // figcraft's menu says the operation's own name, not the command's.
+        assert_eq!(BoolOp::Union.label(), "Union");
+        assert_eq!(BoolOp::Subtract.label(), "Subtract");
+        assert_eq!(BoolOp::Intersect.label(), "Intersect");
+        assert_eq!(BoolOp::Exclude.label(), "Exclude");
+        assert_eq!(boolean_command(BoolOp::Union), "bool.union");
+        assert_eq!(boolean_command(BoolOp::Subtract), "bool.subtract");
+        assert_eq!(boolean_command(BoolOp::Intersect), "bool.intersect");
+        assert_eq!(boolean_command(BoolOp::Exclude), "bool.exclude");
+    }
+
+    #[test]
+    fn the_panel_builds_the_engines_param_names() {
+        let ids = vec![NodeId(7), NodeId(9)];
+        let (command, params) = ArrangeAction::Align {
+            ids: ids.clone(),
+            alignment: Align::Left,
+        }
+        .command();
+        assert_eq!(command, "align.left");
+        assert_eq!(params, json!({ "ids": [7, 9] }));
+
+        let (command, params) = ArrangeAction::Order {
+            ids: ids.clone(),
+            order: Order::Front,
+        }
+        .command();
+        assert_eq!(command, "arrange.front");
+        assert_eq!(params, json!({ "ids": [7, 9] }));
+
+        let (command, params) = ArrangeAction::Spacing {
+            ids: ids.clone(),
+            spacing: Spacing::Tidy,
+        }
+        .command();
+        assert_eq!(command, "arrange.tidy");
+        assert_eq!(params, json!({ "ids": [7, 9] }));
+
+        let (command, params) = ArrangeAction::Boolean {
+            ids: ids.clone(),
+            operation: BoolOp::Intersect,
+        }
+        .command();
+        assert_eq!(command, "bool.intersect");
+        assert_eq!(params, json!({ "ids": [7, 9] }));
+
+        let (command, params) = ArrangeAction::Flatten { ids }.command();
+        assert_eq!(command, "bool.flatten");
+        assert_eq!(params, json!({ "ids": [7, 9] }));
+    }
+
+    #[test]
+    fn the_engines_align_command_moves_the_layers_the_panel_names() {
+        let (mut session, first, second) = {
+            let mut doc = Document::new("test");
+            let page = doc.pages[0];
+            let first = doc
+                .create(page, NodeKind::Rectangle, "First", 0.0, 0.0, 100.0, 100.0)
+                .expect("a rectangle");
+            let second = doc
+                .create(page, NodeKind::Rectangle, "Second", 200.0, 50.0, 100.0, 100.0)
+                .expect("a rectangle");
+            (Session::with_document(doc), first, second)
+        };
+        let (command, params) = ArrangeAction::Align {
+            ids: vec![first, second],
+            alignment: Align::Left,
+        }
+        .command();
+        session
+            .execute(&command, &params)
+            .expect("the engine accepts the panel's command");
+        let doc = session.doc().expect("a document");
+        let moved = doc.world_bounds(second).expect("the second layer's box");
+        assert_eq!(moved.x0, 0.0, "the second layer moved to the first one's edge");
+        assert_eq!(moved.y0, 50.0, "and only sideways");
+    }
+
+    #[test]
+    fn the_engines_order_command_reorders_the_siblings() {
+        let (mut session, ids) = {
+            let (doc, ids) = three_rectangles();
+            (Session::with_document(doc), ids)
+        };
+        let (command, params) = ArrangeAction::Order {
+            ids: vec![ids[0]],
+            order: Order::Back,
+        }
+        .command();
+        session
+            .execute(&command, &params)
+            .expect("the engine accepts the panel's command");
+        let doc = session.doc().expect("a document");
+        let page = doc.pages[0];
+        let children = doc.node(page).expect("the page").children.clone();
+        assert_eq!(
+            children.first().copied(),
+            Some(ids[0]),
+            "the layer went to the back"
+        );
+    }
+
+    #[test]
+    fn the_engines_distribute_command_spaces_the_selection_out() {
+        let (mut session, ids) = {
+            let (doc, ids) = three_rectangles();
+            (Session::with_document(doc), ids)
+        };
+        let (command, params) = ArrangeAction::Spacing {
+            ids: ids.clone(),
+            spacing: Spacing::Horizontal,
+        }
+        .command();
+        session
+            .execute(&command, &params)
+            .expect("the engine accepts the panel's command");
+        let doc = session.doc().expect("a document");
+        let middle = doc.world_bounds(ids[1]).expect("the middle layer's box");
+        // 0, 50 and 300 become 0, 150 and 300: the gaps are even.
+        assert_eq!(middle.x0, 150.0);
+    }
+
+    #[test]
+    fn the_engines_boolean_command_makes_a_boolean_group() {
+        let (mut session, first, second) = {
+            let mut doc = Document::new("test");
+            let page = doc.pages[0];
+            let first = doc
+                .create(page, NodeKind::Rectangle, "First", 0.0, 0.0, 100.0, 100.0)
+                .expect("a rectangle");
+            let second = doc
+                .create(page, NodeKind::Rectangle, "Second", 50.0, 50.0, 100.0, 100.0)
+                .expect("a rectangle");
+            (Session::with_document(doc), first, second)
+        };
+        let (command, params) = ArrangeAction::Boolean {
+            ids: vec![first, second],
+            operation: BoolOp::Union,
+        }
+        .command();
+        session
+            .execute(&command, &params)
+            .expect("the engine accepts the panel's command");
+        let doc = session.doc().expect("a document");
+        let group = doc
+            .node(first)
+            .expect("the first layer")
+            .parent
+            .expect("the group the two layers went into");
+        assert!(
+            booleans::is_group(doc, group),
+            "the engine made a boolean group"
+        );
+    }
+
+    // ── The panel's own state ──────────────────────────────────────────────
+
+    #[test]
+    fn the_panel_state_remembers_which_menu_is_open() {
+        let mut state = ArrangePanelState::new();
+        assert!(!state.is_busy(), "nothing is open to begin with");
+        state.open = Some(ArrangeMenu::Distribute);
+        assert!(state.is_busy(), "a menu is open");
+        assert!(state.cancel(), "the escape was the section's");
+        assert!(!state.is_busy());
+        assert!(!state.cancel(), "and the next one is not");
+    }
+
+    // ── The icons ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn every_icon_emits_one_well_formed_svg() {
+        for icon in [
+            ArrangeIcon::AlignLeft,
+            ArrangeIcon::AlignHorizontalCenter,
+            ArrangeIcon::AlignRight,
+            ArrangeIcon::AlignTop,
+            ArrangeIcon::AlignVerticalCenter,
+            ArrangeIcon::AlignBottom,
+            ArrangeIcon::DistributeHorizontal,
+            ArrangeIcon::Union,
+            ArrangeIcon::Subtract,
+            ArrangeIcon::Intersect,
+            ArrangeIcon::Exclude,
+        ] {
+            let markup = icon_svg(icon);
+            assert!(
+                markup.starts_with("<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 16 16\""),
+                "{icon:?}"
+            );
+            assert!(markup.ends_with("</svg>"), "{icon:?}");
+            assert!(markup.contains("#000"), "{icon:?} paints nothing");
+            assert_eq!(
+                markup.matches('<').count(),
+                markup.matches('>').count(),
+                "{icon:?}"
+            );
+            assert!(!markup.contains("NaN"), "{icon:?}");
+        }
+    }
+
+    // ── The panel, in a window ─────────────────────────────────────────────
+
+    /// A host for the section in a window: it draws the section, remembers
+    /// what the section asked for, and does what it is asked.
+    struct Host {
+        model: ArrangeModel,
+        state: Rc<RefCell<ArrangePanelState>>,
+        asked: Rc<RefCell<Vec<ArrangeAction>>>,
+    }
+
+    impl Host {
+        fn new(model: ArrangeModel) -> Self {
+            Self {
+                model,
+                state: Rc::new(RefCell::new(ArrangePanelState::new())),
+                asked: Rc::new(RefCell::new(Vec::new())),
+            }
+        }
+    }
+
+    impl ArrangeHost for Host {
+        fn run_arrange_action(&mut self, action: ArrangeAction, cx: &mut Context<Self>) {
+            self.asked.borrow_mut().push(action);
+            cx.notify();
+        }
+    }
+
+    impl Render for Host {
+        fn render(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let model = self.model.clone();
+            let state = Rc::clone(&self.state);
+            section(&model, &state, cx)
+        }
+    }
+
+    /// Open a window with the section in it, over the given model.
+    fn open_section(cx: &mut TestAppContext, model: ArrangeModel) -> (Entity<Host>, &mut VisualTestContext) {
+        cx.add_window_view(|_, _| Host::new(model))
+    }
+
+    /// Draw the section in a window and settle.
+    fn draw(root: &Entity<Host>, window: &mut VisualTestContext) {
+        window.draw(
+            point(px(0.0), px(0.0)),
+            size(px(320.0), px(1000.0)),
+            |_, _| root.clone().into_any_element(),
+        );
+        window.run_until_parked();
+    }
+
+    /// The bounds of an element the section draws.
+    fn bounds(window: &mut VisualTestContext, selector: &'static str) -> gpui::Bounds<gpui::Pixels> {
+        window
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("the section draws {selector}"))
+    }
+
+    /// The model a selection of two rectangles gives.
+    fn two_layer_model() -> ArrangeModel {
+        let (doc, first, second) = two_rectangles();
+        selected_arrange(&doc, &[first, second])
+    }
+
+    #[gpui::test]
+    fn the_section_draws_the_six_alignments_in_a_window(cx: &mut TestAppContext) {
+        let (root, window) = open_section(cx, two_layer_model());
+        draw(&root, window);
+
+        for alignment in Align::ALL {
+            let selector: &'static str =
+                Box::leak(format!("arrange-align-{}", alignment.slug()).into_boxed_str());
+            assert!(
+                window.debug_bounds(selector).is_some(),
+                "the section draws {alignment:?}"
+            );
+        }
+        // The order row, and the distribute button beside the alignments.
+        assert!(window.debug_bounds("arrange-order-arrange.front").is_some());
+        assert!(window.debug_bounds("arrange-distribute").is_some());
+        assert!(window.debug_bounds("arrange-boolean").is_some());
+    }
+
+    #[gpui::test]
+    fn clicking_an_alignment_asks_the_engine_to_align(cx: &mut TestAppContext) {
+        let (root, window) = open_section(cx, two_layer_model());
+        draw(&root, window);
+
+        let button = bounds(window, "arrange-align-left");
+        window.simulate_click(button.center(), Modifiers::none());
+        window.run_until_parked();
+
+        let asked = root.read_with(cx, |host, _| host.asked.borrow().clone());
+        assert_eq!(asked.len(), 1, "the section asked for one change");
+        let (command, params) = asked[0].command();
+        assert_eq!(command, "align.left");
+        let model = two_layer_model();
+        assert_eq!(params, json!({ "ids": model.ids.iter().map(|id| id.0).collect::<Vec<_>>() }));
+    }
+
+    #[gpui::test]
+    fn a_disabled_alignment_button_asks_for_nothing(cx: &mut TestAppContext) {
+        let (doc, id) = one_rectangle();
+        let model = selected_arrange(&doc, &[id]);
+        assert_eq!(model.align, Availability::Disabled(ALIGN_REASON));
+        let (root, window) = open_section(cx, model);
+        draw(&root, window);
+
+        let button = bounds(window, "arrange-align-left");
+        window.simulate_click(button.center(), Modifiers::none());
+        window.run_until_parked();
+
+        // And it says why, in words, where it is.
+        assert!(
+            window.debug_bounds("arrange-note-align").is_some(),
+            "the disabled alignment says why it is off"
+        );
+
+        let asked = root.read_with(cx, |host, _| host.asked.borrow().clone());
+        assert!(asked.is_empty(), "a disabled button asks for nothing");
+    }
+
+    #[gpui::test]
+    fn nothing_selected_shows_the_empty_state(cx: &mut TestAppContext) {
+        let (doc, _id) = one_rectangle();
+        let model = selected_arrange(&doc, &[]);
+        let (root, window) = open_section(cx, model);
+        draw(&root, window);
+
+        assert!(
+            window.debug_bounds("arrange-empty").is_some(),
+            "the section says that nothing is selected"
+        );
+        assert!(
+            window.debug_bounds("arrange-align-left").is_none(),
+            "and offers no alignment for a selection of nothing"
+        );
+    }
+
+    #[gpui::test]
+    fn the_distribute_menu_offers_the_three_commands(cx: &mut TestAppContext) {
+        let (doc, ids) = three_rectangles();
+        let model = selected_arrange(&doc, &ids);
+        let (root, window) = open_section(cx, model);
+        draw(&root, window);
+
+        // The menu is closed to begin with.
+        assert!(
+            window.debug_bounds("arrange-distribute-distribute.horizontal").is_none(),
+            "the menu is closed"
+        );
+
+        let button = bounds(window, "arrange-distribute");
+        window.simulate_click(button.center(), Modifiers::none());
+        window.run_until_parked();
+
+        for spacing in Spacing::ALL {
+            let selector: &'static str =
+                Box::leak(format!("arrange-distribute-{}", spacing.command()).into_boxed_str());
+            assert!(
+                window.debug_bounds(selector).is_some(),
+                "the menu offers {}",
+                spacing.label()
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn a_distribute_entry_that_cannot_run_says_why(cx: &mut TestAppContext) {
+        let (doc, first, second) = two_rectangles();
+        let model = selected_arrange(&doc, &[first, second]);
+        let (root, window) = open_section(cx, model);
+        draw(&root, window);
+
+        let button = bounds(window, "arrange-distribute");
+        window.simulate_click(button.center(), Modifiers::none());
+        window.run_until_parked();
+
+        assert!(
+            window
+                .debug_bounds("arrange-note-spacing-distribute.horizontal")
+                .is_some(),
+            "the entry that needs three layers says so"
+        );
+    }
+
+    #[gpui::test]
+    fn the_boolean_menu_offers_the_four_operations_and_the_flattening(
+        cx: &mut TestAppContext,
+    ) {
+        let (doc, first, second) = two_rectangles();
+        let model = selected_arrange(&doc, &[first, second]);
+        let (root, window) = open_section(cx, model);
+        draw(&root, window);
+
+        let button = bounds(window, "arrange-boolean");
+        window.simulate_click(button.center(), Modifiers::none());
+        window.run_until_parked();
+
+        for operation in [
+            BoolOp::Union,
+            BoolOp::Subtract,
+            BoolOp::Intersect,
+            BoolOp::Exclude,
+        ] {
+            let selector: &'static str =
+                Box::leak(format!("arrange-bool-{}", boolean_command(operation)).into_boxed_str());
+            assert!(
+                window.debug_bounds(selector).is_some(),
+                "the menu offers {operation:?}"
+            );
+        }
+        assert!(
+            window.debug_bounds("arrange-bool-flatten").is_some(),
+            "the menu offers the flattening"
+        );
+    }
+
+    #[gpui::test]
+    fn the_operation_in_use_is_shown_read_only(cx: &mut TestAppContext) {
+        let (session, group, _first, _second) = boolean_group();
+        let doc = session.doc().expect("a document");
+        let model = selected_arrange(doc, &[group]);
+        let (root, window) = open_section(cx, model);
+        draw(&root, window);
+
+        assert!(
+            window
+                .debug_bounds("arrange-value-Operation-Subtract")
+                .is_some(),
+            "the panel shows the operation the boolean group uses"
+        );
+    }
+
+    #[gpui::test]
+    fn a_boolean_operation_nobody_set_says_so(cx: &mut TestAppContext) {
+        let (doc, first, second) = two_rectangles();
+        let model = selected_arrange(&doc, &[first, second]);
+        let (root, window) = open_section(cx, model);
+        draw(&root, window);
+
+        assert!(
+            window
+                .debug_bounds("arrange-value-Operation-Not set")
+                .is_some(),
+            "two ordinary layers are not a boolean, and the panel says so"
+        );
+    }
 }
