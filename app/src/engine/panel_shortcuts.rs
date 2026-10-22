@@ -47,6 +47,24 @@
 //! - **The canvas answers the chords while it holds the keyboard.** A gesture
 //!   is not a command at all: the canvas handles it, and it only does so
 //!   while the keyboard is its own. The sheet marks those rows as gestures.
+//!   The canvas's command chords are its in the same way: the shell's own
+//!   table steps aside while the canvas holds the keyboard, so a canvas
+//!   chord is live then and not otherwise.
+//!
+//! # Who answers a chord
+//!
+//! Every row says two things: **where the chord is live** — the canvas, only
+//! while editing text, or both, which is figcraft's own table — and **who
+//! answers it**: the keymap, the shell, the canvas, or nobody yet.
+//!
+//! The second is derived, not written out. The keymap's own function
+//! ([`crate::engine::keymap::bindings`]) is the list of chords Spool
+//! actually installs, and a chord it does not install, and that is not a
+//! text chord, is a chord the shell answers itself. That is what makes
+//! Escape and the save the shell's: the keymap deliberately leaves them
+//! out, and the sheet reads that decision rather than restating it. A test
+//! pins the resulting set, so a third chord joining the shell's fails a
+//! test rather than quietly changing what the sheet teaches.
 //!
 //! # The chord spelling
 //!
@@ -77,6 +95,25 @@
 //! anchors it to the bottom of the window as a dialog, and so does this: the
 //! shell draws it over the canvas, and the engine's own `help.shortcuts`
 //! command opens it.
+//!
+//! # The search field and the keyboard
+//!
+//! The search is a text field like any other, and the keyboard has to know:
+//! a character typed into it is a character and not an editor shortcut, so
+//! the shortcut has to be skipped while it is open.
+//!
+//! **This is the shell's job, not the sheet's.** GPUI dispatches a key
+//! binding *before* any `on_key_down` runs, and an action that is answered
+//! stops the key there — so a letter typed into the field would run the
+//! tool shortcut and never reach the field at all. The sheet cannot stop
+//! that from the inside: the binding is dispatched on the window, above
+//! the field.
+//!
+//! So the sheet says when it is searching — [`ShortcutsState::is_searching`]
+//! — and the shell reads it and skips the shortcuts, exactly as it already
+//! does for the Inspector's own fields. The sheet cannot answer the
+//! question for itself, because only the shell knows what else has the
+//! keyboard.
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -1344,10 +1381,11 @@ mod tests {
             panel.size.height > px(0.0),
             "the sheet is on screen: {panel:?}"
         );
-        // It says what it is.
+        // It says what it is. The width matters as much as the height: an
+        // empty title would still be a line tall.
         let title = bounds(window, "shortcuts-title");
         assert!(
-            title.size.height > px(0.0),
+            title.size.height > px(0.0) && title.size.width > px(0.0),
             "the sheet names itself: {title:?}"
         );
         let tabs = bounds(window, "shortcuts-tabs");
