@@ -1059,6 +1059,39 @@ mod tests {
         }
     }
 
+    /// The live rows are the keymap's commands, exactly.
+    ///
+    /// Both directions, because one direction alone would let the sheet
+    /// quietly stop offering a chord the keymap has, or quietly offer one
+    /// the keymap does not have. The first is a sheet that understates what
+    /// Spool can do; the second is a sheet that teaches a chord which does
+    /// nothing.
+    #[test]
+    fn the_live_rows_are_the_keymaps_commands_exactly() {
+        for platform in PLATFORMS {
+            let installed = installed_ids(platform);
+            let model = ShortcutsModel::read(platform);
+            let live: HashSet<&str> = model
+                .rows
+                .iter()
+                .filter(|row| row.wired == Wired::Keymap)
+                .map(|row| row.id)
+                .collect();
+            for id in &installed {
+                assert!(
+                    live.contains(id.as_str()),
+                    "{platform:?}: `{id}` is installed but the sheet does not call it live"
+                );
+            }
+            for id in &live {
+                assert!(
+                    installed.contains(*id),
+                    "{platform:?}: the sheet calls `{id}` live but the keymap does not install it"
+                );
+            }
+        }
+    }
+
     /// The tabs are figcraft's groups, and every one of them has rows.
     #[test]
     fn the_tabs_are_the_groups_figcraft_has() {
