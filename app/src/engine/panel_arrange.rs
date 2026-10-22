@@ -49,7 +49,19 @@
 //! The one value this surface shows is the boolean operation in use, and it
 //! has three states like every other: the operation every selected layer
 //! agrees on, *Mixed* when they disagree, and *Not set* when the selection is
-//! not a boolean at all.
+//! not a boolean at all. The fold is per property: a mixed operation says so
+//! under the operation, and the alignment and the order are still what they
+//! were.
+//!
+//! # A control that is off says why
+//!
+//! Every control here can be off, and every one of them says so, in words,
+//! where it is: the alignment that a lone layer cannot use, the distribute
+//! entry that needs a third layer, the boolean button that needs two shapes.
+//! The reasons are the engine's own rules, read the way the engine reads
+//! them — `cmd::arrange::can_align` for the alignment, `booleans::apply`'s
+//! rule for the combination, and the layer counts the engine's commands
+//! themselves apply.
 //!
 //! # Not ported
 //!
