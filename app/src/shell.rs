@@ -6,7 +6,9 @@ use std::cell::Cell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use crate::engine::panel_shortcuts::ShortcutsState;
 use crate::{commands, inspector, project_open, theme, tools};
+use std::cell::RefCell;
 
 /// The tools the toolbar offers, in the order it shows them.
 ///
@@ -270,6 +272,7 @@ pub struct AppShell {
     share_open: bool,
     export_open: bool,
     zoom_open: bool,
+    shortcuts: Rc<RefCell<ShortcutsState>>,
     /// The open New Project prompt, when one is.
     new_project: Option<NewProjectPrompt>,
     /// A message shown over the canvas, and whether it reports a failure.
@@ -378,6 +381,9 @@ impl AppShell {
             share_open: false,
             export_open: false,
             zoom_open: false,
+            shortcuts: Rc::new(RefCell::new(ShortcutsState::new(
+                figcraft_engine::keymap::Platform::current(),
+            ))),
             save_status: status,
         }
     }
@@ -1637,6 +1643,7 @@ impl Render for AppShell {
         let render_start = crate::diagnostics::start();
         let element = div()
             .id("spool-shell")
+            .relative()
             .flex()
             .flex_col()
             .size_full()
@@ -1739,7 +1746,22 @@ impl Render for AppShell {
                 );
             }))
             .child(self.top_bar(cx))
-            .child(self.render_body(cx));
+            .child(self.render_body(cx))
+            .child(
+                div()
+                    .absolute()
+                    .left(px(0.0))
+                    .right(px(0.0))
+                    .bottom(px(0.0))
+                    .flex()
+                    .justify_center()
+                    .items_end()
+                    .pb(px(16.0))
+                    .child(crate::engine::panel_shortcuts::shortcuts_panel(
+                        &self.shortcuts,
+                        cx,
+                    )),
+            );
         crate::diagnostics::record("shell_render_build", render_start);
         element
     }
