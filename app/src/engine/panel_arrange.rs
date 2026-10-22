@@ -521,9 +521,7 @@ impl ArrangeAction {
     /// change the CLI, the keymap and an agent would make.
     pub fn command(&self) -> (String, Value) {
         match self {
-            Self::Align { ids, alignment } => {
-                (alignment.command().to_owned(), ids_params(ids))
-            }
+            Self::Align { ids, alignment } => (alignment.command().to_owned(), ids_params(ids)),
             Self::Order { ids, order } => (order.command().to_owned(), ids_params(ids)),
             Self::Spacing { ids, spacing } => (spacing.command().to_owned(), ids_params(ids)),
             Self::Boolean { ids, operation } => {
@@ -782,10 +780,7 @@ fn distribute_row<T: ArrangeHost>(
 }
 
 /// The spacing menu: the three commands that space a selection out.
-fn distribute_menu<T: ArrangeHost>(
-    model: &ArrangeModel,
-    cx: &mut Context<T>,
-) -> impl IntoElement {
+fn distribute_menu<T: ArrangeHost>(model: &ArrangeModel, cx: &mut Context<T>) -> impl IntoElement {
     let mut menu = div()
         .flex()
         .flex_col()
@@ -937,7 +932,11 @@ fn boolean_row<T: ArrangeHost>(
         .bg(rgb(theme::WINDOW))
         .border_1()
         .border_color(rgb(theme::BORDER))
-        .child(icon(boolean_icon(model.boolean_value), 14.0, theme::TEXT_SECONDARY))
+        .child(icon(
+            boolean_icon(model.boolean_value),
+            14.0,
+            theme::TEXT_SECONDARY,
+        ))
         .child(
             div()
                 .text_xs()
@@ -1284,7 +1283,7 @@ fn icon(icon: ArrangeIcon, size_px: f32, color: u32) -> Svg {
 mod tests {
     use super::*;
     use figcraft_doc::NodeKind;
-    use figcraft_engine::{Session, find_command, params::id_of};
+    use figcraft_engine::{find_command, params::id_of, Session};
     use gpui::{point, size, Entity, Modifiers, Render, TestAppContext, VisualTestContext};
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -1309,7 +1308,15 @@ mod tests {
             .create(page, NodeKind::Rectangle, "First", 0.0, 0.0, 100.0, 100.0)
             .expect("a rectangle");
         let second = doc
-            .create(page, NodeKind::Rectangle, "Second", 200.0, 50.0, 100.0, 100.0)
+            .create(
+                page,
+                NodeKind::Rectangle,
+                "Second",
+                200.0,
+                50.0,
+                100.0,
+                100.0,
+            )
             .expect("a rectangle");
         (doc, first, second)
     }
@@ -1347,7 +1354,15 @@ mod tests {
             .create(page, NodeKind::Rectangle, "First", 0.0, 0.0, 100.0, 100.0)
             .expect("a rectangle");
         let second = doc
-            .create(page, NodeKind::Rectangle, "Second", 50.0, 50.0, 100.0, 100.0)
+            .create(
+                page,
+                NodeKind::Rectangle,
+                "Second",
+                50.0,
+                50.0,
+                100.0,
+                100.0,
+            )
             .expect("a rectangle");
         let mut session = Session::with_document(doc);
         let result = session
@@ -1393,9 +1408,9 @@ mod tests {
             ("order", model.order),
             ("boolean", model.boolean),
         ] {
-            let reason = availability.reason().unwrap_or_else(|| {
-                panic!("{name} is disabled and says nothing about why")
-            });
+            let reason = availability
+                .reason()
+                .unwrap_or_else(|| panic!("{name} is disabled and says nothing about why"));
             assert!(!reason.trim().is_empty(), "{name} says nothing");
         }
     }
@@ -1714,7 +1729,15 @@ mod tests {
                 .create(page, NodeKind::Rectangle, "First", 0.0, 0.0, 100.0, 100.0)
                 .expect("a rectangle");
             let second = doc
-                .create(page, NodeKind::Rectangle, "Second", 200.0, 50.0, 100.0, 100.0)
+                .create(
+                    page,
+                    NodeKind::Rectangle,
+                    "Second",
+                    200.0,
+                    50.0,
+                    100.0,
+                    100.0,
+                )
                 .expect("a rectangle");
             (Session::with_document(doc), first, second)
         };
@@ -1728,7 +1751,10 @@ mod tests {
             .expect("the engine accepts the panel's command");
         let doc = session.doc().expect("a document");
         let moved = doc.world_bounds(second).expect("the second layer's box");
-        assert_eq!(moved.x0, 0.0, "the second layer moved to the first one's edge");
+        assert_eq!(
+            moved.x0, 0.0,
+            "the second layer moved to the first one's edge"
+        );
         assert_eq!(moved.y0, 50.0, "and only sideways");
     }
 
@@ -1785,7 +1811,15 @@ mod tests {
                 .create(page, NodeKind::Rectangle, "First", 0.0, 0.0, 100.0, 100.0)
                 .expect("a rectangle");
             let second = doc
-                .create(page, NodeKind::Rectangle, "Second", 50.0, 50.0, 100.0, 100.0)
+                .create(
+                    page,
+                    NodeKind::Rectangle,
+                    "Second",
+                    50.0,
+                    50.0,
+                    100.0,
+                    100.0,
+                )
                 .expect("a rectangle");
             (Session::with_document(doc), first, second)
         };
@@ -1841,7 +1875,8 @@ mod tests {
         ] {
             let markup = icon_svg(icon);
             assert!(
-                markup.starts_with("<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 16 16\""),
+                markup
+                    .starts_with("<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 16 16\""),
                 "{icon:?}"
             );
             assert!(markup.ends_with("</svg>"), "{icon:?}");
@@ -1883,7 +1918,11 @@ mod tests {
     }
 
     impl Render for Host {
-        fn render(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+        fn render(
+            &mut self,
+            _window: &mut gpui::Window,
+            cx: &mut Context<Self>,
+        ) -> impl IntoElement {
             let model = self.model.clone();
             let state = Rc::clone(&self.state);
             section(&model, &state, cx)
@@ -1891,7 +1930,10 @@ mod tests {
     }
 
     /// Open a window with the section in it, over the given model.
-    fn open_section(cx: &mut TestAppContext, model: ArrangeModel) -> (Entity<Host>, &mut VisualTestContext) {
+    fn open_section(
+        cx: &mut TestAppContext,
+        model: ArrangeModel,
+    ) -> (Entity<Host>, &mut VisualTestContext) {
         cx.add_window_view(|_, _| Host::new(model))
     }
 
@@ -1906,7 +1948,10 @@ mod tests {
     }
 
     /// The bounds of an element the section draws.
-    fn bounds(window: &mut VisualTestContext, selector: &'static str) -> gpui::Bounds<gpui::Pixels> {
+    fn bounds(
+        window: &mut VisualTestContext,
+        selector: &'static str,
+    ) -> gpui::Bounds<gpui::Pixels> {
         window
             .debug_bounds(selector)
             .unwrap_or_else(|| panic!("the section draws {selector}"))
@@ -1951,7 +1996,10 @@ mod tests {
         let (command, params) = asked[0].command();
         assert_eq!(command, "align.left");
         let model = two_layer_model();
-        assert_eq!(params, json!({ "ids": model.ids.iter().map(|id| id.0).collect::<Vec<_>>() }));
+        assert_eq!(
+            params,
+            json!({ "ids": model.ids.iter().map(|id| id.0).collect::<Vec<_>>() })
+        );
     }
 
     #[gpui::test]
@@ -2002,7 +2050,9 @@ mod tests {
 
         // The menu is closed to begin with.
         assert!(
-            window.debug_bounds("arrange-distribute-distribute.horizontal").is_none(),
+            window
+                .debug_bounds("arrange-distribute-distribute.horizontal")
+                .is_none(),
             "the menu is closed"
         );
 
@@ -2041,9 +2091,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn the_boolean_menu_offers_the_four_operations_and_the_flattening(
-        cx: &mut TestAppContext,
-    ) {
+    fn the_boolean_menu_offers_the_four_operations_and_the_flattening(cx: &mut TestAppContext) {
         let (doc, first, second) = two_rectangles();
         let model = selected_arrange(&doc, &[first, second]);
         let (root, window) = open_section(cx, model);
