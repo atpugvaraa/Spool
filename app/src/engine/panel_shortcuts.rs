@@ -509,6 +509,30 @@ pub struct ShortcutsState {
     query: String,
     /// The keyboard focus the search field takes.
     focus: Option<FocusHandle>,
+    /// Whether the sheet is open.
+    ///
+    /// The engine's `help.shortcuts` command asks for it; it does not open
+    /// it. The sheet is a panel you open, not one that is always there.
+    open: bool,
+}
+
+impl ShortcutsState {
+    /// Open the sheet.
+    pub fn show(&mut self) {
+        self.open = true;
+    }
+
+    /// Close the sheet. Returns whether it was open, so the caller knows.
+    pub fn hide(&mut self) -> bool {
+        let was = self.open;
+        self.open = false;
+        was
+    }
+
+    /// Whether the sheet is open.
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
 }
 
 impl Default for ShortcutsState {
@@ -525,6 +549,7 @@ impl ShortcutsState {
             tab: Group::Essential,
             query: String::new(),
             focus: None,
+            open: false,
         }
     }
 

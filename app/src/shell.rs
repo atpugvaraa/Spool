@@ -429,7 +429,11 @@ impl AppShell {
             )
         };
         let state = commands::EscapeState {
-            panel: self.ai_open || self.share_open || self.export_open || self.zoom_open,
+            panel: self.ai_open
+                || self.share_open
+                || self.export_open
+                || self.zoom_open
+                || self.shortcuts.borrow().is_open(),
             inspector: self
                 .inspector
                 .update(cx, |inspector, _| inspector.is_busy()),
@@ -440,6 +444,7 @@ impl AppShell {
         };
         match state.next() {
             Some(commands::Rung::Panel) => {
+                self.shortcuts.borrow_mut().hide();
                 self.ai_open = false;
                 self.share_open = false;
                 self.export_open = false;
@@ -1658,6 +1663,7 @@ impl Render for AppShell {
             .on_action({
                 let engine_canvas = self.engine_canvas.clone();
                 let inspector = self.inspector.clone();
+                let shell = cx.entity();
                 move |action: &crate::engine::keymap::RunCommand, window, cx| {
                     let id = action.id.clone();
                     let params = action.params.clone();
@@ -1712,6 +1718,19 @@ impl Render for AppShell {
                     // change it. So the shell is what answers, the way it
                     // answers the escape ladder: by switching the Inspector's
                     // tab, which is what the request meant.
+                    // THE SHORTCUT SHEET IS A PANEL, AND THE ENGINE ONLY ASKS.
+                    //
+                    // `help.shortcuts` is a `ui(s, "panel.shortcuts")`
+                    // command: the engine queues a request for the surface
+                    // and the UI is what answers it, the same way Dev Mode's
+                    // request is answered by switching the Inspector's tab.
+                    if id == "help.shortcuts" {
+                        shell.update(cx, |shell, cx| {
+                            shell.shortcuts.borrow_mut().show();
+                            cx.notify();
+                        });
+                        return;
+                    }
                     if id == "view.devMode" {
                         inspector.update(cx, |inspector, cx| {
                             inspector.toggle_dev_mode(cx);
@@ -1747,7 +1766,7 @@ impl Render for AppShell {
             }))
             .child(self.top_bar(cx))
             .child(self.render_body(cx))
-            .child(
+            .child(if self.shortcuts.borrow().is_open() {
                 div()
                     .absolute()
                     .left(px(0.0))
@@ -1760,8 +1779,11 @@ impl Render for AppShell {
                     .child(crate::engine::panel_shortcuts::shortcuts_panel(
                         &self.shortcuts,
                         cx,
-                    )),
-            );
+                    ))
+                    .into_any_element()
+            } else {
+                div().into_any_element()
+            });
         crate::diagnostics::record("shell_render_build", render_start);
         element
     }
