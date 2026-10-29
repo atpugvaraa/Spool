@@ -1264,8 +1264,12 @@ impl AppShell {
         if let Some((message, failed)) = &self.save_status {
             content = content.child(
                 div()
+                    .debug_selector(|| "canvas-status-message".to_string())
                     .absolute()
                     .left(px(16.0))
+                    // Bound text layout on both sides so long errors wrap
+                    // instead of disappearing past the canvas's clipped edge.
+                    .right(px(16.0))
                     .bottom(px(16.0))
                     .rounded_md()
                     .px(px(10.0))
@@ -1273,6 +1277,7 @@ impl AppShell {
                     .bg(rgb(0x1b1e24))
                     .text_color(rgb(if *failed { 0xff8a8a } else { 0xd8dbe2 }))
                     .text_xs()
+                    .whitespace_normal()
                     .child(message.clone()),
             );
         }

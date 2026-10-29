@@ -1091,3 +1091,35 @@ fn a_refused_rename_is_reported_in_the_status_line(cx: &mut TestAppContext) {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[gpui::test]
+fn a_long_project_error_wraps_inside_the_canvas(cx: &mut TestAppContext) {
+    // A missing project with an unbroken long path component exercises the
+    // actual startup error, including text that cannot wrap only at spaces.
+    let root = std::env::temp_dir()
+        .join(format!("spool-missing-wrap-{}", std::process::id()))
+        .join("long-project-name".repeat(12))
+        .join("missing.spool");
+    assert!(!root.exists());
+    let (shell, window) =
+        cx.add_window_view(move |_, cx| AppShell::new_with_project(Some(root), cx));
+    for width in [1480.0, 1000.0] {
+        window.draw(
+            point(px(0.0), px(0.0)),
+            size(px(width), px(960.0)),
+            |_, _| shell.clone().into_any_element(),
+        );
+        window.run_until_parked();
+        let canvas = window.debug_bounds("canvas-viewport").unwrap();
+        let message = window.debug_bounds("canvas-status-message").unwrap();
+        assert!(message.origin.x >= canvas.origin.x);
+        assert!(
+            message.origin.x + message.size.width <= canvas.origin.x + canvas.size.width,
+            "error must fit the canvas at window width {width}: {message:?}, {canvas:?}"
+        );
+        assert!(
+            message.size.height > px(40.0),
+            "long error should wrap: {message:?}"
+        );
+    }
+}
