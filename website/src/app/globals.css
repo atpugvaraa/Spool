@@ -34,6 +34,128 @@
   --duration-canvas: 1500ms;
   --duration-surface: 1400ms;
   --duration-piece: 150ms;
+
+  /* Ink printed on the artifacts themselves. The room's light does not change
+     it, so it is not redefined for the dark theme. */
+  --print-ink: #191a18;
+
+  /* Ink written straight onto the surface, as opposed to printed on the
+     artifacts placed over it. */
+  --ink-soft: #514e48;
+  --ink-annotation: #55534d;
+  --ink-link: #1e1f1b;
+  --ink-pencil: #666257;
+  --pencil-lift: rgba(255, 255, 255, 0.52);
+  --ink-quiet: #5f5d55;
+  --ink-quiet-strong: #363731;
+  --ink-mark: rgba(50, 52, 48, 0.68);
+  --ink-hover: #5b574e;
+  --thread: #000;
+  --nav-ink: #171816;
+  --nav-mark: #1c1d1a;
+  --button-bg: #111210;
+  --button-bg-hover: #2a2b28;
+  --button-ink: #f7f5ef;
+  --button-ink-nav: #fff;
+  --hairline: rgba(28, 27, 24, 0.16);
+  --menu-shadow: 0 8px 20px rgba(35, 31, 25, 0.14);
+
+  /* How the surface is lit, and how much light reaches what sits on it. */
+  --surface-highlight: rgba(255, 255, 255, 0.16);
+  --surface-vignette: rgba(67, 57, 41, 0.07);
+  --object-light: none;
+  --edge-light: 0 0 #0000;
+  --veil-shadow: #1c1b18;
+  --veil-contact-opacity: 0.2;
+  --veil-ambient-opacity: 0.1;
+}
+
+/* Night at the same desk. The surface becomes black drawing paper; what is
+   drawn on it switches from graphite to white pencil and the wordmark to cream
+   thread. Artifacts placed on the surface keep their own colours and are simply
+   lit less, the way paper and photographs look when the lamp is low. Dark
+   objects are found by the light along their edges. */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --color-void: #0b0b0a;
+  --color-paper: #1a1916;
+  --color-paper-shadow: #131210;
+  --color-paper-light: #26241f;
+  --color-ink: #ebe5d8;
+  --color-quiet: #a29c90;
+
+  --ink-soft: #b8b1a3;
+  --ink-annotation: #b8b1a3;
+  --ink-link: #e3dccd;
+  --ink-pencil: #c4bcab;
+  --pencil-lift: rgba(0, 0, 0, 0.55);
+  --ink-quiet: #a19b8f;
+  --ink-quiet-strong: #dad3c5;
+  --ink-mark: rgba(235, 229, 216, 0.38);
+  --ink-hover: #a8a194;
+  --thread: #e9e1cf;
+  --nav-ink: #ebe5d8;
+  --nav-mark: #ebe5d8;
+  --button-bg: #e8e1d3;
+  --button-bg-hover: #f4eee2;
+  --button-ink: #161614;
+  --button-ink-nav: #161614;
+  --hairline: rgba(236, 230, 218, 0.16);
+  --menu-shadow: 0 8px 20px rgba(0, 0, 0, 0.45);
+
+  --surface-highlight: rgba(255, 224, 170, 0.055);
+  --surface-vignette: rgba(0, 0, 0, 0.45);
+  --object-light: brightness(0.8) sepia(0.07) drop-shadow(0 8px 14px rgba(0, 0, 0, 0.38));
+  --edge-light: inset 0 0 0 1px rgba(255, 243, 222, 0.09);
+  --veil-shadow: #000;
+  --veil-contact-opacity: 0.55;
+  --veil-ambient-opacity: 0.35;
+}
+
+/* Paper is opaque. By day these cards let the surface show through as a tint;
+   over black paper that tint turns grey, so at night they take the colour they
+   read as by day. */
+:root[data-theme="dark"] .paper-sketch { background: #e9e1d1; }
+:root[data-theme="dark"] .process-sketch { background-color: #eee8dc; }
+:root[data-theme="dark"] .editorial-fragment { background: #f7f2e9; }
+:root[data-theme="dark"] .process-index { background: #ebe4d6; }
+
+/* Changing the theme is a lamp being turned, not a page being swapped. A plain
+   crossfade passes through grey with both versions showing at once; a room
+   does not. Going down, it darkens first and the night version settles in on
+   top. Going up, the day version comes in from dim, like a lamp warming. */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation-duration: 600ms;
+  mix-blend-mode: normal;
+}
+
+:root[data-theme-change="dark"]::view-transition-old(root) {
+  animation: lamp-dim 600ms cubic-bezier(0.4, 0, 0.2, 1) both;
+}
+
+:root[data-theme-change="dark"]::view-transition-new(root) {
+  animation: lamp-settle 600ms cubic-bezier(0.6, 0, 0.8, 0.4) both;
+}
+
+:root[data-theme-change="light"]::view-transition-old(root) { animation: none; }
+
+:root[data-theme-change="light"]::view-transition-new(root) {
+  animation: lamp-warm 600ms cubic-bezier(0.4, 0, 0.2, 1) both;
+}
+
+@keyframes lamp-dim {
+  to { filter: brightness(0.3); }
+}
+
+@keyframes lamp-settle {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes lamp-warm {
+  from { opacity: 0; filter: brightness(0.4); }
+  to { opacity: 1; filter: none; }
 }
 
 @theme inline {
@@ -183,7 +305,7 @@ select { font: inherit; }
   height: max(260dvh, 2400px);
   background-color: var(--color-paper);
   background-image:
-    radial-gradient(ellipse at 50% 45%, rgba(255, 255, 255, 0.16), transparent 62%),
+    radial-gradient(ellipse at 50% 45%, var(--surface-highlight), transparent 62%),
     var(--surface-texture);
   background-size: 100% 100%;
   transform: translate3d(0, 0, 0) scale(1);
@@ -195,7 +317,7 @@ select { font: inherit; }
   position: absolute;
   z-index: 0;
   inset: 0;
-  background-image: radial-gradient(ellipse at 50% 44%, transparent 48%, rgba(67, 57, 41, 0.07) 100%);
+  background-image: radial-gradient(ellipse at 50% 44%, transparent 48%, var(--surface-vignette) 100%);
   content: "";
   pointer-events: none;
 }
@@ -206,6 +328,7 @@ select { font: inherit; }
   left: 50%;
   width: 100vw;
   height: 100dvh;
+  color: var(--print-ink);
   transform: translate(-50%, -50%);
   transform-origin: center;
 }
@@ -233,7 +356,7 @@ select { font: inherit; }
   align-items: center;
   justify-content: space-between;
   padding: 0 28px;
-  color: #171816;
+  color: var(--nav-ink);
   font-size: 10px;
   pointer-events: none;
 }
@@ -283,14 +406,14 @@ select { font: inherit; }
   text-align: left;
 }
 
-.site-brand[data-current="true"] { color: #171816; }
+.site-brand[data-current="true"] { color: var(--nav-ink); }
 
 .site-brand__mark {
   display: grid;
   width: 24px;
   height: 24px;
   place-items: center;
-  border: 2px solid #1c1d1a;
+  border: 2px solid var(--nav-mark);
   border-radius: 8px;
   font-size: 15px;
   line-height: 1;
@@ -308,15 +431,33 @@ select { font: inherit; }
 .site-links { position: absolute; left: 50%; transform: translateX(-50%); }
 .site-links button,
 .site-links a { text-decoration: none; }
-.site-links [data-current="true"] { color: #171816; font-weight: 620; }
+.site-links [data-current="true"] { color: var(--nav-ink); font-weight: 620; }
 .site-links [aria-disabled="true"] { color: inherit; }
 .site-actions { min-width: 180px; justify-content: flex-end; gap: 11px; }
 .site-actions .site-github { display: inline-flex; align-items: center; gap: 5px; text-decoration: none; }
-.site-nav .download-small { background: #111210; color: #fff; text-decoration: none; }
+.site-nav .download-small { background: var(--button-bg); color: var(--button-ink-nav); text-decoration: none; }
 .site-nav .download-small:not(:disabled):active { transform: scale(0.97); }
 .site-menu-toggle,
 .mobile-github { display: none; }
 .github-mark { font-size: 18px; }
+
+/* A small dial in the nav's glyph language: half lit, turned half a revolution
+   when the lights change. The view transition carries the turn; it is named so
+   it moves on its own instead of crossfading with the page. */
+.theme-toggle { display: grid; width: 26px; height: 26px; place-items: center; }
+.theme-toggle__dial {
+  width: 14px;
+  height: 14px;
+  border: 1.5px solid currentColor;
+  border-radius: 50%;
+  background: linear-gradient(90deg, currentColor 50%, transparent 50%);
+  view-transition-name: theme-dial;
+}
+:root[data-theme="dark"] .theme-toggle__dial { transform: rotate(180deg); }
+
+@supports not (view-transition-name: none) {
+  .theme-toggle__dial { transition: transform 560ms cubic-bezier(0.4, 0, 0.2, 1); }
+}
 
 .download-small {
   display: grid;
@@ -325,8 +466,8 @@ select { font: inherit; }
   margin-left: 14px;
   place-items: center;
   border-radius: 15px;
-  background: #111210;
-  color: #fff;
+  background: var(--button-bg);
+  color: var(--button-ink-nav);
   font-size: 11px;
 }
 
@@ -409,10 +550,10 @@ select { font: inherit; }
 
 .pencil-note {
   z-index: 8;
-  color: #666257;
+  color: var(--ink-pencil);
   font: italic 14px/1.18 var(--font-editorial);
   letter-spacing: 0.025em;
-  text-shadow: 0 1px rgba(255, 255, 255, 0.52);
+  text-shadow: 0 1px var(--pencil-lift);
 }
 
 .pencil-note span { display: inline-block; margin-left: 5px; font-size: 20px; }
@@ -435,7 +576,7 @@ select { font: inherit; }
 .swatch-note__chips i:nth-child(2) { background: #777f7e; }
 .swatch-note__chips i:nth-child(3) { background: #c8c0b0; }
 .swatch-note__chips i:nth-child(4) { background: #e8dfcf; }
-.swatch-note p { margin: 8px 0 0 18px; color: #656158; font: italic 12px/1.1 var(--font-editorial); }
+.swatch-note p { margin: 8px 0 0 18px; color: var(--ink-pencil); font: italic 12px/1.1 var(--font-editorial); }
 
 .paper-sketch {
   z-index: 2;
@@ -471,7 +612,7 @@ select { font: inherit; }
   overflow: hidden;
   background: #171918;
   color: #f1eee5;
-  box-shadow: 0 3px 7px rgba(24, 25, 22, 0.17), 0 14px 28px rgba(24, 25, 22, 0.18);
+  box-shadow: var(--edge-light), 0 3px 7px rgba(24, 25, 22, 0.17), 0 14px 28px rgba(24, 25, 22, 0.18);
 }
 
 .dark-site__bar { display: flex; justify-content: space-between; gap: 4px; color: #babbb1; font: 6px var(--font-technical); }
@@ -504,12 +645,12 @@ select { font: inherit; }
   display: grid;
   gap: 9px;
   padding: 4px 0;
-  color: #5f5d55;
+  color: var(--ink-quiet);
   font: 7px var(--font-technical);
   white-space: nowrap;
 }
 
-.exploration-index b { color: #363731; font-weight: 500; }
+.exploration-index b { color: var(--ink-quiet-strong); font-weight: 500; }
 
 .image-stack { z-index: 4; height: 128px; }
 .image-stack > div { position: absolute; width: 68%; height: 83px; border: 5px solid #f5f1e8; background-image: url("/images/designWithClearIntent.jpg"); background-size: cover; box-shadow: 0 2px 5px rgba(28, 27, 24, 0.16); }
@@ -534,7 +675,7 @@ select { font: inherit; }
   height: 83px;
   padding: 7px;
   background: #1c1d1c;
-  box-shadow: 0 4px 9px rgba(0, 0, 0, 0.14);
+  box-shadow: var(--edge-light), 0 4px 9px rgba(0, 0, 0, 0.14);
 }
 
 .black-sketch svg { width: 100%; height: 100%; fill: none; stroke: rgba(237, 232, 216, 0.78); stroke-width: 1; }
@@ -543,7 +684,7 @@ select { font: inherit; }
   z-index: 6;
   display: grid;
   gap: 6px;
-  color: #55534d;
+  color: var(--ink-annotation);
   font: 8px var(--font-technical);
   letter-spacing: 0.06em;
 }
@@ -558,14 +699,14 @@ select { font: inherit; }
 
 .hero-copy h1 {
   margin: 0;
-  color: #191a18;
+  color: var(--color-ink);
   font: 500 clamp(34px, 3.9vw, 56px)/1.14 var(--font-interface);
   letter-spacing: -0.075em;
 }
 
 .hero-copy p {
   margin: 19px 0 28px;
-  color: #514e48;
+  color: var(--ink-soft);
   font: 16px/1.3 var(--font-interface);
   letter-spacing: -0.025em;
 }
@@ -581,8 +722,8 @@ select { font: inherit; }
   border: 0;
   padding: 0;
   border-radius: 14px;
-  background: #111210;
-  color: #f7f5ef;
+  background: var(--button-bg);
+  color: var(--button-ink);
   font: inherit;
   font-size: 13px;
   text-decoration: none;
@@ -596,7 +737,7 @@ select { font: inherit; }
 .hero-code {
   display: inline-block;
   margin-top: 15px;
-  color: #1e1f1b;
+  color: var(--ink-link);
   font-size: 12px;
   text-decoration: none;
 }
@@ -741,11 +882,33 @@ select { font: inherit; }
 
 .plus-mark {
   z-index: 2;
-  color: rgba(50, 52, 48, 0.68);
+  color: var(--ink-mark);
   font: 22px/1 var(--font-interface);
   font-weight: 300;
   text-align: center;
 }
+
+/* Everything placed on the surface takes the same light, so prints, photos and
+   paper stocks dim together and keep their relationships. */
+.opnest-board,
+.mini-browser,
+.swatch-note__chips,
+.paper-sketch,
+.eye-study,
+.dark-site,
+.image-stack,
+.japanese-poster,
+.black-sketch,
+.thought-card,
+.process-sketch,
+.editorial-fragment,
+.local-terminal,
+.note-card,
+.build-card,
+.process-index,
+.flower-photo-card { filter: var(--object-light); }
+
+.identity-wordmark > svg > path { fill: var(--thread); }
 
 /* The same fixed piece shapes drive the veil cutouts and void windows. */
 .puzzle-layer {
@@ -787,6 +950,12 @@ select { font: inherit; }
   transition: opacity var(--duration-piece) var(--ease-out);
 }
 
+/* The veil is cut from the surface material, whichever it is. */
+.puzzle-veil-piece > path { fill: var(--color-paper); }
+.puzzle-veil-shadow { fill: var(--veil-shadow); }
+.puzzle-veil-contact-shadow { flood-color: var(--veil-shadow); flood-opacity: var(--veil-contact-opacity); }
+.puzzle-veil-ambient-shadow { flood-color: var(--veil-shadow); flood-opacity: var(--veil-ambient-opacity); }
+
 .puzzle-veil-piece[data-revealed="true"] {
   opacity: 0;
 }
@@ -802,10 +971,10 @@ select { font: inherit; }
   left: calc(12px + env(safe-area-inset-left));
   bottom: calc(12px + env(safe-area-inset-bottom));
   padding: 6px 8px;
-  border: 1px solid rgba(28, 27, 24, 0.16);
+  border: 1px solid var(--hairline);
   border-radius: 2px;
-  background: rgba(244, 239, 229, 0.92);
-  color: #514d46;
+  background: color-mix(in srgb, var(--color-paper) 92%, transparent);
+  color: var(--ink-soft);
   font: 9px/1 var(--font-technical);
   letter-spacing: 0.01em;
   cursor: pointer;
@@ -814,20 +983,37 @@ select { font: inherit; }
 .puzzle-style-toggle:hover { background: var(--color-paper-light); }
 .puzzle-style-toggle:focus-visible { outline-offset: 3px; }
 
+/* Above phone width the composition keeps the size it was art-directed at (the
+   1512 x 982 concept board) and scales as one piece to fit the window. Laid out
+   against the viewport instead, fixed-width artifacts slide into each other as
+   the window narrows and text ends up underneath its neighbours.
+   WorldCanvas sets --composition-scale from the viewport. */
+@media (min-width: 721px) {
+  .world-artifacts {
+    width: 1512px;
+    height: 982px;
+    transform: translate(-50%, -50%) scale(var(--composition-scale, 1));
+  }
+
+  /* These tracked the viewport; inside the composition they take their
+     design-size values, because the scale already accounts for the window. */
+  .hero-copy { width: 700px; }
+  .hero-copy h1 { font-size: 56px; }
+  .identity-wordmark { width: 700px; }
+}
+
 @media (max-width: 900px) {
   .site-brand, .site-actions { min-width: auto; }
   .site-links { gap: 14px; }
   .site-nav { padding-inline: 18px; }
-  .hero-copy { width: min(600px, 60vw); }
-  .hero-copy h1 { font-size: clamp(32px, 5vw, 46px); }
-  .identity-wordmark { width: 58vw; font-size: clamp(164px, 20vw, 220px); }
-  .opnest-board { width: min(var(--width), 320px); }
-  .dark-site--thoughtful { width: 190px; }
-  .exploration-index { font-size: 6px; }
 }
 
 @media (max-width: 720px) {
   .world-coordinate-space { width: max(240vw, 1600px); height: max(220dvh, 1800px); }
+  /* Taller than the phone screen, so the artifacts have room to sit apart rather
+     than stacking on top of one another. The home camera shows it from the top
+     (see homeCamera in WorldCanvas); the visitor drags up for the rest. */
+  .world-artifacts { height: 1650px; }
   .experience-viewport { min-height: 100dvh; }
   .site-nav { top: 0; height: 48px; padding-inline: 12px; }
   .site-brand { gap: 5px; font-size: 15px; }
@@ -851,8 +1037,8 @@ select { font: inherit; }
     gap: 0;
     padding: 7px 12px;
     transform: none;
-    background: rgba(244, 239, 229, 0.97);
-    box-shadow: 0 8px 20px rgba(35, 31, 25, 0.14);
+    background: color-mix(in srgb, var(--color-paper) 97%, transparent);
+    box-shadow: var(--menu-shadow);
     white-space: normal;
   }
   .site-nav[data-mobile-open="true"] .site-links { display: flex; flex-direction: column; }
@@ -863,40 +1049,40 @@ select { font: inherit; }
     text-align: left;
   }
   .site-links [aria-disabled="true"] { opacity: 0.64; }
-  .site-links .mobile-github { display: flex; align-items: center; border-top: 1px solid rgba(28, 27, 24, 0.15); }
+  .site-links .mobile-github { display: flex; align-items: center; border-top: 1px solid var(--hairline); }
   .site-actions { gap: 6px; font-size: 8px; }
   .download-small { min-width: 74px; height: 28px; margin-left: 4px; border-radius: 12px; font-size: 9px; }
 
-  .opnest-board { left: 28% !important; top: 17% !important; width: 51vw; transform: translate(-50%, -50%) rotate(-5deg); }
+  .opnest-board { left: 28% !important; top: 9.15% !important; width: 51vw; transform: translate(-50%, -50%) rotate(-5deg); }
   .opnest-board__image { height: 88px; }
   .opnest-board__image > span { font-size: 41px; }
   .opnest-board__image small { font-size: 6px; }
   .opnest-board__meta { height: 15px; font-size: 4px; }
-  .mini-browser { left: 79% !important; top: 19% !important; width: 30vw; }
+  .mini-browser { left: 79% !important; top: 10.7% !important; width: 30vw; }
   .mini-browser__image { height: 49px; }
   .mini-browser__caption { font-size: 6px; }
   .mini-browser__caption span { font-size: 5px; }
-  .pencil-note--generated { left: 10% !important; top: 23% !important; width: 82px; font-size: 10px; }
-  .swatch-note { left: 51% !important; top: 24% !important; width: 104px; }
+  .pencil-note--generated { left: 10% !important; top: 13.9% !important; width: 82px; font-size: 10px; }
+  .swatch-note { left: 51% !important; top: 14.7% !important; width: 104px; }
   .swatch-note__chips { gap: 4px; }
   .swatch-note__chips i { width: 17px; height: 18px; }
   .swatch-note p { margin: 5px 0 0 7px; font-size: 9px; }
   .paper-sketch, .eye-study, .exploration-index, .pencil-note--imagine { display: none; }
 
-  .dark-site--thoughtful { left: 85% !important; top: 31% !important; width: 30vw; min-height: 126px; padding: 6px; }
+  .dark-site--thoughtful { left: 85% !important; top: 18.2% !important; width: 30vw; min-height: 126px; padding: 6px; }
   .dark-site__bar { font-size: 4px; }
   .dark-site--thoughtful .dark-site__content { min-height: 99px; padding-top: 13px; }
   .dark-site--thoughtful .dark-site__content strong { font-size: 20px; }
   .dark-site--thoughtful .dark-site__content > div { height: 46px; }
   .dark-site small { font-size: 4px; }
-  .image-stack--left { left: 20% !important; top: 37% !important; width: 31vw; transform: translate(-50%, -50%) rotate(-3deg); }
+  .image-stack--left { left: 37% !important; top: 19.6% !important; width: 31vw; transform: translate(-50%, -50%) rotate(-3deg); }
   .image-stack { height: 96px; }
   .image-stack > div { height: 64px; border-width: 3px; }
-  .japanese-poster { left: 7% !important; top: 45% !important; width: 44px; font-size: 19px; }
-  .black-sketch { left: 9% !important; top: 30% !important; width: 74px; height: 58px; }
-  .side-copy { left: 11% !important; top: 55% !important; width: 78px; gap: 4px; font-size: 6px; }
+  .japanese-poster { left: 7% !important; top: 31.2% !important; width: 44px; font-size: 19px; }
+  .black-sketch { left: 9% !important; top: 19.4% !important; width: 74px; height: 58px; }
+  .side-copy { left: 11% !important; top: 47.9% !important; width: 78px; gap: 4px; font-size: 6px; }
 
-  .hero-copy { left: 50% !important; top: 40% !important; width: 84vw; }
+  .hero-copy { left: 50% !important; top: 28% !important; width: 84vw; }
   .hero-copy h1 { font-size: clamp(30px, 8vw, 40px); line-height: 1.1; }
   .hero-copy p { margin: 12px 0 16px; font-size: 11px; }
   .hero-download { width: 118px; height: 35px; gap: 7px; border-radius: 11px; font-size: 11px; }
@@ -904,51 +1090,55 @@ select { font: inherit; }
   .hero-code { margin-top: 11px; font-size: 9px; }
   .hero-code b { font-size: 14px; }
 
-  .dark-site--human { left: 17% !important; top: 66% !important; width: 42vw; min-height: 136px; padding: 7px; }
+  .dark-site--human { left: 17% !important; top: 67.6% !important; width: 42vw; min-height: 136px; padding: 7px; }
   .dark-site--human .dark-site__content { min-height: 103px; padding-top: 12px; }
   .dark-site--human .dark-site__content strong { font-size: 17px; }
   .dark-site--human .flower-photo { height: 61px; }
-  .thought-card { left: 17% !important; top: 80% !important; width: 38vw; min-height: 108px; padding: 6px; }
+  .thought-card { left: 17% !important; top: 77% !important; width: 38vw; min-height: 108px; padding: 6px; }
   .thought-card__top { font-size: 4px; }
   .thought-card__photos { gap: 3px; margin-top: 5px; }
   .thought-card__photos i { width: 27px; height: 29px; }
   .thought-card strong { right: 4px; bottom: 16px; font-size: 12px; }
-  .process-sketch { left: 16% !important; top: 93% !important; width: 41vw; min-height: 95px; padding: 8px; font-size: 5px; }
+  .process-sketch { left: 16% !important; top: 90.9% !important; width: 41vw; min-height: 95px; padding: 8px; font-size: 5px; }
   .process-sketch svg { height: 66%; }
 
-  .identity-wordmark { left: 50% !important; top: 64% !important; width: 94vw; font-size: clamp(120px, 31vw, 185px); }
-  .pencil-note--styles { left: 27% !important; top: 76% !important; width: 86px; font-size: 9px; }
-  .editorial-fragment { left: 41% !important; top: 90% !important; width: 49vw; min-height: 98px; gap: 6px; padding: 5px; }
+  .identity-wordmark { left: 50% !important; top: 39.1% !important; width: 94vw; font-size: clamp(120px, 31vw, 185px); }
+  .pencil-note--styles { left: 49% !important; top: 74.8% !important; width: 86px; font-size: 9px; }
+  .editorial-fragment { left: 38.5% !important; top: 83.9% !important; width: 49vw; min-height: 98px; gap: 6px; padding: 5px; }
   .editorial-fragment__photo { height: 87px; }
   .editorial-fragment h2 { font-size: 13px; }
   .editorial-fragment p { margin-top: 6px; font-size: 5px; }
-  .local-terminal { left: 68% !important; top: 89% !important; width: 37vw; padding: 4px 6px; border-width: 3px; border-top-width: 5px; }
+  .local-terminal { left: 82% !important; top: 81.8% !important; width: 37vw; padding: 4px 6px; border-width: 3px; border-top-width: 5px; }
   .local-terminal pre { font-size: 5px; }
   .local-terminal__chrome { height: 5px; }
-  .pencil-note--local { left: 76% !important; top: 78% !important; width: 82px; font-size: 9px; }
+  .pencil-note--local { left: 30.8% !important; top: 55.8% !important; width: 82px; font-size: 9px; }
 
-  .note-card { left: 79% !important; top: 55% !important; width: 34vw; min-height: 72px; padding: 11px 9px; font-size: 11px; }
-  .build-card { left: 92% !important; top: 62% !important; width: 27vw; min-height: 125px; padding: 12px 8px; }
+  .note-card { left: 77% !important; top: 55.5% !important; width: 34vw; min-height: 72px; padding: 11px 9px; font-size: 11px; }
+  .build-card { left: 41% !important; top: 49.4% !important; width: 27vw; min-height: 125px; padding: 12px 8px; }
   .build-card h3 { font-size: 12px; }
   .build-card div { height: 49px; }
-  .image-stack--right { left: 77% !important; top: 45% !important; width: 34vw; }
+  .image-stack--right { left: 77% !important; top: 48.8% !important; width: 34vw; }
   .image-stack--right > div { height: 72px; }
-  .dark-site--ideas { left: 81% !important; top: 84% !important; width: 39vw; min-height: 142px; padding: 6px; }
+  .dark-site--ideas { left: 81% !important; top: 68.2% !important; width: 39vw; min-height: 142px; padding: 6px; }
   .dark-site--ideas .dark-site__content { min-height: 111px; padding-top: 12px; }
   .dark-site--ideas .dark-site__content strong { font-size: 19px; }
   .dark-site--ideas .earth-image { height: 97px; }
-  .process-index { left: 96% !important; top: 78% !important; width: 62px; gap: 7px; padding: 8px 6px; font-size: 6px; }
-  .pencil-note--drag { left: 76% !important; top: 69% !important; width: 96px; font-size: 9px; }
-  .pencil-note--same { left: 90% !important; top: 96% !important; width: 78px; font-size: 8px; }
-  .flower-photo-card { left: 88% !important; top: 92% !important; width: 43px; }
+  .process-index { left: 92% !important; top: 75.8% !important; width: 62px; gap: 7px; padding: 8px 6px; font-size: 6px; }
+  .pencil-note--drag { left: 77% !important; top: 60.3% !important; width: 96px; font-size: 9px; }
+  .pencil-note--same { left: 90% !important; top: 89.4% !important; width: 78px; font-size: 8px; }
+  .flower-photo-card { left: 85% !important; top: 86.1% !important; width: 43px; }
   .plus-mark { font-size: 16px; }
+  .plus-mark--one { left: 5% !important; top: 22.1% !important; }
+  .plus-mark--two { left: 64% !important; top: 17% !important; }
+  .plus-mark--three { left: 95% !important; top: 23.9% !important; }
+  .plus-mark--four { left: 95% !important; top: 60.6% !important; }
+  .plus-mark--five { left: 3% !important; top: 84.8% !important; }
 
 
 }
 
 @media (max-width: 390px) {
   .site-actions .site-github { display: none; }
-  .hero-copy { top: 41% !important; }
   .hero-copy h1 { font-size: 29px; }
   .identity-wordmark { width: 94vw; font-size: 29vw; }
   .dark-site--thoughtful { left: 87% !important; }
@@ -958,12 +1148,13 @@ select { font: inherit; }
   .site-nav[data-enabled="true"] .site-links button:hover:not(:disabled),
   .site-nav[data-enabled="true"] .site-links a:hover:not([aria-disabled="true"]),
   .site-nav[data-enabled="true"] .site-actions .site-github:hover,
+  .site-nav[data-enabled="true"] .theme-toggle:hover:not(:disabled),
   .site-nav[data-enabled="true"] .site-brand:hover {
-    color: #5b574e;
+    color: var(--ink-hover);
   }
 
-  .hero-code:not([aria-disabled="true"]):hover { color: #5b574e; }
-  .hero-download:not(:disabled):hover { background: #2a2b28; }
+  .hero-code:not([aria-disabled="true"]):hover { color: var(--ink-hover); }
+  .hero-download:not(:disabled):hover { background: var(--button-bg-hover); }
 }
 
 @media (prefers-reduced-motion: reduce) {

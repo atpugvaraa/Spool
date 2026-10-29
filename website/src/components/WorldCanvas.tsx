@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import { anchorPosition, SCENE_ANCHORS, SCENE_NAV_ITEMS, type SceneAnchor, type WorldRegion } from "./composition";
+import { setTheme, useTheme } from "./use-theme";
 
 
 export type Camera = { x: number; y: number; scale: number };
@@ -21,9 +22,18 @@ type WorldMetrics = {
   height: number;
   worldWidth: number;
   worldHeight: number;
+  // Unscaled height of the artifact box, centred in the world.
+  compositionHeight: number;
+  // The scale the artifact box is actually drawn at (1 below the wide layout).
+  compositionScale: number;
 };
 
 const WORLD_SCALE = 1;
+// Bounds for fitting the art-directed composition to the window (see
+// `.world-artifacts` in globals.css): small enough for a short laptop window,
+// large enough to fill a big display without blowing up raster images.
+const COMPOSITION_SCALE_MIN = 0.6;
+const COMPOSITION_SCALE_MAX = 1.4;
 const HOME_CAMERA = { worldX: 0.5, worldY: 0.5 } as const;
 const CAMERA_TRAVEL_MS = 780;
 const GITHUB_URL = "https://github.com/atpugvaraa/spool";
@@ -58,9 +68,14 @@ function clampCamera(camera: Camera, metrics: WorldMetrics): Camera {
 }
 
 function homeCamera(metrics: WorldMetrics): Camera {
+  // On a phone the composition is taller than the screen, and centring it would
+  // open on its middle with the top cluster out of sight. Start at its top edge.
+  const fromTop = metrics.width <= 720 && metrics.compositionHeight > metrics.height;
   return clampCamera({
     x: metrics.width / 2 - metrics.worldWidth * HOME_CAMERA.worldX,
-    y: metrics.height / 2 - metrics.worldHeight * HOME_CAMERA.worldY,
+    y: fromTop
+      ? -(metrics.worldHeight - metrics.compositionHeight) / 2
+      : metrics.height / 2 - metrics.worldHeight * HOME_CAMERA.worldY,
     scale: WORLD_SCALE,
   }, metrics);
 }
@@ -109,6 +124,7 @@ function wordmarkStyle(): ItemStyle {
 export default function WorldCanvas({ phase }: { phase: WorldPhase }) {
   const viewportRef = useRef<HTMLDivElement>(null);
   const worldRef = useRef<HTMLDivElement>(null);
+  const artifactsRef = useRef<HTMLDivElement>(null);
 
 
   const metricsRef = useRef<WorldMetrics>({
@@ -116,6 +132,8 @@ export default function WorldCanvas({ phase }: { phase: WorldPhase }) {
     height: 0,
     worldWidth: 0,
     worldHeight: 0,
+    compositionHeight: 0,
+    compositionScale: 1,
   });
   const cameraRef = useRef<Camera>({ x: 0, y: 0, scale: 1 });
   const pointerRef = useRef<{ id: number; x: number; y: number } | null>(null);
@@ -127,6 +145,7 @@ export default function WorldCanvas({ phase }: { phase: WorldPhase }) {
   const [activeAnchor, setActiveAnchor] = useState<SceneAnchor | null>("home");
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [logoMarkup, setLogoMarkup] = useState("");
+  const darkTheme = useTheme() === "dark";
   const wordmarkRevealStarted = phase === "thread" || phase === "exploring";
 
   useEffect(() => {
@@ -174,17 +193,22 @@ export default function WorldCanvas({ phase }: { phase: WorldPhase }) {
     }
 
     const targetAnchor = SCENE_ANCHORS[anchor];
+    const viewport = viewportRef.current;
+    const artifacts = artifactsRef.current;
     let target: Camera;
-    if (targetAnchor === "home") {
+    if (targetAnchor === "home" || !viewport || !artifacts) {
       target = homeCamera(metrics);
     } else {
       const compact = metrics.width <= 720;
       const { x, y } = anchorPosition(targetAnchor, compact);
-      const worldOriginX = (metrics.worldWidth - metrics.width) / 2;
-      const worldOriginY = (metrics.worldHeight - metrics.height) / 2;
+      // Anchors are percentages of the artifact box, which is not always the
+      // viewport's size: on wider screens it is the scaled composition. Its
+      // on-screen rect less the camera offset is where it sits in the world.
+      const viewportBounds = viewport.getBoundingClientRect();
+      const box = artifacts.getBoundingClientRect();
       target = centeredCamera(
-        worldOriginX + (x / 100) * metrics.width,
-        worldOriginY + (y / 100) * metrics.height,
+        box.left - viewportBounds.left - cameraRef.current.x + (x / 100) * box.width,
+        box.top - viewportBounds.top - cameraRef.current.y + (y / 100) * box.height,
         metrics,
       );
     }
@@ -239,6 +263,14 @@ export default function WorldCanvas({ phase }: { phase: WorldPhase }) {
       const world = worldRef.current;
       if (!world) return;
 
+      const artifacts = artifactsRef.current;
+      if (artifacts?.offsetWidth && artifacts.offsetHeight) {
+        // Only the wide-screen layout reads this; narrower layouts ignore it.
+        const fit = Math.min(bounds.width / artifacts.offsetWidth, bounds.height / artifacts.offsetHeight);
+        const scale = Math.max(COMPOSITION_SCALE_MIN, Math.min(COMPOSITION_SCALE_MAX, fit));
+        artifacts.style.setProperty("--composition-scale", String(scale));
+      }
+
       if (navigationTimerRef.current) {
         cameraRef.current = renderedCamera(world, cameraRef.current);
         finishCameraTransition(false);
@@ -252,14 +284,22 @@ export default function WorldCanvas({ phase }: { phase: WorldPhase }) {
         height: bounds.height,
         worldWidth: world.offsetWidth,
         worldHeight: world.offsetHeight,
+        compositionHeight: artifacts?.offsetHeight ?? 0,
+        compositionScale: artifacts?.offsetWidth
+          ? artifacts.getBoundingClientRect().width / artifacts.offsetWidth
+          : 1,
       };
       metricsRef.current = metrics;
 
+      // Keep what was under the middle of the screen there. The world is sized
+      // from the viewport, so its centre moves on resize, and the composition
+      // may rescale: measure from the centre, in composition units.
+      const ratio = metrics.compositionScale / previous.compositionScale;
       const nextCamera = !previous.width || !previous.height
         ? homeCamera(metrics)
         : centeredCamera(
-          previous.width / 2 - current.x,
-          previous.height / 2 - current.y,
+          metrics.worldWidth / 2 + (previous.width / 2 - current.x - previous.worldWidth / 2) * ratio,
+          metrics.worldHeight / 2 + (previous.height / 2 - current.y - previous.worldHeight / 2) * ratio,
           metrics,
         );
       writeCamera(nextCamera);
@@ -331,7 +371,7 @@ export default function WorldCanvas({ phase }: { phase: WorldPhase }) {
         aria-label="Draggable Spool creative world"
       >
         <div className="world-coordinate-space" data-world-coordinate-space ref={worldRef}>
-          <div className="world-artifacts">
+          <div className="world-artifacts" ref={artifactsRef}>
 
         <figure className="world-item opnest-board" style={anchoredStyle("opnest", 354)} aria-label="A generated website with a landscape image">
           <div className="opnest-board__image"><span>opnest</span><small>your calmer internet.</small></div>
@@ -360,7 +400,7 @@ export default function WorldCanvas({ phase }: { phase: WorldPhase }) {
           <div className="dark-site__content"><strong>A more<br />thoughtful<br />web.</strong><div className="dark-site__landscape" /></div>
           <small>DESIGN / DEVELOP / SHARE</small>
         </article>
-        <aside className="world-item exploration-index" style={itemStyle(96, 31, 104, 0)} aria-label="Exploration index">
+        <aside className="world-item exploration-index" style={itemStyle(96, 38, 104, 0)} aria-label="Exploration index">
           <b>+ explorations</b><span>01 / websites</span><span>02 / posters</span><span>03 / UI concepts</span><span>04 / illustrations</span><span>05 / presentations</span><span>06 / brands</span><span>07 / experiments</span>
         </aside>
         <aside className="world-item pencil-note pencil-note--imagine" style={itemStyle(73, 9, 192, -8)}>
@@ -457,9 +497,9 @@ export default function WorldCanvas({ phase }: { phase: WorldPhase }) {
         <figure className="world-item flower-photo-card" style={itemStyle(88, 92, 80, 4)} aria-label="Small botanical photograph"><div /></figure>
 
         <div className="world-item plus-mark plus-mark--one" style={itemStyle(9, 35, 24)} aria-hidden="true">+</div>
-        <div className="world-item plus-mark plus-mark--two" style={itemStyle(65, 31, 24)} aria-hidden="true">+</div>
-        <div className="world-item plus-mark plus-mark--three" style={itemStyle(93, 39, 24)} aria-hidden="true">+</div>
-        <div className="world-item plus-mark plus-mark--four" style={itemStyle(75, 66, 24)} aria-hidden="true">+</div>
+        <div className="world-item plus-mark plus-mark--two" style={itemStyle(75.5, 31, 24)} aria-hidden="true">+</div>
+        <div className="world-item plus-mark plus-mark--three" style={itemStyle(96.5, 22, 24)} aria-hidden="true">+</div>
+        <div className="world-item plus-mark plus-mark--four" style={itemStyle(84, 68, 24)} aria-hidden="true">+</div>
         <div className="world-item plus-mark plus-mark--five" style={itemStyle(3, 91, 24)} aria-hidden="true">+</div>
           </div>
         </div>
@@ -524,6 +564,17 @@ export default function WorldCanvas({ phase }: { phase: WorldPhase }) {
           </a>
         </nav>
         <div className="site-actions">
+          <button
+            className="theme-toggle"
+            type="button"
+            aria-label="Dark mode"
+            aria-pressed={darkTheme}
+            title={darkTheme ? "Lights up" : "Lights down"}
+            disabled={!navigationActive}
+            onClick={() => setTheme(darkTheme ? "light" : "dark")}
+          >
+            <span className="theme-toggle__dial" aria-hidden="true" />
+          </button>
           <a
             className="site-github"
             href={GITHUB_URL}
